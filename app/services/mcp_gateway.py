@@ -12,17 +12,22 @@ import shutil
 import subprocess
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import httpx
 
 from app import db
 from app.schemas import McpServerCreate
 from app.services.network_policy import env_flag, require_outbound_network, validate_outbound_http_url
+from app.services.tool_effect_journal import (
+    inject_http_idempotency_key,
+    inject_mcp_idempotency_argument,
+)
 
 BASE_DIR = Path(__file__).resolve().parents[2]
 ARTIFACT_DIR = Path(os.getenv("APP_ARTIFACT_DIR", str(BASE_DIR / "data" / "artifacts")))
 PRESENTATION_GENERATOR_SCRIPT = BASE_DIR / "app" / "services" / "presentation_generator.mjs"
+PRESENTATION_GENERATOR_MODES = {"artifact_tool", "python"}
 
 
 class ToolError(RuntimeError):
@@ -136,6 +141,14 @@ def _artifact_tool_entrypoint() -> Path:
 def presentation_generation_status() -> dict[str, Any]:
     """Report whether the optional PPTX generator is ready on this host."""
 
+    mode = str(os.getenv("APP_PPTX_GENERATOR") or "").strip().lower()
+    if mode == "python":
+        try:
+            import pptx  # noqa: F401
+        except Exception:
+            return {"configured": False, "reason": "平台内置 Python PPTX 组件不可用，请安装 python-pptx"}
+        return {"configured": True}
+
     node_name = str(os.getenv("APP_NODE_BINARY") or "node").strip()
     node_binary = (
         str(Path(node_name).resolve())
@@ -153,7 +166,97 @@ def presentation_generation_status() -> dict[str, Any]:
     return {"configured": True}
 
 
+def presentation_configuration_status() -> dict[str, Any]:
+    """Return actionable local setup information without exposing secrets."""
+
+    node_name = str(os.getenv("APP_NODE_BINARY") or "node").strip()
+    node_binary = (
+        str(Path(node_name).expanduser().resolve())
+        if Path(node_name).expanduser().is_file()
+        else shutil.which(node_name)
+    )
+    entrypoint = str(os.getenv("APP_ARTIFACT_TOOL_ENTRYPOINT") or "").strip()
+    native_python = False
+    try:
+        import pptx  # noqa: F401
+        native_python = True
+    except Exception:
+        native_python = False
+    status = presentation_generation_status()
+    return {
+        "configured": bool(status.get("configured")),
+        "mode": str(os.getenv("APP_PPTX_GENERATOR") or "artifact_tool").strip().lower() or "artifact_tool",
+        "reason": str(status.get("reason") or ""),
+        "node_binary": node_binary or "",
+        "entrypoint": entrypoint,
+        "native_python_available": native_python,
+        "instructions": {
+            "recommended": "启用平台内置 Python 生成器（不需要 Docker、Node.js 或私有 npm 包）",
+            "native_python": [
+                "确认当前虚拟环境已安装 python-pptx（项目 requirements.txt 已包含）",
+                "在配置向导中选择“平台内置 Python 生成器”，点击确认并保存",
+                "重启平台服务后再次生成 PPTX，并在产物区预览或下载",
+            ],
+            "artifact_tool": [
+                "准备已获授权的 Artifact Tool，并找到导出 Presentation/PresentationFile 的入口 .mjs 文件",
+                "填写 Node.js 可执行文件和入口文件的绝对路径",
+                "点击验证并保存；平台只会写入本机 .env.local，不会上传路径或文件",
+                "重启平台服务后再次生成 PPTX",
+            ],
+            "environment": [
+                "APP_PPTX_GENERATOR=python 或 artifact_tool",
+                "APP_NODE_BINARY=/absolute/path/to/node（仅 Artifact Tool 需要）",
+                "APP_ARTIFACT_TOOL_ENTRYPOINT=/absolute/path/to/artifact_tool.mjs（仅 Artifact Tool 需要）",
+            ],
+        },
+    }
+
+
+def configure_native_presentation_generator() -> dict[str, Any]:
+    """Enable the bundled Python PPTX generator for local conversation commands.
+
+    The chat runtime cannot call the FastAPI route (that would create a
+    circular import), so the local configuration operation lives beside the
+    generator status helpers.  It intentionally writes only the non-secret
+    ``APP_PPTX_GENERATOR`` setting to the project-local ``.env.local`` file.
+    """
+
+    try:
+        import pptx  # noqa: F401
+    except Exception as exc:
+        raise ToolError(
+            "平台内置 Python PPTX 组件不可用，请先在当前虚拟环境安装 python-pptx"
+        ) from exc
+
+    values = {"APP_PPTX_GENERATOR": "python"}
+    os.environ.update(values)
+    env_file = BASE_DIR / ".env.local"
+    text = env_file.read_text(encoding="utf-8") if env_file.exists() else ""
+    if text and not text.endswith("\n"):
+        text += "\n"
+    line = 'APP_PPTX_GENERATOR="python"'
+    pattern = re.compile(r"(?m)^\s*APP_PPTX_GENERATOR\s*=.*$")
+    if pattern.search(text):
+        text = pattern.sub(line, text, count=1)
+    else:
+        text += line + "\n"
+    env_file.write_text(text, encoding="utf-8")
+    status = presentation_configuration_status()
+    status["env_file"] = str(env_file)
+    return status
+
+
 def _generate_pptx_with_artifact_tool(title: str, content: str, output_path: Path) -> dict[str, Any]:
+    if str(os.getenv("APP_PPTX_GENERATOR") or "").strip().lower() == "python":
+        try:
+            from app.services.presentation_generator_python import generate_pptx
+
+            return generate_pptx(title, content, output_path)
+        except Exception as exc:
+            if isinstance(exc, ToolError):
+                raise
+            raise ToolError(f"PowerPoint 生成失败：{exc}") from exc
+
     node_name = str(os.getenv("APP_NODE_BINARY") or "node").strip()
     node_binary = shutil.which(node_name) if not Path(node_name).is_file() else str(Path(node_name).resolve())
     if not node_binary:
@@ -334,6 +437,85 @@ def server_to_api(server: dict[str, Any]) -> dict[str, Any]:
 
 
 class McpGateway:
+    @staticmethod
+    def _normalise_import_config(payload: Any) -> list[dict[str, Any]]:
+        """Validate common MCP config shapes without touching persistence."""
+
+        candidates: list[dict[str, Any]] = []
+        if isinstance(payload, dict) and isinstance(payload.get("mcpServers"), dict):
+            for server_id, raw_config in payload["mcpServers"].items():
+                config = raw_config if isinstance(raw_config, dict) else {}
+                kind = (
+                    "mcp_http"
+                    if config.get("url") or config.get("base_url")
+                    else "mcp_stdio"
+                )
+                candidates.append(
+                    {
+                        "id": str(server_id),
+                        "name": str(config.get("name") or server_id),
+                        "kind": kind,
+                        "description": str(
+                            config.get("description") or "通过配置文件导入"
+                        ),
+                        "enabled": bool(config.get("enabled", True)),
+                        "config": {
+                            key: value
+                            for key, value in config.items()
+                            if key
+                            not in {"name", "description", "enabled", "tools"}
+                        },
+                        "tools": (
+                            config.get("tools")
+                            if isinstance(config.get("tools"), list)
+                            else []
+                        ),
+                    }
+                )
+        elif isinstance(payload, list):
+            candidates = [item for item in payload if isinstance(item, dict)]
+        elif isinstance(payload, dict):
+            candidates = [payload]
+        else:
+            raise ValueError("MCP 配置必须是 JSON 对象或数组")
+
+        normalised: list[dict[str, Any]] = []
+        for item in candidates:
+            raw_id = str(item.get("id") or "").strip()
+            raw = {
+                "id": raw_id,
+                "name": str(item.get("name") or raw_id),
+                "kind": str(
+                    item.get("kind")
+                    or ("mcp_http" if item.get("url") else "mcp_stdio")
+                ),
+                "description": str(
+                    item.get("description") or "通过配置文件导入"
+                ),
+                "enabled": bool(item.get("enabled", True)),
+                "config": (
+                    item.get("config")
+                    if isinstance(item.get("config"), dict)
+                    else {
+                        key: item[key]
+                        for key in ("command", "args", "env", "url", "headers")
+                        if key in item
+                    }
+                ),
+                "tools": (
+                    item.get("tools")
+                    if isinstance(item.get("tools"), list)
+                    else []
+                ),
+            }
+            try:
+                normalised.append(McpServerCreate.model_validate(raw).model_dump())
+            except ValueError as exc:
+                raise ValueError(f"MCP 配置无效：{exc}") from exc
+        if not normalised:
+            raise ValueError("配置中没有可导入的 MCP Server")
+        return normalised
+
     def seed_builtin_servers(self) -> None:
         for server in BUILTIN_SERVERS:
             exists = db.query_one("SELECT id, kind FROM mcp_servers WHERE id = ?", (server["id"],))
@@ -405,50 +587,79 @@ class McpGateway:
 
     def import_config(self, payload: Any) -> list[dict[str, Any]]:
         """Import platform MCP records or the common {mcpServers: {...}} format."""
-        candidates: list[dict[str, Any]] = []
-        if isinstance(payload, dict) and isinstance(payload.get("mcpServers"), dict):
-            for server_id, raw_config in payload["mcpServers"].items():
-                config = raw_config if isinstance(raw_config, dict) else {}
-                kind = "mcp_http" if config.get("url") or config.get("base_url") else "mcp_stdio"
-                candidates.append({
-                    "id": str(server_id), "name": str(config.get("name") or server_id), "kind": kind,
-                    "description": str(config.get("description") or "通过配置文件导入"), "enabled": bool(config.get("enabled", True)),
-                    "config": {k: v for k, v in config.items() if k not in {"name", "description", "enabled", "tools"}},
-                    "tools": config.get("tools") if isinstance(config.get("tools"), list) else [],
-                })
-        elif isinstance(payload, list):
-            candidates = [x for x in payload if isinstance(x, dict)]
-        elif isinstance(payload, dict):
-            candidates = [payload]
-        else:
-            raise ValueError("MCP 配置必须是 JSON 对象或数组")
+        conn = db.get_conn()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            imported = self.import_config_in_transaction(conn, payload)
+            conn.commit()
+            return imported
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def import_config_in_transaction(
+        self, conn: Any, payload: Any
+    ) -> list[dict[str, Any]]:
+        """Import MCP records on the Task/Run publication transaction."""
 
         imported: list[dict[str, Any]] = []
-        for item in candidates:
-            raw_id = str(item.get("id") or "").strip()
-            raw = {
-                "id": raw_id,
-                "name": str(item.get("name") or raw_id),
-                "kind": str(item.get("kind") or ("mcp_http" if item.get("url") else "mcp_stdio")),
-                "description": str(item.get("description") or "通过配置文件导入"),
-                "enabled": bool(item.get("enabled", True)),
-                "config": item.get("config") if isinstance(item.get("config"), dict) else {
-                    k: item[k] for k in ("command", "args", "env", "url", "headers") if k in item
-                },
-                "tools": item.get("tools") if isinstance(item.get("tools"), list) else [],
-            }
-            try:
-                normalized = McpServerCreate.model_validate(raw).model_dump()
-            except ValueError as exc:
-                raise ValueError(f"MCP 配置无效：{exc}") from exc
-            server_id = normalized["id"]
-            if self._get_server_runtime(server_id):
-                imported.append(self._update_server_runtime(server_id, normalized) or normalized)
+        for normalized in self._normalise_import_config(payload):
+            server_id = str(normalized["id"])
+            current_row = conn.execute(
+                "SELECT * FROM mcp_servers WHERE id = ?", (server_id,)
+            ).fetchone()
+            now = db.utc_now()
+            if current_row is None:
+                conn.execute(
+                    """
+                    INSERT INTO mcp_servers(
+                        id, name, kind, description, enabled, config_json,
+                        tools_json, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        server_id,
+                        normalized["name"],
+                        normalized["kind"],
+                        normalized["description"],
+                        1 if normalized.get("enabled", True) else 0,
+                        db.json_dumps(normalized.get("config", {})),
+                        db.json_dumps(normalized.get("tools", [])),
+                        now,
+                        now,
+                    ),
+                )
             else:
-                imported.append(self._create_server_runtime(normalized))
-        if not imported:
-            raise ValueError("配置中没有可导入的 MCP Server")
-        return [self.to_api(server) for server in imported]
+                current = server_to_runtime(dict(current_row))
+                config = _merge_mcp_config_secrets(
+                    current.get("config", {}), normalized.get("config", {})
+                )
+                conn.execute(
+                    """
+                    UPDATE mcp_servers
+                    SET name = ?, kind = ?, description = ?, enabled = ?,
+                        config_json = ?, tools_json = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        normalized["name"],
+                        normalized["kind"],
+                        normalized["description"],
+                        1 if normalized.get("enabled", True) else 0,
+                        db.json_dumps(config),
+                        db.json_dumps(normalized.get("tools", [])),
+                        now,
+                        server_id,
+                    ),
+                )
+            stored = conn.execute(
+                "SELECT * FROM mcp_servers WHERE id = ?", (server_id,)
+            ).fetchone()
+            assert stored is not None
+            imported.append(self.to_api(server_to_runtime(dict(stored))))
+        return imported
 
     def list_tools(self, server_id: str | None = None) -> list[dict[str, Any]]:
         servers = (
@@ -489,36 +700,96 @@ class McpGateway:
             "server_kind": server.get("kind", ""),
         }
 
-    async def invoke_tool(self, server_id: str, tool_name: str, arguments: dict[str, Any], task_id: str | None = None) -> dict[str, Any]:
+    async def invoke_tool(
+        self,
+        server_id: str,
+        tool_name: str,
+        arguments: dict[str, Any],
+        task_id: str | None = None,
+        *,
+        idempotency_key: str = "",
+        tool_effect_id: str = "",
+    ) -> dict[str, Any]:
         server = self._get_server_runtime(server_id)
         if not server:
             raise ToolError(f"MCP server not found: {server_id}")
         if not server["enabled"]:
             raise ToolError(f"MCP server disabled: {server_id}")
         if server["kind"] == "builtin":
-            return await self._invoke_builtin(server_id, tool_name, arguments, task_id=task_id)
+            return await self._invoke_builtin(
+                server_id,
+                tool_name,
+                arguments,
+                task_id=task_id,
+                tool_effect_id=tool_effect_id,
+            )
         if server["kind"] == "http":
-            return await self._invoke_http_tool(server, tool_name, arguments)
+            return await self._invoke_http_tool(
+                server,
+                tool_name,
+                arguments,
+                idempotency_key=idempotency_key,
+            )
         if server["kind"] in {"mcp_stdio", "stdio"}:
-            return await self._invoke_mcp_stdio(server, tool_name, arguments)
+            return await self._invoke_mcp_stdio(
+                server,
+                tool_name,
+                arguments,
+                idempotency_key=idempotency_key,
+            )
         if server["kind"] in {"mcp_http", "streamable_http"}:
-            return await self._invoke_mcp_http(server, tool_name, arguments)
+            return await self._invoke_mcp_http(
+                server,
+                tool_name,
+                arguments,
+                idempotency_key=idempotency_key,
+            )
         raise ToolError(f"Unsupported MCP server kind: {server['kind']}")
 
-    async def _invoke_builtin(self, server_id: str, tool_name: str, arguments: dict[str, Any], task_id: str | None = None) -> dict[str, Any]:
+    async def _invoke_builtin(
+        self,
+        server_id: str,
+        tool_name: str,
+        arguments: dict[str, Any],
+        task_id: str | None = None,
+        *,
+        tool_effect_id: str = "",
+    ) -> dict[str, Any]:
         if server_id == "web-search" and tool_name == "search":
             return await self._web_search(arguments)
         if server_id == "weather" and tool_name == "forecast":
             return await self._weather_forecast(arguments)
         if server_id == "spreadsheet" and tool_name == "create_excel":
-            return await asyncio.to_thread(self._create_excel, arguments, task_id=task_id)
+            return await asyncio.to_thread(
+                self._create_excel,
+                arguments,
+                task_id=task_id,
+                tool_effect_id=tool_effect_id,
+            )
         if server_id == "report" and tool_name == "generate_markdown_report":
-            return await asyncio.to_thread(self._generate_markdown_report, arguments, task_id=task_id)
+            return await asyncio.to_thread(
+                self._generate_markdown_report,
+                arguments,
+                task_id=task_id,
+                tool_effect_id=tool_effect_id,
+            )
         if server_id == "report" and tool_name == "generate_document":
-            return await asyncio.to_thread(self._generate_document, arguments, task_id=task_id)
+            return await asyncio.to_thread(
+                self._generate_document,
+                arguments,
+                task_id=task_id,
+                tool_effect_id=tool_effect_id,
+            )
         raise ToolError(f"Builtin tool not found: {server_id}.{tool_name}")
 
-    async def _invoke_http_tool(self, server: dict[str, Any], tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    async def _invoke_http_tool(
+        self,
+        server: dict[str, Any],
+        tool_name: str,
+        arguments: dict[str, Any],
+        *,
+        idempotency_key: str = "",
+    ) -> dict[str, Any]:
         tool = next((t for t in server.get("tools", []) if t.get("name") == tool_name), None)
         if not tool:
             raise ToolError(f"HTTP tool not found: {tool_name}")
@@ -532,6 +803,8 @@ class McpGateway:
         url = base_url + path
         url = self._validate_remote_url(url)
         headers = self._resolve_env_values(config.get("headers", {}))
+        if idempotency_key:
+            headers = inject_http_idempotency_key(headers, idempotency_key)
         timeout = float(config.get("timeout", 30))
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
             if method == "GET":
@@ -710,6 +983,41 @@ class McpGateway:
             "structured_content": getattr(result, "structuredContent", None),
         }
 
+    @staticmethod
+    def _mcp_arguments_with_idempotency(
+        server: Mapping[str, Any],
+        tool_name: str,
+        arguments: Mapping[str, Any],
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        """Forward a stable key only when the MCP schema explicitly permits it."""
+
+        if not idempotency_key:
+            return dict(arguments)
+        tool = next(
+            (
+                item
+                for item in server.get("tools", [])
+                if isinstance(item, Mapping)
+                and str(item.get("name") or "") == tool_name
+            ),
+            {},
+        )
+        schema = tool.get("input_schema") if isinstance(tool, Mapping) else {}
+        config = server.get("config")
+        configured_argument = (
+            str(config.get("idempotency_key_argument") or "")
+            if isinstance(config, Mapping)
+            else ""
+        )
+        forwarded, _, _ = inject_mcp_idempotency_argument(
+            arguments,
+            schema if isinstance(schema, Mapping) else {},
+            idempotency_key,
+            configured_argument=configured_argument,
+        )
+        return forwarded
+
     async def _list_mcp_stdio(self, server: dict[str, Any]) -> list[dict[str, Any]]:
         from mcp import ClientSession
         from mcp.client.stdio import stdio_client
@@ -723,7 +1031,14 @@ class McpGateway:
         except TimeoutError as exc:
             raise ToolError(f"MCP stdio 工具发现超过 {timeout:g} 秒，已终止子进程") from exc
 
-    async def _invoke_mcp_stdio(self, server: dict[str, Any], tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    async def _invoke_mcp_stdio(
+        self,
+        server: dict[str, Any],
+        tool_name: str,
+        arguments: dict[str, Any],
+        *,
+        idempotency_key: str = "",
+    ) -> dict[str, Any]:
         from mcp import ClientSession
         from mcp.client.stdio import stdio_client
         timeout = self._stdio_timeout_seconds(server)
@@ -732,7 +1047,12 @@ class McpGateway:
                 async with stdio_client(self._stdio_params(server)) as (read, write):
                     async with ClientSession(read, write) as session:
                         await session.initialize()
-                        return self._normalize_mcp_result(await session.call_tool(tool_name, arguments))
+                        forwarded = self._mcp_arguments_with_idempotency(
+                            server, tool_name, arguments, idempotency_key
+                        )
+                        return self._normalize_mcp_result(
+                            await session.call_tool(tool_name, forwarded)
+                        )
         except TimeoutError as exc:
             raise ToolError(f"MCP stdio 调用 {tool_name} 超过 {timeout:g} 秒，已终止子进程") from exc
 
@@ -744,14 +1064,22 @@ class McpGateway:
             value = 60.0
         return max(5.0, min(value, 300.0))
 
-    def _mcp_http_config(self, server: dict[str, Any]) -> tuple[str, dict[str, str]]:
+    def _mcp_http_config(
+        self,
+        server: dict[str, Any],
+        *,
+        idempotency_key: str = "",
+    ) -> tuple[str, dict[str, str]]:
         require_outbound_network("远程 MCP", error_type=ToolError)
         if not env_flag("APP_ALLOW_REMOTE_MCP"):
             raise ToolError("远程 MCP 尚未开启，请由管理员设置 APP_ALLOW_REMOTE_MCP=true 后重启平台")
         config = server.get("config", {})
         url = str(config.get("url") or config.get("base_url") or "")
         url = self._validate_remote_url(url)
-        return url, self._resolve_env_values(config.get("headers", {}))
+        headers = self._resolve_env_values(config.get("headers", {}))
+        if idempotency_key:
+            headers = inject_http_idempotency_key(headers, idempotency_key)
+        return url, headers
 
     async def _list_mcp_http(self, server: dict[str, Any]) -> list[dict[str, Any]]:
         from mcp import ClientSession
@@ -763,15 +1091,29 @@ class McpGateway:
                     await session.initialize()
                     return self._normalize_mcp_tools(await session.list_tools())
 
-    async def _invoke_mcp_http(self, server: dict[str, Any], tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    async def _invoke_mcp_http(
+        self,
+        server: dict[str, Any],
+        tool_name: str,
+        arguments: dict[str, Any],
+        *,
+        idempotency_key: str = "",
+    ) -> dict[str, Any]:
         from mcp import ClientSession
         from mcp.client.streamable_http import streamable_http_client
-        url, headers = self._mcp_http_config(server)
+        url, headers = self._mcp_http_config(
+            server, idempotency_key=idempotency_key
+        )
         async with httpx.AsyncClient(headers=headers, timeout=60, follow_redirects=False) as client:
             async with streamable_http_client(url, http_client=client) as (read, write, _):
                 async with ClientSession(read, write) as session:
                     await session.initialize()
-                    return self._normalize_mcp_result(await session.call_tool(tool_name, arguments))
+                    forwarded = self._mcp_arguments_with_idempotency(
+                        server, tool_name, arguments, idempotency_key
+                    )
+                    return self._normalize_mcp_result(
+                        await session.call_tool(tool_name, forwarded)
+                    )
 
     async def _web_search(self, arguments: dict[str, Any]) -> dict[str, Any]:
         query = str(arguments.get("query", "")).strip()
@@ -896,6 +1238,150 @@ class McpGateway:
         }
 
     @staticmethod
+    def _artifact_public_record(row: Mapping[str, Any]) -> dict[str, Any]:
+        artifact_id = str(row.get("id") or "")
+        metadata = db.json_loads(str(row.get("metadata_json") or "{}"), {})
+        return {
+            "id": artifact_id,
+            "name": str(row.get("name") or ""),
+            "kind": str(row.get("kind") or ""),
+            "run_id": str(row.get("run_id") or ""),
+            "workspace_id": str(row.get("workspace_id") or "default"),
+            "relative_path": str(row.get("relative_path") or ""),
+            "mime_type": str(
+                row.get("mime_type") or "application/octet-stream"
+            ),
+            "size": int(row.get("size") or 0),
+            "sha256": str(row.get("sha256") or ""),
+            "version": int(row.get("version") or 1),
+            "metadata": metadata if isinstance(metadata, dict) else {},
+            "delivery_status": str(row.get("delivery_status") or "published"),
+            "download_url": f"/api/artifacts/{artifact_id}/download",
+        }
+
+    @staticmethod
+    def _artifact_row_is_intact(row: Mapping[str, Any]) -> bool:
+        relative_path = str(row.get("relative_path") or "")
+        expected_sha = str(row.get("sha256") or "")
+        expected_size = int(row.get("size") or 0)
+        if not relative_path or not expected_sha or expected_size < 0:
+            return False
+        try:
+            path = resolve_artifact_path(relative_path)
+            if path.stat().st_size != expected_size:
+                return False
+            digest = hashlib.sha256()
+            with path.open("rb") as stream:
+                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            return digest.hexdigest() == expected_sha
+        except (FileNotFoundError, OSError, RuntimeError, ToolError, ValueError):
+            return False
+
+    def reconcile_artifact_effect(
+        self,
+        tool_effect_id: str,
+        *,
+        task_id: str,
+        run_id: str = "",
+    ) -> dict[str, Any] | None:
+        """Recover one platform-generated Artifact without generating it again.
+
+        A pending file from an interrupted Run may be adopted only by the
+        exact recovery child recorded on that Run.  Files rejected by policy
+        or a normal failure are never revived.  The Artifact row and bytes
+        remain the same; only ownership moves from the interrupted attempt to
+        its durable recovery attempt.
+        """
+
+        effect_id = str(tool_effect_id or "").strip()
+        owner_task_id = str(task_id or "").strip()
+        if not effect_id or not owner_task_id:
+            return None
+        row = db.query_one(
+            "SELECT * FROM artifacts WHERE tool_effect_id = ?", (effect_id,)
+        )
+        if not row or str(row.get("task_id") or "") != owner_task_id:
+            return None
+        if not self._artifact_row_is_intact(row):
+            return None
+
+        context = self._artifact_context(owner_task_id)
+        target_run_id = str(run_id or context.get("run_id") or "")
+        source_run_id = str(row.get("run_id") or "")
+        delivery_status = str(row.get("delivery_status") or "published")
+        if source_run_id == target_run_id:
+            if delivery_status == "rejected":
+                return None
+            return {"artifact": self._artifact_public_record(row)}
+
+        if not source_run_id or not target_run_id:
+            return None
+        source_run = db.query_one(
+            "SELECT status, error_json, metadata_json FROM task_runs WHERE id = ?",
+            (source_run_id,),
+        ) or {}
+        target_run = db.query_one(
+            "SELECT status, intake_state FROM task_runs WHERE id = ? AND task_id = ?",
+            (target_run_id, owner_task_id),
+        ) or {}
+        source_metadata = db.json_loads(
+            str(source_run.get("metadata_json") or "{}"), {}
+        )
+        source_error = db.json_loads(
+            str(source_run.get("error_json") or "{}"), {}
+        )
+        interrupted = bool(
+            isinstance(source_metadata, Mapping)
+            and source_metadata.get("interrupted") is True
+            and str(source_metadata.get("recovery_run_id") or "")
+            == target_run_id
+        ) or bool(
+            str(source_run.get("status") or "") == "failed"
+            and isinstance(source_error, Mapping)
+            and str(source_error.get("error_type") or "") == "ServiceRestart"
+            and isinstance(source_metadata, Mapping)
+            and str(source_metadata.get("recovery_run_id") or "")
+            == target_run_id
+        )
+        if (
+            not interrupted
+            or str(target_run.get("status") or "") != "running"
+            or str(target_run.get("intake_state") or "open") != "open"
+            or delivery_status not in {"pending_verification", "rejected"}
+        ):
+            return None
+        db.execute(
+            """
+            UPDATE artifacts
+            SET run_id = ?, delivery_status = 'pending_verification',
+                verification_id = '', published_at = ''
+            WHERE id = ? AND task_id = ? AND run_id = ?
+              AND tool_effect_id = ?
+              AND delivery_status IN ('pending_verification', 'rejected')
+            """,
+            (
+                target_run_id,
+                str(row["id"]),
+                owner_task_id,
+                source_run_id,
+                effect_id,
+            ),
+        )
+        adopted = db.query_one(
+            "SELECT * FROM artifacts WHERE id = ?", (str(row["id"]),)
+        )
+        if (
+            not adopted
+            or str(adopted.get("run_id") or "") != target_run_id
+            or str(adopted.get("delivery_status") or "")
+            != "pending_verification"
+            or not self._artifact_row_is_intact(adopted)
+        ):
+            return None
+        return {"artifact": self._artifact_public_record(adopted)}
+
+    @staticmethod
     def _storage_segment(value: str, fallback: str) -> str:
         candidate = str(value or "").strip()
         if (
@@ -908,15 +1394,31 @@ class McpGateway:
         return f"{fallback}-{digest}"
 
     def _new_artifact_target(
-        self, task_id: str | None, filename: str
+        self,
+        task_id: str | None,
+        filename: str,
+        *,
+        tool_effect_id: str = "",
     ) -> tuple[dict[str, str], str, Path]:
         context = self._artifact_context(task_id)
-        artifact_id = "art_" + uuid.uuid4().hex[:12]
+        effect_id = str(tool_effect_id or "").strip()
+        artifact_id = (
+            "art_fx_" + hashlib.sha256(effect_id.encode("utf-8")).hexdigest()[:24]
+            if effect_id
+            else "art_" + uuid.uuid4().hex[:12]
+        )
         task_segment = self._storage_segment(context["task_id"], "task")
-        run_segment = self._storage_segment(context["run_id"], "unscoped")
+        run_segment = (
+            "effects"
+            if effect_id
+            else self._storage_segment(context["run_id"], "unscoped")
+        )
         root = ARTIFACT_DIR.resolve(strict=False)
         output_dir = root / task_segment / run_segment / artifact_id
-        output_dir.mkdir(parents=True, exist_ok=False)
+        # A process may exit after creating the private target directory but
+        # before registering the Artifact.  The stable effect-owned directory
+        # is safe to reuse and overwrite on a reconciled retry.
+        output_dir.mkdir(parents=True, exist_ok=bool(effect_id))
         return context, artifact_id, output_dir / filename
 
     def _safe_filename(self, value: str, fallback: str) -> str:
@@ -932,6 +1434,8 @@ class McpGateway:
         name: str,
         kind: str,
         path: Path,
+        *,
+        tool_effect_id: str = "",
     ) -> dict[str, Any]:
         try:
             root = ARTIFACT_DIR.resolve(strict=True)
@@ -958,13 +1462,21 @@ class McpGateway:
             "storage": "immutable",
             "generator": "mcp_gateway",
         }
+        effect_id = str(tool_effect_id or "").strip()
+        if effect_id:
+            metadata["tool_effect_id"] = effect_id
+        delivery_status = (
+            "pending_verification" if context["run_id"] else "published"
+        )
+        published_at = "" if context["run_id"] else db.utc_now()
         db.execute(
             """
             INSERT INTO artifacts(
                 id, task_id, run_id, workspace_id, name, kind, path,
                 relative_path, mime_type, size, sha256, version,
-                metadata_json, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                metadata_json, delivery_status, verification_id, published_at,
+                created_at, tool_effect_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 artifact_id,
@@ -980,7 +1492,11 @@ class McpGateway:
                 digest.hexdigest(),
                 version,
                 db.json_dumps(metadata),
+                delivery_status,
+                "",
+                published_at,
                 db.utc_now(),
+                effect_id,
             ),
         )
         return {
@@ -995,6 +1511,7 @@ class McpGateway:
             "sha256": digest.hexdigest(),
             "version": version,
             "metadata": metadata,
+            "delivery_status": delivery_status,
             "download_url": f"/api/artifacts/{artifact_id}/download",
         }
 
@@ -1016,14 +1533,33 @@ class McpGateway:
             return "text/markdown"
         return mimetypes.guess_type(name)[0] or "application/octet-stream"
 
-    def _create_excel(self, arguments: dict[str, Any], task_id: str | None = None) -> dict[str, Any]:
+    def _create_excel(
+        self,
+        arguments: dict[str, Any],
+        task_id: str | None = None,
+        *,
+        tool_effect_id: str = "",
+    ) -> dict[str, Any]:
         rows = arguments.get("rows") or []
         filename = self._safe_filename(arguments.get("filename") or "result.xlsx", "result.xlsx")
         suffix = Path(filename).suffix.lower()
         if suffix not in {".xlsx", ".csv"}:
             filename += ".xlsx"
             suffix = ".xlsx"
-        context, artifact_id, out_path = self._new_artifact_target(task_id, filename)
+        if tool_effect_id and task_id:
+            recovered = self.reconcile_artifact_effect(
+                tool_effect_id, task_id=task_id
+            )
+            if recovered is not None:
+                return {
+                    **recovered,
+                    "row_count": len(rows),
+                    "format": "csv" if suffix == ".csv" else "xlsx",
+                    "recovered": True,
+                }
+        context, artifact_id, out_path = self._new_artifact_target(
+            task_id, filename, tool_effect_id=tool_effect_id
+        )
         if rows:
             headers = list(rows[0].keys())
         else:
@@ -1034,7 +1570,14 @@ class McpGateway:
                 writer = csv.DictWriter(stream, fieldnames=headers, extrasaction="ignore")
                 writer.writeheader()
                 writer.writerows(rows)
-            artifact = self._register_artifact(context, artifact_id, filename, "csv", out_path)
+            artifact = self._register_artifact(
+                context,
+                artifact_id,
+                filename,
+                "csv",
+                out_path,
+                tool_effect_id=tool_effect_id,
+            )
             return {"artifact": artifact, "row_count": len(rows), "format": "csv"}
         try:
             from openpyxl import Workbook
@@ -1063,18 +1606,46 @@ class McpGateway:
                 writer = csv.DictWriter(f, fieldnames=headers, extrasaction="ignore")
                 writer.writeheader()
                 writer.writerows(rows)
-            artifact = self._register_artifact(context, artifact_id, csv_path.name, "csv", csv_path)
+            artifact = self._register_artifact(
+                context,
+                artifact_id,
+                csv_path.name,
+                "csv",
+                csv_path,
+                tool_effect_id=tool_effect_id,
+            )
             return {"artifact": artifact, "row_count": len(rows), "format": "csv"}
-        artifact = self._register_artifact(context, artifact_id, filename, "xlsx", out_path)
+        artifact = self._register_artifact(
+            context,
+            artifact_id,
+            filename,
+            "xlsx",
+            out_path,
+            tool_effect_id=tool_effect_id,
+        )
         return {"artifact": artifact, "row_count": len(rows), "format": "xlsx"}
 
-    def _generate_markdown_report(self, arguments: dict[str, Any], task_id: str | None = None) -> dict[str, Any]:
+    def _generate_markdown_report(
+        self,
+        arguments: dict[str, Any],
+        task_id: str | None = None,
+        *,
+        tool_effect_id: str = "",
+    ) -> dict[str, Any]:
         summary = arguments.get("summary", "")
         rows = arguments.get("rows") or []
         filename = self._safe_filename(arguments.get("filename") or "report.md", "report.md")
         if not filename.endswith(".md"):
             filename += ".md"
-        context, artifact_id, out_path = self._new_artifact_target(task_id, filename)
+        if tool_effect_id and task_id:
+            recovered = self.reconcile_artifact_effect(
+                tool_effect_id, task_id=task_id
+            )
+            if recovered is not None:
+                return {**recovered, "row_count": len(rows), "recovered": True}
+        context, artifact_id, out_path = self._new_artifact_target(
+            task_id, filename, tool_effect_id=tool_effect_id
+        )
         lines = ["# 任务报告", "", summary, "", "## 结果明细", ""]
         if rows:
             headers = list(rows[0].keys())
@@ -1087,10 +1658,23 @@ class McpGateway:
         lines.append("")
         lines.append("---")
         out_path.write_text("\n".join(lines), encoding="utf-8")
-        artifact = self._register_artifact(context, artifact_id, filename, "markdown", out_path)
+        artifact = self._register_artifact(
+            context,
+            artifact_id,
+            filename,
+            "markdown",
+            out_path,
+            tool_effect_id=tool_effect_id,
+        )
         return {"artifact": artifact, "row_count": len(rows)}
 
-    def _generate_document(self, arguments: dict[str, Any], task_id: str | None = None) -> dict[str, Any]:
+    def _generate_document(
+        self,
+        arguments: dict[str, Any],
+        task_id: str | None = None,
+        *,
+        tool_effect_id: str = "",
+    ) -> dict[str, Any]:
         title = str(arguments.get("title") or "任务文档")
         content = str(arguments.get("content") or "")
         fmt = str(arguments.get("format") or "md").lower()
@@ -1099,7 +1683,15 @@ class McpGateway:
         filename = self._safe_filename(arguments.get("filename") or f"document.{fmt}", f"document.{fmt}")
         if not filename.lower().endswith(f".{fmt}"):
             filename += f".{fmt}"
-        context, artifact_id, out_path = self._new_artifact_target(task_id, filename)
+        if tool_effect_id and task_id:
+            recovered = self.reconcile_artifact_effect(
+                tool_effect_id, task_id=task_id
+            )
+            if recovered is not None:
+                return {**recovered, "format": fmt, "recovered": True}
+        context, artifact_id, out_path = self._new_artifact_target(
+            task_id, filename, tool_effect_id=tool_effect_id
+        )
         if fmt == "md":
             out_path.write_text(f"# {title}\n\n{content}\n", encoding="utf-8")
             kind = "markdown"
@@ -1201,7 +1793,14 @@ class McpGateway:
             SimpleDocTemplate(str(out_path), pagesize=A4).build(story)
             kind = "pdf"
         return {
-            "artifact": self._register_artifact(context, artifact_id, filename, kind, out_path),
+            "artifact": self._register_artifact(
+                context,
+                artifact_id,
+                filename,
+                kind,
+                out_path,
+                tool_effect_id=tool_effect_id,
+            ),
             "format": fmt,
         }
 

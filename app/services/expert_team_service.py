@@ -3,13 +3,19 @@ from __future__ import annotations
 import asyncio
 import re
 import uuid
-from typing import Any
+from typing import Any, Mapping
 
 from app import db
 from app.services.agent_runtime import AgentRuntime, create_task_record
 from app.services.context_service import ExecutionScope
 from app.services.event_bus import emit
-from app.services.task_state import TaskStateError, TaskStateService
+from app.services.task_state import (
+    PublicationConflict,
+    TaskStateError,
+    TaskStateService,
+    deserialize_checkpoint_state,
+    serialize_checkpoint_state,
+)
 
 
 class ExpertTeamError(RuntimeError):
@@ -30,6 +36,10 @@ class ExpertPermissionError(ExpertTeamError):
 
 class ExpertValidationError(ExpertTeamError):
     pass
+
+
+class ExpertTeamSteeringRequested(RuntimeError):
+    """A newer parent-task message won the terminal-publication race."""
 
 
 def _new_id(prefix: str) -> str:
@@ -880,86 +890,15 @@ class ExpertTeamService:
         )
         return [self._run_api(row) for row in rows]
 
-    def queued_runs_for_recovery(self) -> list[dict[str, str]]:
-        """Return durable team submissions that were never picked up.
-
-        Creating the parent task and team-run record happens before the HTTP
-        handler schedules background work.  A process exit in that narrow
-        window must not leave a task permanently displayed as queued.  Active
-        member/supervisor recovery is intentionally handled separately; this
-        method only resumes runs that have not started yet.
-        """
-        return [
-            {"id": str(row["id"]), "parent_task_id": str(row["parent_task_id"])}
-            for row in db.query_all(
-                """SELECT id, parent_task_id FROM team_runs
-                   WHERE status = 'queued' ORDER BY created_at, id"""
-            )
+    @staticmethod
+    def _submission_plan(team: Mapping[str, Any], message: str) -> dict[str, Any]:
+        members = [
+            dict(item)
+            for item in team.get("members", [])
+            if isinstance(item, Mapping)
         ]
-
-    def create_task_and_run(
-        self,
-        team_id: str,
-        scope: ExecutionScope,
-        *,
-        message: str,
-        model_id: str | None = None,
-        conversation_id: str | None = None,
-    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
-        team = self.get_team(team_id, scope)
-        if not team or not team.get("enabled"):
-            raise ExpertNotFoundError("专家团不存在、不可见或已停用")
-        parent = create_task_record(
-            message,
-            team["supervisor_agent_id"],
-            scope.workspace_id,
-            model_id=model_id,
-            conversation_id=conversation_id,
-            organization_id=scope.organization_id,
-            user_id=scope.user_id,
-            executor_type="team",
-            executor_id=team_id,
-        )
-        parent_run = self.task_state.create_run(
-            parent["id"],
-            metadata={"executor_type": "team", "executor_id": team_id, "trigger": "user"},
-        )
-        team_run = self.create_run_for_task(team_id, parent["id"], scope, parent_run_id=parent_run["id"])
-        return parent, parent_run, team_run
-
-    def create_run_for_task(
-        self,
-        team_id: str,
-        parent_task_id: str,
-        scope: ExecutionScope,
-        *,
-        parent_run_id: str = "",
-    ) -> dict[str, Any]:
-        team = self.get_team(team_id, scope)
-        if not team or not team.get("enabled"):
-            raise ExpertNotFoundError("专家团不存在、不可见或已停用")
-        parent = db.query_one("SELECT * FROM tasks WHERE id = ?", (parent_task_id,))
-        if not parent:
-            raise ExpertNotFoundError("父任务不存在")
-        if str(parent.get("executor_id") or team_id) != team_id:
-            raise ExpertValidationError("父任务绑定的专家团与请求不一致")
-        team_run_id = _new_id("xrun")
-        now = db.utc_now()
-        db.execute(
-            """
-            INSERT INTO team_runs(
-                id, team_id, parent_task_id, status, result_json, error_json,
-                started_at, finished_at, created_at, updated_at, organization_id,
-                workspace_id, user_id, parent_run_id
-            ) VALUES (?, ?, ?, 'queued', '{}', '{}', '', '', ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                team_run_id, team_id, parent_task_id, now, now, scope.organization_id,
-                scope.workspace_id, scope.user_id, parent_run_id,
-            ),
-        )
-        plan = {
-            "goal": str(parent.get("message") or ""),
+        return {
+            "goal": str(message or ""),
             "goal_confirmation": {
                 "status": "confirmed",
                 "label": "已选择专家协作",
@@ -977,7 +916,8 @@ class ExpertTeamService:
                             str(item.get("id") or "").strip()
                             if isinstance(item, dict)
                             else ""
-                        ) or f"team-criterion-{index + 1}",
+                        )
+                        or f"team-criterion-{index + 1}",
                         "title": _acceptance_title(item, index),
                         "status": "pending",
                     }
@@ -998,11 +938,15 @@ class ExpertTeamService:
                     "children": [
                         {
                             "id": f"expert:{member['id']}",
-                            "title": str(member.get("role") or member.get("agent_id") or "专家"),
+                            "title": str(
+                                member.get("role")
+                                or member.get("agent_id")
+                                or "专家"
+                            ),
                             "kind": "agent",
                             "status": "pending",
                         }
-                        for member in team["members"]
+                        for member in members
                     ],
                 },
                 {
@@ -1014,22 +958,885 @@ class ExpertTeamService:
             ],
             "tool_node_id": "execute",
             "executor_type": "team",
-            "team_id": team_id,
+            "team_id": str(team["id"]),
         }
-        emit(
-            parent_task_id,
-            "plan",
-            "专家协作计划",
-            f"{len(team['members'])} 位专家并行分析，主管随后汇总。",
-            {"plan": plan},
+
+    def _insert_submission_events(
+        self,
+        conn: Any,
+        *,
+        task_id: str,
+        team_run_id: str,
+        team: Mapping[str, Any],
+        message: str,
+        now: str,
+        recovered: bool = False,
+    ) -> None:
+        members = [
+            item for item in team.get("members", []) if isinstance(item, Mapping)
+        ]
+        plan = self._submission_plan(team, message)
+        recovery_data = {"recovered_after_restart": True} if recovered else {}
+        self._insert_event_in_transaction(
+            conn,
+            task_id=task_id,
+            now=now,
+            event={
+                "type": "plan",
+                "title": "专家协作计划",
+                "content": f"{len(members)} 位专家并行分析，主管随后汇总。",
+                "data": {"plan": plan, **recovery_data},
+            },
         )
-        emit(
-            parent_task_id,
-            "team_queued",
-            "专家团任务已排队",
-            f"将由 {len(team['members'])} 位成员并行执行，再由主管汇总。",
-            {"team_id": team_id, "team_run_id": team_run_id, "member_count": len(team["members"])},
+        self._insert_event_in_transaction(
+            conn,
+            task_id=task_id,
+            now=now,
+            event={
+                "type": "team_queued",
+                "title": "专家团任务已排队",
+                "content": (
+                    f"将由 {len(members)} 位成员并行执行，再由主管汇总。"
+                ),
+                "data": {
+                    "team_id": str(team["id"]),
+                    "team_run_id": team_run_id,
+                    "member_count": len(members),
+                    **recovery_data,
+                },
+            },
         )
+
+    @staticmethod
+    def _insert_parent_run_in_transaction(
+        conn: Any,
+        *,
+        task_id: str,
+        team_id: str,
+        trigger: str,
+        now: str,
+        member_id: str = "",
+    ) -> str:
+        run_id = _new_id("trun")
+        attempt = int(
+            conn.execute(
+                "SELECT COALESCE(MAX(attempt), 0) + 1 FROM task_runs WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()[0]
+        )
+        metadata = {
+            "executor_type": "team",
+            "executor_id": team_id,
+            "trigger": trigger,
+        }
+        if member_id:
+            metadata["member_id"] = member_id
+        conn.execute(
+            """
+            INSERT INTO task_runs(
+                id, task_id, attempt, status, metadata_json, created_at, updated_at
+            ) VALUES (?, ?, ?, 'queued', ?, ?, ?)
+            """,
+            (
+                run_id,
+                task_id,
+                attempt,
+                serialize_checkpoint_state(metadata),
+                now,
+                now,
+            ),
+        )
+        return run_id
+
+    @staticmethod
+    def _insert_team_run_in_transaction(
+        conn: Any,
+        *,
+        team_run_id: str,
+        team_id: str,
+        task_id: str,
+        parent_run_id: str,
+        scope: ExecutionScope,
+        now: str,
+    ) -> None:
+        conn.execute(
+            """
+            INSERT INTO team_runs(
+                id, team_id, parent_task_id, status, result_json, error_json,
+                started_at, finished_at, created_at, updated_at, organization_id,
+                workspace_id, user_id, parent_run_id
+            ) VALUES (?, ?, ?, 'queued', '{}', '{}', '', '', ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                team_run_id,
+                team_id,
+                task_id,
+                now,
+                now,
+                scope.organization_id,
+                scope.workspace_id,
+                scope.user_id,
+                parent_run_id,
+            ),
+        )
+
+    @staticmethod
+    def _team_from_connection(
+        conn: Any, team_id: str, scope: ExecutionScope
+    ) -> dict[str, Any] | None:
+        row = conn.execute(
+            "SELECT * FROM agent_teams WHERE id = ?", (team_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        raw = {key: row[key] for key in row.keys()}
+        if not bool(raw.get("enabled")) or not ExpertTeamService._visible(raw, scope):
+            return None
+        team = {
+            **{
+                key: value
+                for key, value in raw.items()
+                if key
+                not in {"acceptance_json", "budget_json", "permissions_json"}
+            },
+            "acceptance": _json(raw.get("acceptance_json"), []),
+            "budget": _json(raw.get("budget_json"), {}),
+            "permissions": _json(raw.get("permissions_json"), {}),
+            "enabled": True,
+        }
+        team["members"] = [
+            ExpertTeamService._member_api(
+                {key: member[key] for key in member.keys()}
+            )
+            for member in conn.execute(
+                "SELECT * FROM agent_team_members WHERE team_id = ? "
+                "ORDER BY position, id",
+                (team_id,),
+            ).fetchall()
+        ]
+        return team
+
+    def _repair_task_only_team_submissions(self) -> None:
+        candidates = db.query_all(
+            """
+            SELECT * FROM tasks AS t
+            WHERE t.executor_type = 'team'
+              AND t.status IN ('queued', 'running', 'waiting_approval')
+              AND NOT EXISTS(
+                  SELECT 1 FROM task_runs AS r WHERE r.task_id = t.id
+              )
+            ORDER BY t.created_at, t.id
+            """
+        )
+        for candidate in candidates:
+            task_id = str(candidate["id"])
+            team_id = str(candidate.get("executor_id") or "")
+            scope = ExecutionScope(
+                organization_id=str(
+                    candidate.get("organization_id") or "local-org"
+                ),
+                workspace_id=str(candidate.get("workspace") or "default"),
+                user_id=str(candidate.get("user_id") or "local-user"),
+            )
+            now = db.utc_now()
+            with self.task_state.transaction(write=True) as conn:
+                task = conn.execute(
+                    "SELECT * FROM tasks WHERE id = ?", (task_id,)
+                ).fetchone()
+                if (
+                    task is None
+                    or str(task["executor_type"] or "") != "team"
+                    or str(task["status"] or "")
+                    not in {"queued", "running", "waiting_approval"}
+                    or conn.execute(
+                        "SELECT 1 FROM task_runs WHERE task_id = ? LIMIT 1",
+                        (task_id,),
+                    ).fetchone()
+                    is not None
+                ):
+                    continue
+                team = self._team_from_connection(conn, team_id, scope)
+                if team is None:
+                    current_result = (
+                        deserialize_checkpoint_state(task["result_json"] or "{}")
+                        or {}
+                    )
+                    current_result.update(
+                        {
+                            "error": "绑定的专家团不存在、不可见或已停用",
+                            "error_type": "MissingExpertTeam",
+                            "recovered_after_restart": True,
+                        }
+                    )
+                    updated = conn.execute(
+                        "UPDATE tasks SET status = 'failed', result_json = ?, "
+                        "updated_at = ? WHERE id = ? AND status IN "
+                        "('queued', 'running', 'waiting_approval')",
+                        (
+                            serialize_checkpoint_state(current_result),
+                            now,
+                            task_id,
+                        ),
+                    )
+                    if updated.rowcount != 1:
+                        raise PublicationConflict(
+                            "缺失专家团的 Task-only 残留终态 CAS 失败"
+                        )
+                    self._insert_event_in_transaction(
+                        conn,
+                        task_id=task_id,
+                        now=now,
+                        event={
+                            "type": "error",
+                            "title": "专家团任务无法恢复",
+                            "content": "绑定的专家团不存在、不可见或已停用，平台未启动任何普通 Agent。",
+                            "data": {
+                                "error_type": "MissingExpertTeam",
+                                "team_id": team_id,
+                                "recovered_after_restart": True,
+                            },
+                        },
+                    )
+                    continue
+                parent_run_id = self._insert_parent_run_in_transaction(
+                    conn,
+                    task_id=task_id,
+                    team_id=team_id,
+                    trigger="startup_task_only_recovery",
+                    now=now,
+                )
+                team_run_id = _new_id("xrun")
+                self._insert_team_run_in_transaction(
+                    conn,
+                    team_run_id=team_run_id,
+                    team_id=team_id,
+                    task_id=task_id,
+                    parent_run_id=parent_run_id,
+                    scope=scope,
+                    now=now,
+                )
+                conn.execute(
+                    "UPDATE tasks SET status = 'queued', updated_at = ? WHERE id = ?",
+                    (now, task_id),
+                )
+                self._insert_submission_events(
+                    conn,
+                    task_id=task_id,
+                    team_run_id=team_run_id,
+                    team=team,
+                    message=str(task["message"] or ""),
+                    now=now,
+                    recovered=True,
+                )
+
+    def _reconcile_terminal_team_extensions(self) -> None:
+        rows = db.query_all(
+            """
+            SELECT tr.id, tr.parent_task_id, tr.parent_run_id,
+                   t.status AS task_status, r.status AS run_status
+            FROM team_runs AS tr
+            JOIN tasks AS t ON t.id = tr.parent_task_id
+            LEFT JOIN task_runs AS r ON r.id = tr.parent_run_id
+            WHERE tr.status IN ('queued', 'running', 'aggregating')
+              AND t.status IN ('completed', 'failed', 'cancelled')
+            ORDER BY tr.created_at, tr.id
+            """
+        )
+        for row in rows:
+            parent_run_id = str(row.get("parent_run_id") or "")
+            if parent_run_id and str(row.get("run_status") or "") in {
+                "running",
+                "paused",
+                "waiting_approval",
+            }:
+                self.task_state.reconcile_legacy_terminal_projection(parent_run_id)
+            terminal = {
+                "completed": "completed",
+                "cancelled": "cancelled",
+            }.get(str(row.get("task_status") or ""), "failed")
+            now = db.utc_now()
+            with self.task_state.transaction(write=True) as conn:
+                task = conn.execute(
+                    "SELECT status FROM tasks WHERE id = ?",
+                    (str(row["parent_task_id"]),),
+                ).fetchone()
+                current = conn.execute(
+                    "SELECT status FROM team_runs WHERE id = ?", (str(row["id"]),)
+                ).fetchone()
+                if (
+                    task is None
+                    or current is None
+                    or str(task["status"] or "")
+                    not in {"completed", "failed", "cancelled"}
+                    or str(current["status"] or "")
+                    not in {"queued", "running", "aggregating"}
+                ):
+                    continue
+                terminal = {
+                    "completed": "completed",
+                    "cancelled": "cancelled",
+                }.get(str(task["status"] or ""), "failed")
+                conn.execute(
+                    "UPDATE team_runs SET status = ?, finished_at = CASE "
+                    "WHEN finished_at = '' THEN ? ELSE finished_at END, "
+                    "updated_at = ? WHERE id = ? AND status IN "
+                    "('queued', 'running', 'aggregating')",
+                    (terminal, now, now, str(row["id"])),
+                )
+                conn.execute(
+                    "UPDATE team_member_runs SET status = ?, finished_at = CASE "
+                    "WHEN finished_at = '' THEN ? ELSE finished_at END, "
+                    "updated_at = ? WHERE team_run_id = ? AND status IN "
+                    "('queued', 'running', 'waiting_approval')",
+                    (
+                        "cancelled" if terminal == "cancelled" else "failed",
+                        now,
+                        now,
+                        str(row["id"]),
+                    ),
+                )
+
+    @staticmethod
+    def _executor_projection_mismatch(
+        task: Mapping[str, Any], run: Mapping[str, Any]
+    ) -> bool:
+        task_type = str(task.get("executor_type") or "agent").strip() or "agent"
+        task_executor_id = str(task.get("executor_id") or "").strip()
+        metadata = (
+            deserialize_checkpoint_state(run.get("metadata_json") or "{}") or {}
+        )
+        metadata_type = str(
+            metadata.get("executor_type") or task_type
+        ).strip() or task_type
+        metadata_id = str(
+            metadata.get("executor_id") or task_executor_id
+        ).strip()
+        return bool(
+            metadata_type != task_type
+            or (
+                task_executor_id
+                and metadata_id
+                and task_executor_id != metadata_id
+            )
+        )
+
+    def _reconcile_executor_ownership_mismatches(self) -> None:
+        rows = db.query_all(
+            """
+            SELECT r.*, t.executor_type, t.executor_id, t.status AS task_status
+            FROM task_runs AS r
+            JOIN tasks AS t ON t.id = r.task_id
+            WHERE r.status IN ('queued', 'running', 'paused', 'waiting_approval')
+              AND t.status IN ('queued', 'running', 'waiting_approval', 'failed')
+            ORDER BY r.created_at, r.attempt, r.id
+            """
+        )
+        for row in rows:
+            task_view = {
+                "executor_type": row.get("executor_type"),
+                "executor_id": row.get("executor_id"),
+            }
+            if not self._executor_projection_mismatch(task_view, row):
+                continue
+            task_id = str(row["task_id"])
+            run_id = str(row["id"])
+            error = {
+                "message": "Task 与 Run 的持久执行器所有权不一致，平台已隔离终止且不会创建普通 Agent 重试",
+                "error_type": "ExecutorOwnershipMismatch",
+            }
+
+            def close_extensions(conn: Any) -> None:
+                now = db.utc_now()
+                serialized_error = serialize_checkpoint_state(error)
+                conn.execute(
+                    "UPDATE team_runs SET status = 'failed', error_json = ?, "
+                    "finished_at = CASE WHEN finished_at = '' THEN ? ELSE finished_at END, "
+                    "updated_at = ? WHERE (parent_task_id = ? OR parent_run_id = ?) "
+                    "AND status IN ('queued', 'running', 'aggregating')",
+                    (serialized_error, now, now, task_id, run_id),
+                )
+                conn.execute(
+                    "UPDATE team_member_runs SET status = 'failed', error_json = ?, "
+                    "finished_at = CASE WHEN finished_at = '' THEN ? ELSE finished_at END, "
+                    "updated_at = ? WHERE child_task_id = ? AND status IN "
+                    "('queued', 'running', 'waiting_approval')",
+                    (serialized_error, now, now, task_id),
+                )
+
+            self.task_state.commit_failure(
+                task_id=task_id,
+                run_id=run_id,
+                error=error,
+                result={
+                    "error": "executor_ownership_mismatch",
+                    "error_type": "ExecutorOwnershipMismatch",
+                    "recovered_after_restart": True,
+                },
+                transaction_effect=close_extensions,
+            )
+
+    def queued_runs_for_recovery(self) -> list[dict[str, str]]:
+        """Return durable team submissions that were never picked up.
+
+        Creating the parent task and team-run record happens before the HTTP
+        handler schedules background work.  A process exit in that narrow
+        window must not leave a task permanently displayed as queued.  Active
+        member/supervisor recovery is intentionally handled separately; this
+        method only resumes runs that have not started yet.
+        """
+        rows = db.query_all(
+            """
+            SELECT tr.id, tr.parent_task_id, tr.parent_run_id, tr.team_id,
+                   r.metadata_json AS run_metadata_json
+            FROM team_runs AS tr
+            JOIN tasks AS t ON t.id = tr.parent_task_id
+            JOIN task_runs AS r ON r.id = tr.parent_run_id
+            WHERE tr.status = 'queued'
+              AND t.executor_type = 'team'
+              AND t.executor_id = tr.team_id
+              AND t.status IN ('queued', 'running', 'waiting_approval')
+              AND r.task_id = tr.parent_task_id
+              AND r.status IN ('queued', 'running')
+              AND r.intake_state = 'open'
+            ORDER BY tr.created_at, tr.id
+            """
+        )
+        queued: list[dict[str, str]] = []
+        for row in rows:
+            metadata = deserialize_checkpoint_state(
+                row.get("run_metadata_json") or "{}"
+            ) or {}
+            metadata_type = str(
+                metadata.get("executor_type") or "team"
+            ) if isinstance(metadata, Mapping) else ""
+            metadata_id = str(
+                metadata.get("executor_id") or row["team_id"]
+            ) if isinstance(metadata, Mapping) else ""
+            if metadata_type != "team" or metadata_id != str(row["team_id"]):
+                continue
+            queued.append(
+                {
+                    "id": str(row["id"]),
+                    "parent_task_id": str(row["parent_task_id"]),
+                }
+            )
+        return queued
+
+    def _fail_orphaned_child_run(
+        self, *, task_id: str, run_id: str, executor_type: str
+    ) -> None:
+        run = self.task_state.get_run(run_id)
+        if not run or run.get("status") in {"completed", "failed", "cancelled"}:
+            return
+        error = {
+            "message": "专家团编排进程已中断；该子运行不会交给普通 Agent 重放",
+            "error_type": "OrchestratorRestart",
+        }
+
+        def close_extension(conn: Any) -> None:
+            if executor_type != "team_member":
+                return
+            now = db.utc_now()
+            conn.execute(
+                """
+                UPDATE team_member_runs
+                SET status = 'failed', error_json = ?, finished_at = ?, updated_at = ?
+                WHERE child_task_id = ?
+                  AND status IN ('queued', 'running', 'waiting_approval')
+                """,
+                (
+                    serialize_checkpoint_state(
+                        {
+                            "message": "专家团编排进程已中断",
+                            "error_type": "OrchestratorRestart",
+                        }
+                    ),
+                    now,
+                    now,
+                    task_id,
+                ),
+            )
+
+        self.task_state.commit_failure(
+            task_id=task_id,
+            run_id=run_id,
+            error=error,
+            result={
+                "error": "orchestrator_restart",
+                "executor_type": executor_type,
+                "recovered_after_restart": True,
+            },
+            transaction_effect=close_extension,
+        )
+
+    def reconcile_interrupted_orchestrated_runs(self) -> list[dict[str, str]]:
+        """Reconcile durable team ownership before generic restart recovery.
+
+        Queued team submissions remain schedulable.  A team that had already
+        begun members/supervision cannot be replayed safely without a complete
+        orchestration checkpoint, so it is closed as a retryable failure.
+        Orphaned member/supervisor runs are likewise failed, never returned to
+        the ordinary Agent dispatcher.
+        """
+
+        self._repair_task_only_team_submissions()
+        self._reconcile_terminal_team_extensions()
+        self._reconcile_executor_ownership_mismatches()
+
+        parent_rows = db.query_all(
+            """
+            SELECT r.id AS run_id, r.task_id, r.status AS run_status,
+                   t.status AS task_status, t.executor_id AS team_id,
+                   tr.id AS team_run_id, tr.status AS team_status,
+                   tr.team_id AS team_run_team_id,
+                   tr.result_json AS team_result_json,
+                   tr.error_json AS team_error_json,
+                   r.metadata_json AS run_metadata_json
+            FROM task_runs AS r
+            JOIN tasks AS t ON t.id = r.task_id
+            LEFT JOIN team_runs AS tr ON tr.parent_run_id = r.id
+            WHERE t.executor_type = 'team'
+              AND r.status IN ('queued', 'running', 'paused', 'waiting_approval')
+            ORDER BY r.created_at, r.attempt, r.id
+            """
+        )
+        for row in parent_rows:
+            if str(row.get("task_status") or "") in {
+                "completed", "failed", "cancelled"
+            }:
+                # The core legacy terminal reconciler owns this historical
+                # split projection and preserves the already-public Task.
+                continue
+            run_id = str(row["run_id"])
+            task_id = str(row["task_id"])
+            team_run_id = str(row.get("team_run_id") or "")
+            if not team_run_id:
+                run = self.task_state.get_run(run_id) or {}
+                if run.get("status") == "queued":
+                    self.task_state.begin_run(
+                        task_id,
+                        run_id=run_id,
+                        metadata={
+                            "executor_type": "team",
+                            "executor_id": str(row.get("team_id") or ""),
+                            "orphaned_team_run": True,
+                        },
+                        activate_task_projection=True,
+                    )
+                self.task_state.commit_failure(
+                    task_id=task_id,
+                    run_id=run_id,
+                    error={
+                        "message": "专家团父运行缺少对应的 team_run，已安全终止",
+                        "error_type": "OrphanedTeamRun",
+                    },
+                    result={
+                        "error": "orphaned_team_run",
+                        "recovered_after_restart": True,
+                    },
+                )
+                continue
+            run_metadata = deserialize_checkpoint_state(
+                row.get("run_metadata_json") or "{}"
+            ) or {}
+            metadata_type = str(
+                run_metadata.get("executor_type") or "team"
+            ) if isinstance(run_metadata, Mapping) else ""
+            metadata_id = str(
+                run_metadata.get("executor_id") or row.get("team_id") or ""
+            ) if isinstance(run_metadata, Mapping) else ""
+            if (
+                metadata_type != "team"
+                or metadata_id != str(row.get("team_id") or "")
+                or str(row.get("team_run_team_id") or "")
+                != str(row.get("team_id") or "")
+            ):
+                self._commit_team_terminal(
+                    team_run_id=team_run_id,
+                    parent_run_id=run_id,
+                    team_status="failed",
+                    task_status="failed",
+                    result={
+                        "error": "executor_ownership_mismatch",
+                        "team_run_id": team_run_id,
+                        "recovered_after_restart": True,
+                    },
+                    error={
+                        "message": "专家团父运行的持久执行器所有权不一致，已隔离终止",
+                        "error_type": "ExecutorOwnershipMismatch",
+                    },
+                    artifacts=[],
+                    allow_steering=False,
+                    allow_ownership_repair=True,
+                    events=[
+                        {
+                            "type": "error",
+                            "title": "专家团运行所有权异常",
+                            "content": "持久执行器信息不一致，平台未将该运行交给任何普通 Agent。",
+                            "data": {
+                                "team_run_id": team_run_id,
+                                "error_type": "ExecutorOwnershipMismatch",
+                            },
+                        }
+                    ],
+                )
+                continue
+            team_status = str(row.get("team_status") or "")
+            if team_status == "queued":
+                continue
+            result = db.json_loads(row.get("team_result_json"), {})
+            error = db.json_loads(row.get("team_error_json"), {})
+            if team_status == "completed":
+                summary = str(result.get("summary") or "")
+                self._commit_team_terminal(
+                    team_run_id=team_run_id,
+                    parent_run_id=run_id,
+                    team_status="completed",
+                    task_status="completed",
+                    result=result,
+                    artifacts=[],
+                    allow_steering=False,
+                    events=[
+                        {
+                            "type": "answer",
+                            "title": "专家团最终答复",
+                            "content": summary,
+                            "data": {
+                                "team_run_id": team_run_id,
+                                "recovered_after_restart": True,
+                            },
+                        },
+                        {
+                            "type": "team_completed",
+                            "title": "专家团任务已完成",
+                            "content": "已恢复进程中断前完成的专家团交付。",
+                            "data": {
+                                "team_run_id": team_run_id,
+                                "recovered_after_restart": True,
+                            },
+                        },
+                    ],
+                )
+                continue
+            failure = error or {
+                "message": (
+                    "专家团编排进程在平台重启时中断，已安全终止；可重新提交任务"
+                ),
+                "error_type": "OrchestratorRestart",
+            }
+            failed_result = {
+                **result,
+                "error": str(failure.get("message") or "orchestrator_restart"),
+                "recovered_after_restart": True,
+                "team_run_id": team_run_id,
+            }
+            self._commit_team_terminal(
+                team_run_id=team_run_id,
+                parent_run_id=run_id,
+                team_status=(
+                    team_status
+                    if team_status in {"failed", "partial_failed"}
+                    else "failed"
+                ),
+                task_status="failed",
+                result=failed_result,
+                error=failure,
+                artifacts=[],
+                allow_steering=False,
+                events=[
+                    {
+                        "type": "error",
+                        "title": "专家团运行已安全终止",
+                        "content": str(failure.get("message") or "专家团编排进程已中断"),
+                        "data": {
+                            "team_run_id": team_run_id,
+                            "error_type": str(failure.get("error_type") or "OrchestratorRestart"),
+                            "recovered_after_restart": True,
+                        },
+                    }
+                ],
+            )
+
+        child_rows = db.query_all(
+            """
+            SELECT r.id AS run_id, r.task_id, t.executor_type,
+                   t.status AS task_status
+            FROM task_runs AS r
+            JOIN tasks AS t ON t.id = r.task_id
+            WHERE t.executor_type IN ('team_member', 'team_supervisor')
+              AND r.status IN ('queued', 'running', 'paused', 'waiting_approval')
+            ORDER BY r.created_at, r.attempt, r.id
+            """
+        )
+        for row in child_rows:
+            if str(row.get("task_status") or "") in {
+                "completed", "failed", "cancelled"
+            }:
+                continue
+            self._fail_orphaned_child_run(
+                task_id=str(row["task_id"]),
+                run_id=str(row["run_id"]),
+                executor_type=str(row["executor_type"]),
+            )
+        # If a previous recovery process exited after closing the core child
+        # Run but before updating the extension row, converge that residue on
+        # the next startup as well.
+        now = db.utc_now()
+        db.execute(
+            """
+            UPDATE team_member_runs
+            SET status = 'failed', error_json = ?,
+                finished_at = CASE WHEN finished_at = '' THEN ? ELSE finished_at END,
+                updated_at = ?
+            WHERE status IN ('queued', 'running', 'waiting_approval')
+              AND child_task_id IN (
+                  SELECT id FROM tasks
+                  WHERE executor_type = 'team_member'
+                    AND status IN ('failed', 'cancelled')
+              )
+            """,
+            (
+                db.json_dumps(
+                    {
+                        "message": "专家成员核心运行已终止",
+                        "error_type": "OrchestratorRestart",
+                    }
+                ),
+                now,
+                now,
+            ),
+        )
+        return self.queued_runs_for_recovery()
+
+    def create_task_and_run(
+        self,
+        team_id: str,
+        scope: ExecutionScope,
+        *,
+        message: str,
+        model_id: str | None = None,
+        conversation_id: str | None = None,
+        attachments: list[Mapping[str, Any]] | None = None,
+        parent_task_id: str = "",
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+        team = self.get_team(team_id, scope)
+        if not team or not team.get("enabled"):
+            raise ExpertNotFoundError("专家团不存在、不可见或已停用")
+        task_id = _new_id("task")
+        team_run_id = _new_id("xrun")
+        now = db.utc_now()
+        resolved_conversation_id = conversation_id or _new_id("conv")
+        title = message.strip().replace("\n", " ")[:60] or "新任务"
+        with self.task_state.transaction(write=True) as conn:
+            durable_team = self._team_from_connection(conn, team_id, scope)
+            if durable_team is None:
+                raise ExpertNotFoundError("专家团不存在、不可见或已停用")
+            conn.execute(
+                """
+                INSERT INTO tasks(
+                    id, title, message, agent_id, model_id, conversation_id,
+                    workspace, organization_id, user_id, parent_task_id,
+                    executor_type, executor_id, status, result_json,
+                    artifacts_json, attachments_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'team', ?, 'queued',
+                          '{}', '[]', ?, ?, ?)
+                """,
+                (
+                    task_id,
+                    title,
+                    message,
+                    str(durable_team["supervisor_agent_id"]),
+                    model_id or "",
+                    resolved_conversation_id,
+                    scope.workspace_id,
+                    scope.organization_id,
+                    scope.user_id,
+                    parent_task_id,
+                    team_id,
+                    db.json_dumps(attachments or []),
+                    now,
+                    now,
+                ),
+            )
+            parent_run_id = self._insert_parent_run_in_transaction(
+                conn,
+                task_id=task_id,
+                team_id=team_id,
+                trigger="user",
+                now=now,
+            )
+            self._insert_team_run_in_transaction(
+                conn,
+                team_run_id=team_run_id,
+                team_id=team_id,
+                task_id=task_id,
+                parent_run_id=parent_run_id,
+                scope=scope,
+                now=now,
+            )
+            self._insert_submission_events(
+                conn,
+                task_id=task_id,
+                team_run_id=team_run_id,
+                team=durable_team,
+                message=message,
+                now=now,
+            )
+        parent = db.query_one("SELECT * FROM tasks WHERE id = ?", (task_id,)) or {}
+        parent_run = self.task_state.get_run(parent_run_id) or {}
+        team_run = self._run_api(
+            db.query_one("SELECT * FROM team_runs WHERE id = ?", (team_run_id,))
+            or {}
+        )
+        return parent, parent_run, team_run
+
+    def create_run_for_task(
+        self,
+        team_id: str,
+        parent_task_id: str,
+        scope: ExecutionScope,
+        *,
+        parent_run_id: str = "",
+    ) -> dict[str, Any]:
+        team = self.get_team(team_id, scope)
+        if not team or not team.get("enabled"):
+            raise ExpertNotFoundError("专家团不存在、不可见或已停用")
+        parent = db.query_one("SELECT * FROM tasks WHERE id = ?", (parent_task_id,))
+        if not parent:
+            raise ExpertNotFoundError("父任务不存在")
+        if str(parent.get("executor_id") or team_id) != team_id:
+            raise ExpertValidationError("父任务绑定的专家团与请求不一致")
+        team_run_id = _new_id("xrun")
+        now = db.utc_now()
+        with self.task_state.transaction(write=True) as conn:
+            durable_parent = conn.execute(
+                "SELECT * FROM tasks WHERE id = ?", (parent_task_id,)
+            ).fetchone()
+            durable_team = self._team_from_connection(conn, team_id, scope)
+            parent_run = conn.execute(
+                "SELECT task_id FROM task_runs WHERE id = ?", (parent_run_id,)
+            ).fetchone()
+            if durable_parent is None or durable_team is None:
+                raise ExpertNotFoundError("父任务或专家团不存在")
+            if parent_run is None or str(parent_run["task_id"]) != parent_task_id:
+                raise ExpertValidationError("父运行与父任务不一致")
+            self._insert_team_run_in_transaction(
+                conn,
+                team_run_id=team_run_id,
+                team_id=team_id,
+                task_id=parent_task_id,
+                parent_run_id=parent_run_id,
+                scope=scope,
+                now=now,
+            )
+            self._insert_submission_events(
+                conn,
+                task_id=parent_task_id,
+                team_run_id=team_run_id,
+                team=durable_team,
+                message=str(durable_parent["message"] or ""),
+                now=now,
+            )
         return self._run_api(db.query_one("SELECT * FROM team_runs WHERE id = ?", (team_run_id,)) or {})
 
     @staticmethod
@@ -1194,6 +2001,692 @@ class ExpertTeamService:
             latest.setdefault(str(row["member_id"]), row)
         return [self._member_run_api(row) for row in latest.values()]
 
+    @staticmethod
+    def _team_steering_mode(messages: list[str]) -> str:
+        text = "\n".join(item.strip() for item in messages if item.strip())
+        replace_patterns = (
+            r"(?:任务|目标|需求|问题).{0,12}(?:改成|改为|替换为|换成)(?:新的)?",
+            r"(?:取消|放弃|忽略)(?:之前|原来|原先|当前|上述).{0,8}(?:任务|目标|需求|要求)",
+            r"(?:不要再做|停止)(?:之前|原来|当前|上述).{0,8}(?:任务|目标|需求)",
+            r"\b(?:replace|discard|cancel|ignore)\s+(?:the\s+)?(?:previous|current|old)\s+(?:task|goal|request)\b",
+            r"\bnew\s+(?:task|goal)\s*[:：]",
+        )
+        return "replace" if any(
+            re.search(pattern, text, flags=re.IGNORECASE)
+            for pattern in replace_patterns
+        ) else "amend"
+
+    @staticmethod
+    def _insert_event_in_transaction(
+        conn: Any,
+        *,
+        task_id: str,
+        now: str,
+        event: Mapping[str, Any],
+    ) -> int:
+        cursor = conn.execute(
+            """
+            INSERT INTO task_events(task_id, ts, type, title, content, data_json)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                task_id,
+                now,
+                str(event.get("type") or ""),
+                str(event.get("title") or ""),
+                str(event.get("content") or ""),
+                serialize_checkpoint_state(dict(event.get("data") or {})),
+            ),
+        )
+        return int(cursor.lastrowid)
+
+    @staticmethod
+    def _terminal_residue_in_transaction(
+        conn: Any, *, task_id: str, run_id: str
+    ) -> bool:
+        residue = conn.execute(
+            """
+            SELECT
+              EXISTS(SELECT 1 FROM task_nodes
+                     WHERE run_id = ? AND status IN ('pending', 'running')) AS active_nodes,
+              EXISTS(SELECT 1 FROM task_commands
+                     WHERE task_id = ? AND (run_id = ? OR run_id IS NULL)
+                       AND status IN ('queued', 'claimed')) AS active_commands,
+              EXISTS(SELECT 1 FROM artifacts
+                     WHERE task_id = ? AND run_id = ?
+                       AND delivery_status = 'pending_verification') AS pending_artifacts
+            """,
+            (run_id, task_id, run_id, task_id, run_id),
+        ).fetchone()
+        return residue is None or any(int(residue[key] or 0) for key in residue.keys())
+
+    def _commit_team_terminal(
+        self,
+        *,
+        team_run_id: str,
+        parent_run_id: str,
+        team_status: str,
+        task_status: str,
+        result: Mapping[str, Any],
+        error: Mapping[str, Any] | None = None,
+        artifacts: list[dict[str, Any]] | None = None,
+        events: list[Mapping[str, Any]] | None = None,
+        node_outcomes: list[Mapping[str, Any]] | None = None,
+        allow_steering: bool = True,
+        allow_ownership_repair: bool = False,
+    ) -> dict[str, Any]:
+        """Publish every expert-team terminal projection in one transaction.
+
+        ``team_runs`` is an orchestration extension table, while Task, Run,
+        node, command, artifact and event rows are core runtime state.  The
+        transaction boundary exposed by :class:`TaskStateService` is the only
+        safe place to make those projections visible: either all of them
+        commit, or none of them do.
+        """
+
+        if task_status not in {"completed", "failed", "cancelled"}:
+            raise ValueError("task_status must be terminal")
+        if not team_status:
+            raise ValueError("team_status cannot be empty")
+        result_payload = dict(result)
+        error_payload = dict(error or {})
+        event_values = [dict(item) for item in events or []]
+        outcome_values = [dict(item) for item in node_outcomes or []]
+        now = db.utc_now()
+        idempotent = False
+        terminal_status = task_status
+        with self.task_state.transaction(write=True) as conn:
+            team_row = conn.execute(
+                "SELECT * FROM team_runs WHERE id = ?", (team_run_id,)
+            ).fetchone()
+            if team_row is None:
+                raise ExpertNotFoundError("专家团运行不存在")
+            task_id = str(team_row["parent_task_id"])
+            task = conn.execute(
+                "SELECT * FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            run = conn.execute(
+                "SELECT * FROM task_runs WHERE id = ?", (parent_run_id,)
+            ).fetchone()
+            if task is None or run is None or str(run["task_id"]) != task_id:
+                raise PublicationConflict("专家团父任务与父运行不一致")
+            if str(team_row["parent_run_id"] or "") != parent_run_id:
+                raise PublicationConflict("专家团运行不再拥有指定父运行")
+            if str(task["executor_type"] or "agent") != "team":
+                raise PublicationConflict("父任务不再由专家团执行器拥有")
+            if (
+                not allow_ownership_repair
+                and str(task["executor_id"] or "") != str(team_row["team_id"] or "")
+            ):
+                raise PublicationConflict("父任务绑定的专家团与运行记录不一致")
+
+            if (
+                str(task["status"] or "") == task_status
+                and str(run["status"] or "") == task_status
+                and str(team_row["status"] or "") == team_status
+                and str(run["intake_state"] or "") == "closed"
+                and int(run["accepted_generation"] or 0)
+                == int(run["applied_generation"] or 0)
+                and not self._terminal_residue_in_transaction(
+                    conn, task_id=task_id, run_id=parent_run_id
+                )
+            ):
+                idempotent = True
+            else:
+                if str(task["status"] or "") not in {
+                    "queued", "running", "waiting_approval", "failed"
+                }:
+                    raise PublicationConflict("专家团父任务已由其他终态提交关闭")
+                if str(run["status"] or "") not in {
+                    "queued", "running", "paused", "waiting_approval"
+                }:
+                    raise PublicationConflict("专家团父运行已由其他终态提交关闭")
+                if str(run["intake_state"] or "open") != "open":
+                    raise PublicationConflict("专家团父运行已经关闭输入")
+
+                commands = conn.execute(
+                    """
+                    SELECT * FROM task_commands
+                    WHERE task_id = ? AND (run_id = ? OR run_id IS NULL)
+                      AND status IN ('queued', 'claimed')
+                    ORDER BY priority DESC, intake_generation, created_at, id
+                    """,
+                    (task_id, parent_run_id),
+                ).fetchall()
+                cancel_rows = [
+                    row for row in commands if str(row["command_type"]) == "cancel"
+                ]
+                message_rows = [
+                    row for row in commands if str(row["command_type"]) == "message"
+                ]
+                if cancel_rows:
+                    terminal_status = "cancelled"
+                    team_status = "cancelled"
+                    raw_cancel_payload = deserialize_checkpoint_state(
+                        cancel_rows[0]["payload_json"] or "{}"
+                    ) or {}
+                    cancel_payload = (
+                        dict(raw_cancel_payload)
+                        if isinstance(raw_cancel_payload, Mapping)
+                        else {}
+                    )
+                    reason = str(
+                        cancel_payload.get("reason")
+                        or "用户请求取消"
+                    )
+                    result_payload = {
+                        "cancelled": True,
+                        "summary": reason,
+                        "team_run_id": team_run_id,
+                    }
+                    error_payload = {}
+                    event_values = [
+                        {
+                            "type": "cancelled",
+                            "title": "专家团任务已取消",
+                            "content": reason,
+                            "data": {
+                                "team_run_id": team_run_id,
+                                "cancel_command_ids": [str(row["id"]) for row in cancel_rows],
+                            },
+                        }
+                    ]
+                    outcome_values = []
+                elif message_rows and allow_steering:
+                    raise ExpertTeamSteeringRequested(
+                        "新的运行中指令先于专家团终态发布到达"
+                    )
+
+                serialized_result = serialize_checkpoint_state(result_payload)
+                serialized_error = serialize_checkpoint_state(error_payload)
+                artifact_payload = (
+                    serialize_checkpoint_state(artifacts)
+                    if artifacts is not None
+                    else str(task["artifacts_json"] or "[]")
+                )
+
+                for outcome in outcome_values:
+                    node_id = str(outcome.get("node_id") or "")
+                    node_status = str(outcome.get("status") or "")
+                    if not node_id or node_status not in {
+                        "completed", "failed", "skipped", "cancelled"
+                    }:
+                        raise ValueError("node_outcomes contains an invalid terminal outcome")
+                    node = conn.execute(
+                        "SELECT status FROM task_nodes WHERE id = ? AND run_id = ?",
+                        (node_id, parent_run_id),
+                    ).fetchone()
+                    if node is None:
+                        raise PublicationConflict("专家团终态引用了不存在的父运行节点")
+                    if str(node["status"]) in {"pending", "running"}:
+                        conn.execute(
+                            """
+                            UPDATE task_nodes
+                            SET status = ?, output_json = ?, error_json = ?,
+                                finished_at = ?, updated_at = ?
+                            WHERE id = ? AND run_id = ?
+                              AND status IN ('pending', 'running')
+                            """,
+                            (
+                                node_status,
+                                serialize_checkpoint_state(dict(outcome.get("output") or {})),
+                                serialize_checkpoint_state(dict(outcome.get("error") or {})),
+                                now,
+                                now,
+                                node_id,
+                                parent_run_id,
+                            ),
+                        )
+
+                if terminal_status == "completed":
+                    conn.execute(
+                        """
+                        UPDATE task_nodes
+                        SET status = 'completed', finished_at = ?, updated_at = ?
+                        WHERE run_id = ? AND status = 'running'
+                        """,
+                        (now, now, parent_run_id),
+                    )
+                    conn.execute(
+                        """
+                        UPDATE task_nodes
+                        SET status = 'cancelled',
+                            output_json = ?, finished_at = ?, updated_at = ?
+                        WHERE run_id = ? AND status = 'pending'
+                        """,
+                        (
+                            serialize_checkpoint_state(
+                                {
+                                    "summary": "当前专家团交付已完成，该节点无需继续",
+                                    "completion_kind": "not_needed",
+                                }
+                            ),
+                            now,
+                            now,
+                            parent_run_id,
+                        ),
+                    )
+                elif terminal_status == "failed":
+                    conn.execute(
+                        """
+                        UPDATE task_nodes
+                        SET status = 'failed', error_json = ?,
+                            finished_at = ?, updated_at = ?
+                        WHERE run_id = ? AND status = 'running'
+                        """,
+                        (serialized_error, now, now, parent_run_id),
+                    )
+                    conn.execute(
+                        """
+                        UPDATE task_nodes
+                        SET status = 'cancelled', output_json = ?,
+                            finished_at = ?, updated_at = ?
+                        WHERE run_id = ? AND status = 'pending'
+                        """,
+                        (
+                            serialize_checkpoint_state(
+                                {
+                                    "summary": "专家团运行失败，后续节点未执行",
+                                    "completion_kind": "failed",
+                                }
+                            ),
+                            now,
+                            now,
+                            parent_run_id,
+                        ),
+                    )
+                else:
+                    conn.execute(
+                        """
+                        UPDATE task_nodes
+                        SET status = 'cancelled', output_json = ?,
+                            finished_at = ?, updated_at = ?
+                        WHERE run_id = ? AND status IN ('pending', 'running')
+                        """,
+                        (
+                            serialize_checkpoint_state(
+                                {
+                                    "summary": "用户已取消专家团运行",
+                                    "completion_kind": "cancelled",
+                                }
+                            ),
+                            now,
+                            now,
+                            parent_run_id,
+                        ),
+                    )
+
+                if terminal_status == "cancelled":
+                    cancel_ids = {str(row["id"]) for row in cancel_rows}
+                    for row in commands:
+                        command_id = str(row["id"])
+                        if command_id in cancel_ids:
+                            conn.execute(
+                                """
+                                UPDATE task_commands
+                                SET status = 'completed', result_json = ?,
+                                    completed_at = ?, updated_at = ?
+                                WHERE id = ? AND status IN ('queued', 'claimed')
+                                """,
+                                (
+                                    serialize_checkpoint_state(
+                                        {"cancelled": True, "team_run_id": team_run_id}
+                                    ),
+                                    now,
+                                    now,
+                                    command_id,
+                                ),
+                            )
+                        else:
+                            conn.execute(
+                                """
+                                UPDATE task_commands
+                                SET status = 'cancelled', result_json = ?,
+                                    completed_at = ?, updated_at = ?
+                                WHERE id = ? AND status IN ('queued', 'claimed')
+                                """,
+                                (
+                                    serialize_checkpoint_state(
+                                        {"cancelled": True, "reason": "task_cancelled"}
+                                    ),
+                                    now,
+                                    now,
+                                    command_id,
+                                ),
+                            )
+                else:
+                    conn.execute(
+                        """
+                        UPDATE task_commands
+                        SET status = 'failed', error_json = ?,
+                            completed_at = ?, updated_at = ?
+                        WHERE task_id = ? AND (run_id = ? OR run_id IS NULL)
+                          AND status IN ('queued', 'claimed')
+                        """,
+                        (
+                            serialize_checkpoint_state(
+                                {"message": "专家团运行已经结束", "terminal_status": terminal_status}
+                            ),
+                            now,
+                            now,
+                            task_id,
+                            parent_run_id,
+                        ),
+                    )
+
+                conn.execute(
+                    """
+                    UPDATE artifacts
+                    SET delivery_status = 'rejected', verification_id = '', published_at = ''
+                    WHERE task_id = ? AND run_id = ?
+                      AND delivery_status = 'pending_verification'
+                    """,
+                    (task_id, parent_run_id),
+                )
+                team_update = conn.execute(
+                    """
+                    UPDATE team_runs
+                    SET status = ?, result_json = ?, error_json = ?,
+                        finished_at = ?, updated_at = ?
+                    WHERE id = ? AND parent_run_id = ?
+                    """,
+                    (
+                        team_status,
+                        serialized_result,
+                        serialized_error,
+                        now,
+                        now,
+                        team_run_id,
+                        parent_run_id,
+                    ),
+                )
+                if team_update.rowcount != 1:
+                    raise PublicationConflict("专家团运行终态 CAS 失败")
+                task_update = conn.execute(
+                    """
+                    UPDATE tasks
+                    SET status = ?, result_json = ?, artifacts_json = ?, updated_at = ?
+                    WHERE id = ? AND status IN ('queued', 'running', 'waiting_approval', 'failed')
+                    """,
+                    (
+                        terminal_status,
+                        serialized_result,
+                        artifact_payload,
+                        now,
+                        task_id,
+                    ),
+                )
+                if task_update.rowcount != 1:
+                    raise PublicationConflict("专家团父任务终态 CAS 失败")
+
+                metadata = deserialize_checkpoint_state(run["metadata_json"] or "{}") or {}
+                metadata.update(
+                    {
+                        "completion_kind": (
+                            "expert_team_clarification"
+                            if result_payload.get("needs_clarification")
+                            else "expert_team"
+                        ),
+                        "team_run_id": team_run_id,
+                        "team_status": team_status,
+                    }
+                )
+                accepted_generation = int(run["accepted_generation"] or 0)
+                run_update = conn.execute(
+                    """
+                    UPDATE task_runs
+                    SET status = ?, result_json = ?, error_json = ?, metadata_json = ?,
+                        current_node_id = '', intake_state = 'closed', intake_closed_at = ?,
+                        applied_generation = ?, started_at = CASE WHEN started_at = '' THEN ? ELSE started_at END,
+                        finished_at = ?, updated_at = ?
+                    WHERE id = ? AND status IN ('queued', 'running', 'paused', 'waiting_approval')
+                      AND intake_state = 'open' AND accepted_generation = ?
+                    """,
+                    (
+                        terminal_status,
+                        serialized_result,
+                        serialized_error,
+                        serialize_checkpoint_state(metadata),
+                        now,
+                        accepted_generation,
+                        now,
+                        now,
+                        now,
+                        parent_run_id,
+                        accepted_generation,
+                    ),
+                )
+                if run_update.rowcount != 1:
+                    raise PublicationConflict("专家团父运行终态 CAS 失败")
+                for event in event_values:
+                    self._insert_event_in_transaction(
+                        conn, task_id=task_id, now=now, event=event
+                    )
+
+                final_run = conn.execute(
+                    "SELECT * FROM task_runs WHERE id = ?", (parent_run_id,)
+                ).fetchone()
+                if (
+                    final_run is None
+                    or str(final_run["status"]) != terminal_status
+                    or str(final_run["intake_state"]) != "closed"
+                    or int(final_run["accepted_generation"] or 0)
+                    != int(final_run["applied_generation"] or 0)
+                    or self._terminal_residue_in_transaction(
+                        conn, task_id=task_id, run_id=parent_run_id
+                    )
+                ):
+                    raise PublicationConflict("专家团终态提交未满足核心运行不变量")
+
+        self.task_state.assert_terminal_clean(
+            task_id=str(team_row["parent_task_id"]), run_id=parent_run_id
+        )
+        return {
+            "idempotent": idempotent,
+            "status": terminal_status,
+            "team_status": team_status,
+            "team_run_id": team_run_id,
+            "parent_run_id": parent_run_id,
+        }
+
+    def _apply_pending_team_messages(
+        self, team_run_id: str, parent_run_id: str
+    ) -> dict[str, Any] | None:
+        """Atomically bind queued messages to a revised expert-team goal."""
+
+        now = db.utc_now()
+        with self.task_state.transaction(write=True) as conn:
+            team_row = conn.execute(
+                "SELECT * FROM team_runs WHERE id = ?", (team_run_id,)
+            ).fetchone()
+            run = conn.execute(
+                "SELECT * FROM task_runs WHERE id = ?", (parent_run_id,)
+            ).fetchone()
+            if team_row is None or run is None:
+                raise PublicationConflict("专家团运行或父运行不存在")
+            task_id = str(team_row["parent_task_id"])
+            cancel = conn.execute(
+                """
+                SELECT 1 FROM task_commands
+                WHERE task_id = ? AND (run_id = ? OR run_id IS NULL)
+                  AND command_type = 'cancel' AND status IN ('queued', 'claimed')
+                LIMIT 1
+                """,
+                (task_id, parent_run_id),
+            ).fetchone()
+            if cancel is not None:
+                return {"cancel_requested": True}
+            rows = conn.execute(
+                """
+                SELECT * FROM task_commands
+                WHERE task_id = ? AND (run_id = ? OR run_id IS NULL)
+                  AND command_type = 'message' AND status IN ('queued', 'claimed')
+                ORDER BY intake_generation, created_at, id
+                """,
+                (task_id, parent_run_id),
+            ).fetchall()
+            if not rows:
+                return None
+            messages: list[str] = []
+            for row in rows:
+                payload = deserialize_checkpoint_state(row["payload_json"] or "{}") or {}
+                message = str(payload.get("message") or "").strip()
+                if not message:
+                    raise PublicationConflict("专家团收到空的运行中指令")
+                messages.append(message)
+            generations = [int(row["intake_generation"] or 0) for row in rows]
+            applied = int(run["applied_generation"] or 0)
+            target_generation = max(generations)
+            if sorted(set(generations)) != list(range(applied + 1, target_generation + 1)):
+                raise PublicationConflict("专家团运行中指令的输入代次不连续")
+            if target_generation > int(run["accepted_generation"] or 0):
+                raise PublicationConflict("专家团运行中指令超出已接受输入代次")
+
+            result = deserialize_checkpoint_state(team_row["result_json"] or "{}") or {}
+            previous_goal = str(result.get("goal_snapshot") or "")
+            if not previous_goal:
+                task = conn.execute(
+                    "SELECT message FROM tasks WHERE id = ?", (task_id,)
+                ).fetchone()
+                previous_goal = str((task or {})["message"] if task else "")
+            mode = self._team_steering_mode(messages)
+            incoming = "\n".join(messages)
+            revised_goal = (
+                incoming
+                if mode == "replace" or not previous_goal
+                else f"{previous_goal}\n补充要求：{incoming}"
+            )
+            revision = int(result.get("goal_revision") or 1) + 1
+            revisions = list(result.get("goal_revisions") or [])
+            revisions.append(
+                {
+                    "revision": revision,
+                    "previous_goal": previous_goal,
+                    "goal": revised_goal,
+                    "mode": mode,
+                    "command_ids": [str(row["id"]) for row in rows],
+                    "applied_at": now,
+                }
+            )
+            result.update(
+                {
+                    "goal_snapshot": revised_goal,
+                    "goal_revision": revision,
+                    "goal_revisions": revisions[-20:],
+                }
+            )
+            conn.execute(
+                """
+                UPDATE task_nodes
+                SET status = 'cancelled', output_json = ?,
+                    finished_at = ?, updated_at = ?
+                WHERE run_id = ? AND status IN ('pending', 'running')
+                """,
+                (
+                    serialize_checkpoint_state(
+                        {
+                            "summary": "收到新的运行中指令，旧目标节点已停止",
+                            "completion_kind": "superseded_by_message",
+                            "goal_revision": revision,
+                        }
+                    ),
+                    now,
+                    now,
+                    parent_run_id,
+                ),
+            )
+            conn.execute(
+                """
+                UPDATE team_runs
+                SET status = 'running', result_json = ?, error_json = '{}',
+                    finished_at = '', updated_at = ?
+                WHERE id = ? AND parent_run_id = ?
+                """,
+                (
+                    serialize_checkpoint_state(result),
+                    now,
+                    team_run_id,
+                    parent_run_id,
+                ),
+            )
+            for row in rows:
+                command_result = {
+                    "applied": True,
+                    "executor_type": "team",
+                    "team_run_id": team_run_id,
+                    "goal_revision": revision,
+                    "goal_snapshot": revised_goal,
+                }
+                conn.execute(
+                    """
+                    UPDATE task_commands
+                    SET status = 'completed', worker_id = ?, claimed_at = CASE
+                            WHEN claimed_at = '' THEN ? ELSE claimed_at END,
+                        result_json = ?, completed_at = ?, updated_at = ?
+                    WHERE id = ? AND status IN ('queued', 'claimed')
+                    """,
+                    (
+                        f"expert-team:{team_run_id}",
+                        now,
+                        serialize_checkpoint_state(command_result),
+                        now,
+                        now,
+                        row["id"],
+                    ),
+                )
+            run_update = conn.execute(
+                """
+                UPDATE task_runs
+                SET applied_generation = ?, updated_at = ?
+                WHERE id = ? AND applied_generation = ? AND intake_state = 'open'
+                """,
+                (target_generation, now, parent_run_id, applied),
+            )
+            if run_update.rowcount != 1:
+                raise PublicationConflict("专家团运行中指令应用 CAS 失败")
+            self._insert_event_in_transaction(
+                conn,
+                task_id=task_id,
+                now=now,
+                event={
+                    "type": "steering",
+                    "title": "已应用运行中指令",
+                    "content": "专家团已停止旧候选，正在按最新要求重新执行成员分析与主管验收。",
+                    "data": {
+                        "team_run_id": team_run_id,
+                        "goal_revision": revision,
+                        "mode": mode,
+                        "command_ids": [str(row["id"]) for row in rows],
+                    },
+                },
+            )
+        return {
+            "cancel_requested": False,
+            "goal_snapshot": revised_goal,
+            "goal_revision": revision,
+            "command_ids": [str(row["id"]) for row in rows],
+        }
+
+    def _finish_if_cancel_requested(
+        self, team_run_id: str, parent_run_id: str
+    ) -> bool:
+        row = db.query_one(
+            "SELECT parent_task_id FROM team_runs WHERE id = ?", (team_run_id,)
+        )
+        if not row or not self.task_state.is_cancel_requested(
+            str(row["parent_task_id"]), run_id=parent_run_id
+        ):
+            return False
+        self._commit_team_terminal(
+            team_run_id=team_run_id,
+            parent_run_id=parent_run_id,
+            team_status="cancelled",
+            task_status="cancelled",
+            result={"cancelled": True, "team_run_id": team_run_id},
+            allow_steering=False,
+        )
+        return True
+
     def _begin_parent_run(self, team_run: dict[str, Any], *, trigger: str) -> dict[str, Any]:
         parent_run_id = str(team_run.get("parent_run_id") or "")
         if not parent_run_id:
@@ -1202,15 +2695,20 @@ class ExpertTeamService:
             )
             parent_run_id = created["id"]
             db.execute("UPDATE team_runs SET parent_run_id = ?, updated_at = ? WHERE id = ?", (parent_run_id, db.utc_now(), team_run["id"]))
+        current = self.task_state.get_run(parent_run_id)
+        if current and current.get("status") == "running":
+            metadata = current.get("metadata") or {}
+            if (
+                str(metadata.get("executor_type") or "team") != "team"
+                or str(metadata.get("executor_id") or team_run["team_id"])
+                != str(team_run["team_id"])
+            ):
+                raise PublicationConflict("专家团父运行的持久执行器所有权不一致")
+            return current
         return self.task_state.begin_run(
             team_run["parent_task_id"], run_id=parent_run_id,
             metadata={"executor_type": "team", "team_run_id": team_run["id"], "trigger": trigger},
         )
-
-    def _finish_parent_failed(self, parent_run_id: str, error: dict[str, Any]) -> None:
-        current = self.task_state.get_run(parent_run_id)
-        if current and current["status"] not in {"completed", "failed", "cancelled"}:
-            self.task_state.finish_run(parent_run_id, status="failed", error=error)
 
     async def run_team(self, team_run_id: str) -> None:
         row = db.query_one("SELECT * FROM team_runs WHERE id = ?", (team_run_id,))
@@ -1218,121 +2716,241 @@ class ExpertTeamService:
             return
         team_run = self._run_api(row, include_members=False)
         scope = self._scope_for_run(team_run)
-        team = self.get_team(team_run["team_id"], scope)
-        if not team:
-            self._fail_team_run(team_run, "专家团不存在或当前作用域无权访问")
-            return
         parent_run: dict[str, Any] | None = None
         try:
             parent_run = self._begin_parent_run(team_run, trigger="team_start")
-            parent = db.query_one(
-                "SELECT * FROM tasks WHERE id = ?", (team_run["parent_task_id"],)
-            ) or {}
-            intent = await self.runtime.resolve_task_goal(parent)
-            goal_snapshot = str(intent.get("standalone_request") or parent.get("message") or "")
-            routing_result = {
-                **(team_run.get("result") or {}),
-                "goal_snapshot": goal_snapshot,
-                "intent_resolution": intent,
-            }
-            db.execute(
-                "UPDATE team_runs SET result_json = ?, updated_at = ? WHERE id = ?",
-                (db.json_dumps(routing_result), db.utc_now(), team_run_id),
-            )
-            team_run["result"] = routing_result
-            missing = [
-                str(item).strip()
-                for item in intent.get("missing_information") or []
-                if str(item).strip()
-            ]
-            if missing:
-                clarification = "在安排专家协作前，还需要你补充：" + "；".join(missing[:5]) + "。"
-                result = {
-                    **routing_result,
-                    "summary": clarification,
-                    "needs_clarification": True,
-                    "missing_information": missing[:20],
-                }
-                finished = db.utc_now()
-                db.execute(
-                    """UPDATE team_runs SET status = 'completed', result_json = ?,
-                       finished_at = ?, updated_at = ? WHERE id = ?""",
-                    (db.json_dumps(result), finished, finished, team_run_id),
+            team = self.get_team(team_run["team_id"], scope)
+            if not team:
+                self._fail_team_run(
+                    team_run,
+                    "专家团不存在或当前作用域无权访问",
+                    parent_run_id=parent_run["id"],
                 )
-                db.update_task_status(team_run["parent_task_id"], "completed", result=result)
+                return
+            while True:
+                if self._finish_if_cancel_requested(team_run_id, parent_run["id"]):
+                    return
+                latest_row = db.query_one(
+                    "SELECT * FROM team_runs WHERE id = ?", (team_run_id,)
+                ) or {}
+                team_run = self._run_api(latest_row, include_members=False)
+                parent = db.query_one(
+                    "SELECT * FROM tasks WHERE id = ?", (team_run["parent_task_id"],)
+                ) or {}
+                current_goal = str(
+                    (team_run.get("result") or {}).get("goal_snapshot")
+                    or parent.get("message")
+                    or ""
+                )
+                intent = await self.runtime.resolve_task_goal(
+                    {**parent, "message": current_goal}
+                )
+                goal_snapshot = str(
+                    intent.get("standalone_request") or current_goal
+                )
+                routing_result = {
+                    **(team_run.get("result") or {}),
+                    "goal_snapshot": goal_snapshot,
+                    "goal_revision": max(
+                        1, int((team_run.get("result") or {}).get("goal_revision") or 1)
+                    ),
+                    "intent_resolution": intent,
+                }
+                db.execute(
+                    "UPDATE team_runs SET result_json = ?, updated_at = ? WHERE id = ?",
+                    (db.json_dumps(routing_result), db.utc_now(), team_run_id),
+                )
+                team_run["result"] = routing_result
+                applied = self._apply_pending_team_messages(
+                    team_run_id, parent_run["id"]
+                )
+                if applied:
+                    if applied.get("cancel_requested"):
+                        self._finish_if_cancel_requested(team_run_id, parent_run["id"])
+                        return
+                    continue
+                missing = [
+                    str(item).strip()
+                    for item in intent.get("missing_information") or []
+                    if str(item).strip()
+                ]
+                if missing:
+                    formatter = getattr(
+                        self.runtime, "_readable_missing_information_labels", None
+                    )
+                    readable = (
+                        formatter(missing[:5], str(intent.get("intent") or ""))
+                        if callable(formatter)
+                        else missing[:5]
+                    )
+                    clarification = (
+                        "在安排专家协作前，还需要你补充："
+                        + "；".join(readable or missing[:5])
+                        + "。"
+                    )
+                    result = {
+                        **routing_result,
+                        "summary": clarification,
+                        "needs_clarification": True,
+                        "missing_information": missing[:20],
+                    }
+                    try:
+                        self._commit_team_terminal(
+                            team_run_id=team_run_id,
+                            parent_run_id=parent_run["id"],
+                            team_status="completed",
+                            task_status="completed",
+                            result=result,
+                            artifacts=[],
+                            events=[
+                                {
+                                    "type": "plan_progress",
+                                    "title": "专家协作进度",
+                                    "content": "已确认需要补充关键信息，暂不启动专家成员。",
+                                    "data": {"node_id": "understand", "status": "completed"},
+                                },
+                                {
+                                    "type": "clarification",
+                                    "title": "需要补充信息",
+                                    "content": clarification,
+                                    "data": {"missing_information": missing[:20]},
+                                },
+                                {
+                                    "type": "answer",
+                                    "title": "请补充一下",
+                                    "content": clarification,
+                                },
+                                {
+                                    "type": "done",
+                                    "title": "等待补充",
+                                    "content": "补充后可在当前对话重新提交专家任务。",
+                                },
+                            ],
+                        )
+                        return
+                    except ExpertTeamSteeringRequested:
+                        applied = self._apply_pending_team_messages(
+                            team_run_id, parent_run["id"]
+                        )
+                        if applied and applied.get("cancel_requested"):
+                            self._finish_if_cancel_requested(team_run_id, parent_run["id"])
+                            return
+                        continue
                 self._emit_team_progress(
                     team_run["parent_task_id"], "understand", "completed",
-                    "已确认需要补充关键信息，暂不启动专家成员。",
+                    "已结合当前对话确认目标，并固定本次专家分工。",
                 )
-                emit(
-                    team_run["parent_task_id"], "clarification", "需要补充信息",
-                    clarification, {"missing_information": missing[:20]},
+                now = db.utc_now()
+                db.execute(
+                    """UPDATE team_runs SET status = 'running',
+                       started_at = CASE WHEN started_at = '' THEN ? ELSE started_at END,
+                       updated_at = ? WHERE id = ?""",
+                    (now, now, team_run_id),
                 )
-                emit(team_run["parent_task_id"], "answer", "请补充一下", clarification)
-                emit(team_run["parent_task_id"], "done", "等待补充", "补充后可在当前对话重新提交专家任务。")
-                current = self.task_state.get_run(parent_run["id"])
-                if current and current["status"] not in {"completed", "failed", "cancelled"}:
-                    self.task_state.finish_run(parent_run["id"], result=result)
-                return
-            self._emit_team_progress(
-                team_run["parent_task_id"], "understand", "completed",
-                "已结合当前对话确认目标，并固定本次专家分工。",
-            )
-            now = db.utc_now()
-            db.execute(
-                "UPDATE team_runs SET status = 'running', started_at = ?, updated_at = ? WHERE id = ?",
-                (now, now, team_run_id),
-            )
-            db.update_task_status(team_run["parent_task_id"], "running")
-            self._emit_team_progress(
-                team_run["parent_task_id"], "execute", "running",
-                f"{len(team['members'])} 位专家正在独立并行分析。",
-            )
-            emit(
-                team_run["parent_task_id"], "team_parallel_start", "专家成员并行执行中",
-                f"{len(team['members'])} 位成员已同时启动，每位成员使用独立对话上下文。",
-                {"team_run_id": team_run_id, "member_ids": [item["id"] for item in team["members"]]},
-            )
-            attempts: list[tuple[dict[str, Any], str, str]] = []
-            for index, member in enumerate(team["members"]):
-                member_run, child_run_id = self._create_member_attempt(team_run, team, member)
+                db.update_task_status(team_run["parent_task_id"], "running")
                 self._emit_team_progress(
                     team_run["parent_task_id"], "execute", "running",
-                    f"{member.get('role') or '专家'}已开始分析。",
-                    child_id=f"expert:{member['id']}",
-                    child_title=str(member.get("role") or member["agent_id"]),
+                    f"{len(team['members'])} 位专家正在独立并行分析。",
                 )
-                node = self.task_state.create_node(
-                    parent_run["id"], f"expert:{member['id']}", f"{member.get('role') or '专家'} · {member['agent_id']}",
-                    kind="agent", sequence=index + 1,
-                    input_data={"member_id": member["id"], "child_task_id": member_run["child_task_id"]},
-                    metadata={"execution_mode": "parallel", "isolated_context": True},
+                emit(
+                    team_run["parent_task_id"], "team_parallel_start", "专家成员并行执行中",
+                    f"{len(team['members'])} 位成员已同时启动，每位成员使用独立对话上下文。",
+                    {
+                        "team_run_id": team_run_id,
+                        "goal_revision": routing_result["goal_revision"],
+                        "member_ids": [item["id"] for item in team["members"]],
+                    },
                 )
-                attempts.append((member_run, child_run_id, node["id"]))
-            # Creating every child before scheduling and awaiting one gather is
-            # intentional: no member waits for another member to finish.
-            await asyncio.gather(
-                *(self._execute_member_attempt(member_run, child_run_id, node_id) for member_run, child_run_id, node_id in attempts)
-            )
-            latest_by_member = {
-                item["member_id"]: item for item in self._latest_member_runs(team_run_id)
-            }
-            for member in team["members"]:
-                member_status = str((latest_by_member.get(member["id"]) or {}).get("status") or "failed")
-                public_status = "completed" if member_status == "completed" else "failed"
-                self._emit_team_progress(
-                    team_run["parent_task_id"], "execute", public_status,
-                    f"{member.get('role') or '专家'}{'已完成分析' if public_status == 'completed' else '未能完成分析'}。",
-                    child_id=f"expert:{member['id']}",
-                    child_title=str(member.get("role") or member["agent_id"]),
+                attempts: list[tuple[dict[str, Any], str, str]] = []
+                for index, member in enumerate(team["members"]):
+                    member_run, child_run_id = self._create_member_attempt(
+                        team_run, team, member
+                    )
+                    self._emit_team_progress(
+                        team_run["parent_task_id"], "execute", "running",
+                        f"{member.get('role') or '专家'}已开始分析。",
+                        child_id=f"expert:{member['id']}",
+                        child_title=str(member.get("role") or member["agent_id"]),
+                    )
+                    node_key = f"expert:{member['id']}"
+                    if int(member_run.get("attempt") or 1) > 1:
+                        node_key += f":attempt:{member_run['attempt']}"
+                    node = self.task_state.create_node(
+                        parent_run["id"], node_key,
+                        f"{member.get('role') or '专家'} · {member['agent_id']}",
+                        kind="agent", sequence=index + 1,
+                        input_data={
+                            "member_id": member["id"],
+                            "child_task_id": member_run["child_task_id"],
+                            "goal_revision": routing_result["goal_revision"],
+                        },
+                        metadata={"execution_mode": "parallel", "isolated_context": True},
+                    )
+                    attempts.append((member_run, child_run_id, node["id"]))
+                # Creating every child before scheduling and awaiting one gather
+                # is intentional: no member waits for another member to finish.
+                await asyncio.gather(
+                    *(
+                        self._execute_member_attempt(member_run, child_run_id, node_id)
+                        for member_run, child_run_id, node_id in attempts
+                    )
                 )
-            await self._complete_or_pause(team_run_id, parent_run["id"])
+                if self._finish_if_cancel_requested(team_run_id, parent_run["id"]):
+                    return
+                applied = self._apply_pending_team_messages(
+                    team_run_id, parent_run["id"]
+                )
+                if applied:
+                    if applied.get("cancel_requested"):
+                        self._finish_if_cancel_requested(team_run_id, parent_run["id"])
+                        return
+                    continue
+                latest_by_member = {
+                    item["member_id"]: item
+                    for item in self._latest_member_runs(team_run_id)
+                }
+                for member in team["members"]:
+                    member_status = str(
+                        (latest_by_member.get(member["id"]) or {}).get("status")
+                        or "failed"
+                    )
+                    public_status = (
+                        "completed" if member_status == "completed" else "failed"
+                    )
+                    self._emit_team_progress(
+                        team_run["parent_task_id"], "execute", public_status,
+                        f"{member.get('role') or '专家'}{'已完成分析' if public_status == 'completed' else '未能完成分析'}。",
+                        child_id=f"expert:{member['id']}",
+                        child_title=str(member.get("role") or member["agent_id"]),
+                    )
+                try:
+                    await self._complete_or_pause(team_run_id, parent_run["id"])
+                    return
+                except ExpertTeamSteeringRequested:
+                    applied = self._apply_pending_team_messages(
+                        team_run_id, parent_run["id"]
+                    )
+                    if applied and applied.get("cancel_requested"):
+                        self._finish_if_cancel_requested(team_run_id, parent_run["id"])
+                        return
+                    continue
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            self._fail_team_run(team_run, str(exc))
             if parent_run:
-                self._finish_parent_failed(parent_run["id"], {"message": str(exc), "error_type": exc.__class__.__name__})
+                current = self.task_state.get_run(parent_run["id"])
+                if current and current.get("status") not in {
+                    "completed", "failed", "cancelled"
+                }:
+                    self._fail_team_run(
+                        team_run,
+                        str(exc),
+                        error={
+                            "message": str(exc),
+                            "error_type": exc.__class__.__name__,
+                        },
+                        parent_run_id=parent_run["id"],
+                    )
 
     async def _complete_or_pause(self, team_run_id: str, parent_run_id: str) -> None:
         raw_run = db.query_one("SELECT * FROM team_runs WHERE id = ?", (team_run_id,)) or {}
@@ -1349,20 +2967,37 @@ class ExpertTeamService:
                 "members": latest,
                 "retryable_member_run_ids": retryable,
             }
-            now = db.utc_now()
-            db.execute(
-                "UPDATE team_runs SET status = ?, result_json = ?, updated_at = ? WHERE id = ?",
-                (status, db.json_dumps(result), now, team_run_id),
-            )
-            db.update_task_status(team_run["parent_task_id"], "failed", result=result)
-            self._finish_parent_failed(parent_run_id, {"message": result["summary"], "retryable_member_run_ids": retryable})
-            emit(
-                team_run["parent_task_id"], "team_partial_failed", "专家团部分成员未完成",
-                result["summary"], {"team_run_id": team_run_id, "retryable_member_run_ids": retryable},
-            )
-            self._emit_team_progress(
-                team_run["parent_task_id"], "execute", "failed",
-                "部分专家未完成，可在专家团运行记录中单独重试。",
+            error = {
+                "message": result["summary"],
+                "error_type": "team_partial_failed",
+                "retryable_member_run_ids": retryable,
+                "waiting_for_member_approval": waiting,
+            }
+            self._commit_team_terminal(
+                team_run_id=team_run_id,
+                parent_run_id=parent_run_id,
+                team_status=status,
+                task_status="failed",
+                result=result,
+                error=error,
+                artifacts=[],
+                events=[
+                    {
+                        "type": "team_partial_failed",
+                        "title": "专家团部分成员未完成",
+                        "content": result["summary"],
+                        "data": {
+                            "team_run_id": team_run_id,
+                            "retryable_member_run_ids": retryable,
+                        },
+                    },
+                    {
+                        "type": "plan_progress",
+                        "title": "专家协作进度",
+                        "content": "部分专家未完成，可在专家团运行记录中单独重试。",
+                        "data": {"node_id": "execute", "status": "failed"},
+                    },
+                ],
             )
             return
         self._emit_team_progress(
@@ -1421,8 +3056,11 @@ class ExpertTeamService:
         child_run = self.task_state.create_run(
             child["id"], metadata={"team_run_id": team_run_id, "role": "supervisor", "aggregation_attempt": attempt}
         )
+        supervisor_node_key = "supervisor:aggregate"
+        if attempt > 1:
+            supervisor_node_key += f":attempt:{attempt}"
         node = self.task_state.create_node(
-            parent_run_id, "supervisor:aggregate", "主管汇总与验收", kind="agent",
+            parent_run_id, supervisor_node_key, "主管汇总与验收", kind="agent",
             input_data={"member_run_ids": [item["id"] for item in member_runs], "child_task_id": child["id"]},
             metadata={"aggregation_attempt": attempt},
         )
@@ -1442,11 +3080,35 @@ class ExpertTeamService:
         supervisor = self._task_output(child["id"])
         if supervisor.get("status") != "completed":
             error = {"message": "主管汇总任务失败", "supervisor": supervisor}
-            self.task_state.fail_node(node["id"], error)
-            self._fail_team_run(team_run, error["message"], error=error)
-            self._finish_parent_failed(parent_run_id, error)
-            self._emit_team_progress(
-                team_run["parent_task_id"], "validate", "failed", error["message"]
+            self._commit_team_terminal(
+                team_run_id=team_run_id,
+                parent_run_id=parent_run_id,
+                team_status="failed",
+                task_status="failed",
+                result={
+                    **(team_run.get("result") or {}),
+                    "error": error["message"],
+                    "team_run_id": team_run_id,
+                },
+                error=error,
+                artifacts=[],
+                node_outcomes=[
+                    {"node_id": node["id"], "status": "failed", "error": error}
+                ],
+                events=[
+                    {
+                        "type": "plan_progress",
+                        "title": "专家协作进度",
+                        "content": error["message"],
+                        "data": {"node_id": "validate", "status": "failed"},
+                    },
+                    {
+                        "type": "error",
+                        "title": "专家团任务失败",
+                        "content": error["message"],
+                        "data": {"team_run_id": team_run_id},
+                    },
+                ],
             )
             return
         artifacts: list[dict[str, Any]] = []
@@ -1475,13 +3137,6 @@ class ExpertTeamService:
             goal_snapshot=goal_snapshot,
         )
         result["validation"] = validation
-        emit(
-            team_run["parent_task_id"],
-            "output_check",
-            "专家团最终验收",
-            validation["message"],
-            validation,
-        )
         if not validation["passed"]:
             error = {
                 "message": validation["message"],
@@ -1489,86 +3144,131 @@ class ExpertTeamService:
                 "validation": validation,
                 "supervisor_task_id": child["id"],
             }
-            self.task_state.fail_node(node["id"], error)
-            finished = db.utc_now()
-            db.execute(
-                """UPDATE team_runs SET status = 'failed', result_json = ?, error_json = ?,
-                   finished_at = ?, updated_at = ? WHERE id = ?""",
-                (
-                    db.json_dumps(result), db.json_dumps(error), finished, finished,
-                    team_run_id,
-                ),
-            )
-            db.update_task_status(
-                team_run["parent_task_id"],
-                "failed",
+            self._commit_team_terminal(
+                team_run_id=team_run_id,
+                parent_run_id=parent_run_id,
+                team_status="failed",
+                task_status="failed",
                 result={**result, "error": validation["message"]},
+                error=error,
                 artifacts=artifacts,
+                node_outcomes=[
+                    {"node_id": node["id"], "status": "failed", "error": error}
+                ],
+                events=[
+                    {
+                        "type": "output_check",
+                        "title": "专家团最终验收",
+                        "content": validation["message"],
+                        "data": validation,
+                    },
+                    {
+                        "type": "plan_progress",
+                        "title": "专家协作进度",
+                        "content": validation["message"],
+                        "data": {"node_id": "validate", "status": "failed"},
+                    },
+                    {
+                        "type": "team_acceptance_failed",
+                        "title": "专家团验收未通过",
+                        "content": validation["message"],
+                        "data": {"team_run_id": team_run_id, "validation": validation},
+                    },
+                    {
+                        "type": "error",
+                        "title": "专家团验收未通过",
+                        "content": validation["message"],
+                        "data": {
+                            "team_run_id": team_run_id,
+                            "error_type": "acceptance_failed",
+                        },
+                    },
+                ],
             )
-            self._emit_team_progress(
-                team_run["parent_task_id"], "validate", "failed", validation["message"]
-            )
-            emit(
-                team_run["parent_task_id"],
-                "team_acceptance_failed",
-                "专家团验收未通过",
-                validation["message"],
-                {"team_run_id": team_run_id, "validation": validation},
-            )
-            emit(
-                team_run["parent_task_id"],
-                "error",
-                "专家团验收未通过",
-                validation["message"],
-                {"team_run_id": team_run_id, "error_type": "acceptance_failed"},
-            )
-            self._finish_parent_failed(parent_run_id, error)
             return
 
-        self.task_state.finish_node(
-            node["id"],
-            output={
-                "summary": supervisor.get("summary", ""),
-                "child_task_id": child["id"],
-                "validation": validation,
-            },
+        self._commit_team_terminal(
+            team_run_id=team_run_id,
+            parent_run_id=parent_run_id,
+            team_status="completed",
+            task_status="completed",
+            result=result,
+            artifacts=artifacts,
+            node_outcomes=[
+                {
+                    "node_id": node["id"],
+                    "status": "completed",
+                    "output": {
+                        "summary": supervisor.get("summary", ""),
+                        "child_task_id": child["id"],
+                        "validation": validation,
+                    },
+                }
+            ],
+            events=[
+                {
+                    "type": "output_check",
+                    "title": "专家团最终验收",
+                    "content": validation["message"],
+                    "data": validation,
+                },
+                {
+                    "type": "plan_progress",
+                    "title": "专家协作进度",
+                    "content": validation["message"],
+                    "data": {"node_id": "validate", "status": "completed"},
+                },
+                {
+                    "type": "answer",
+                    "title": "专家团最终答复",
+                    "content": str(result["summary"]),
+                    "data": {"team_run_id": team_run_id},
+                },
+                {
+                    "type": "team_completed",
+                    "title": "专家团任务已完成",
+                    "content": f"{len(member_runs)} 位成员已完成，主管汇总通过。",
+                    "data": {"team_run_id": team_run_id},
+                },
+            ],
         )
-        finished = db.utc_now()
-        db.execute(
-            """UPDATE team_runs SET status = 'completed', result_json = ?, error_json = '{}',
-               finished_at = ?, updated_at = ? WHERE id = ?""",
-            (db.json_dumps(result), finished, finished, team_run_id),
-        )
-        db.update_task_status(team_run["parent_task_id"], "completed", result=result, artifacts=artifacts)
-        self._emit_team_progress(
-            team_run["parent_task_id"], "validate", "completed",
-            validation["message"],
-        )
-        emit(team_run["parent_task_id"], "answer", "专家团最终答复", str(result["summary"]), {"team_run_id": team_run_id})
-        emit(
-            team_run["parent_task_id"], "team_completed", "专家团任务已完成",
-            f"{len(member_runs)} 位成员已完成，主管汇总通过。", {"team_run_id": team_run_id},
-        )
-        current = self.task_state.get_run(parent_run_id)
-        if current and current["status"] not in {"completed", "failed", "cancelled"}:
-            self.task_state.finish_run(parent_run_id, result=result)
 
     def _fail_team_run(
-        self, team_run: dict[str, Any], message: str, *, error: dict[str, Any] | None = None
+        self,
+        team_run: dict[str, Any],
+        message: str,
+        *,
+        error: dict[str, Any] | None = None,
+        parent_run_id: str = "",
     ) -> None:
         payload = error or {"message": message}
-        now = db.utc_now()
-        db.execute(
-            """UPDATE team_runs SET status = 'failed', error_json = ?, finished_at = ?,
-               updated_at = ? WHERE id = ?""",
-            (db.json_dumps(payload), now, now, team_run["id"]),
+        resolved_parent_run_id = parent_run_id or str(team_run.get("parent_run_id") or "")
+        if not resolved_parent_run_id:
+            raise PublicationConflict("专家团失败发布缺少父运行")
+        self._commit_team_terminal(
+            team_run_id=str(team_run["id"]),
+            parent_run_id=resolved_parent_run_id,
+            team_status="failed",
+            task_status="failed",
+            result={"error": message, "team_run_id": team_run["id"]},
+            error=payload,
+            artifacts=[],
+            allow_steering=False,
+            events=[
+                {
+                    "type": "plan_progress",
+                    "title": "专家协作进度",
+                    "content": "专家协作未能完成，请查看错误信息后重试。",
+                    "data": {"node_id": "execute", "status": "failed"},
+                },
+                {
+                    "type": "error",
+                    "title": "专家团任务失败",
+                    "content": message,
+                    "data": {"team_run_id": team_run["id"]},
+                },
+            ],
         )
-        db.update_task_status(team_run["parent_task_id"], "failed", result={"error": message, "team_run_id": team_run["id"]})
-        self._emit_team_progress(
-            team_run["parent_task_id"], "execute", "failed",
-            "专家协作未能完成，请查看错误信息后重试。",
-        )
-        emit(team_run["parent_task_id"], "error", "专家团任务失败", message, {"team_run_id": team_run["id"]})
 
     def validate_member_retry(
         self, team_run_id: str, member_run_id: str, scope: ExecutionScope
@@ -1604,17 +3304,58 @@ class ExpertTeamService:
         member = next((item for item in team["members"] if item["id"] == target["member_id"]), None)
         if not member:
             raise ExpertNotFoundError("专家团成员已不存在")
-        parent_run = self.task_state.create_run(
-            team_run["parent_task_id"],
-            metadata={"executor_type": "team", "team_run_id": team_run_id, "trigger": "member_retry", "member_id": member["id"]},
-        )
-        db.execute(
-            """UPDATE team_runs SET status = 'running', parent_run_id = ?, finished_at = '',
-               updated_at = ? WHERE id = ?""",
-            (parent_run["id"], db.utc_now(), team_run_id),
-        )
-        db.update_task_status(team_run["parent_task_id"], "queued")
-        parent_run = self.task_state.begin_run(team_run["parent_task_id"], run_id=parent_run["id"])
+        parent_run_id = _new_id("trun")
+        now = db.utc_now()
+        parent_metadata = {
+            "executor_type": "team",
+            "executor_id": team_run["team_id"],
+            "team_run_id": team_run_id,
+            "trigger": "member_retry",
+            "member_id": member["id"],
+        }
+        with self.task_state.transaction(write=True) as conn:
+            attempt = int(
+                conn.execute(
+                    "SELECT COALESCE(MAX(attempt), 0) + 1 FROM task_runs WHERE task_id = ?",
+                    (team_run["parent_task_id"],),
+                ).fetchone()[0]
+            )
+            conn.execute(
+                """
+                INSERT INTO task_runs(
+                    id, task_id, attempt, status, resumed_from_checkpoint_id,
+                    metadata_json, started_at, created_at, updated_at
+                ) VALUES (?, ?, ?, 'running', '', ?, ?, ?, ?)
+                """,
+                (
+                    parent_run_id,
+                    team_run["parent_task_id"],
+                    attempt,
+                    serialize_checkpoint_state(parent_metadata),
+                    now,
+                    now,
+                    now,
+                ),
+            )
+            task_update = conn.execute(
+                """
+                UPDATE tasks
+                SET status = 'running', result_json = '{}', artifacts_json = '[]',
+                    updated_at = ?
+                WHERE id = ? AND executor_type = 'team'
+                """,
+                (now, team_run["parent_task_id"]),
+            )
+            if task_update.rowcount != 1:
+                raise PublicationConflict("专家团父任务无法进入成员重试")
+            team_update = conn.execute(
+                """UPDATE team_runs SET status = 'running', parent_run_id = ?, finished_at = '',
+                   updated_at = ? WHERE id = ?""",
+                (parent_run_id, now, team_run_id),
+            )
+            if team_update.rowcount != 1:
+                raise PublicationConflict("专家团运行无法进入成员重试")
+        parent_run = self.task_state.get_run(parent_run_id) or {"id": parent_run_id}
         member_run, child_run_id = self._create_member_attempt(team_run, team, member)
         node = self.task_state.create_node(
             parent_run["id"], f"expert:{member['id']}:retry", f"单独重试 · {member.get('role') or member['agent_id']}",
@@ -1632,5 +3373,16 @@ class ExpertTeamService:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            self._fail_team_run(team_run, str(exc))
-            self._finish_parent_failed(parent_run["id"], {"message": str(exc), "error_type": exc.__class__.__name__})
+            current = self.task_state.get_run(parent_run["id"])
+            if current and current.get("status") not in {
+                "completed", "failed", "cancelled"
+            }:
+                self._fail_team_run(
+                    team_run,
+                    str(exc),
+                    error={
+                        "message": str(exc),
+                        "error_type": exc.__class__.__name__,
+                    },
+                    parent_run_id=parent_run["id"],
+                )

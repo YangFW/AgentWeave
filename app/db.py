@@ -23,6 +23,46 @@ def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
 
+def _execute_schema_script(
+    conn: sqlite3.Connection, script: str
+) -> None:
+    """Execute a DDL script without ``executescript``'s implicit COMMIT.
+
+    Numbered migrations are wrapped in an explicit transaction below.  The
+    stdlib ``Connection.executescript`` commits any open transaction before it
+    starts, which can otherwise leave half of a failed migration installed but
+    absent from ``schema_migrations``.  ``complete_statement`` keeps compound
+    SQL such as triggers intact while each completed statement participates in
+    the caller's transaction.
+    """
+
+    pending = ""
+    for line in script.splitlines(keepends=True):
+        pending += line
+        if not sqlite3.complete_statement(pending):
+            continue
+        statement = pending.strip()
+        pending = ""
+        if statement:
+            conn.execute(statement)
+    if pending.strip():
+        raise sqlite3.OperationalError("incomplete schema migration statement")
+
+
+class _AtomicMigrationConnection:
+    """Connection proxy that makes legacy ``executescript`` transactional."""
+
+    def __init__(self, connection: sqlite3.Connection) -> None:
+        self._connection = connection
+
+    def executescript(self, script: str) -> sqlite3.Cursor:
+        _execute_schema_script(self._connection, script)
+        return self._connection.cursor()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._connection, name)
+
+
 def _shared_scope_schema(conn: sqlite3.Connection) -> None:
     """Create the shared scope, memory, expert and artifact metadata tables."""
     for column, definition in (
@@ -44,7 +84,8 @@ def _shared_scope_schema(conn: sqlite3.Connection) -> None:
         ("metadata_json", "TEXT NOT NULL DEFAULT '{}'"),
     ):
         _ensure_column(conn, "artifacts", column, definition)
-    conn.executescript(
+    _execute_schema_script(
+        conn,
         """
         CREATE TABLE IF NOT EXISTS memory_entries (
             id TEXT PRIMARY KEY,
@@ -247,7 +288,8 @@ def _expert_team_scope_schema(conn: sqlite3.Connection) -> None:
         ("expert_installation_id", "TEXT NOT NULL DEFAULT ''"),
     ):
         _ensure_column(conn, "agents", column, definition)
-    conn.executescript(
+    _execute_schema_script(
+        conn,
         """
         CREATE INDEX IF NOT EXISTS idx_expert_templates_scope
             ON expert_templates(organization_id, workspace_id, owner_user_id, visibility, enabled);
@@ -347,13 +389,15 @@ def _automation_schema(conn: sqlite3.Connection) -> None:
     for column, definition in (
         ("attempt", "INTEGER NOT NULL DEFAULT 1"),
         ("trigger_event_id", "TEXT NOT NULL DEFAULT ''"),
+        ("task_run_id", "TEXT NOT NULL DEFAULT ''"),
         ("input_state_json", "TEXT NOT NULL DEFAULT '{}'"),
         ("output_state_json", "TEXT NOT NULL DEFAULT '{}'"),
         ("diff_json", "TEXT NOT NULL DEFAULT '{}'"),
         ("error_json", "TEXT NOT NULL DEFAULT '{}'"),
     ):
         _ensure_column(conn, "loop_runs", column, definition)
-    conn.executescript(
+    _execute_schema_script(
+        conn,
         """
         CREATE TABLE IF NOT EXISTS automation_trigger_events (
             id TEXT PRIMARY KEY,
@@ -439,12 +483,162 @@ def _rename_legacy_recommended_skill_category(conn: sqlite3.Connection) -> None:
         )
 
 
+def _artifact_delivery_state_schema(conn: sqlite3.Connection) -> None:
+    """Add immutable delivery-state fields without rewriting migration v1.
+
+    Early installations already recorded v1 before the verification fence was
+    introduced.  A new migration version is therefore required; changing the
+    old function alone never updates those databases.  Legacy artifacts were
+    immediately downloadable, so they remain grandfathered as published but
+    are not assigned a fabricated Verification record.
+    """
+
+    for column, definition in (
+        ("delivery_status", "TEXT NOT NULL DEFAULT 'published'"),
+        ("verification_id", "TEXT NOT NULL DEFAULT ''"),
+        ("published_at", "TEXT NOT NULL DEFAULT ''"),
+    ):
+        _ensure_column(conn, "artifacts", column, definition)
+    conn.execute(
+        """
+        UPDATE artifacts
+        SET delivery_status = CASE
+                WHEN delivery_status IS NULL OR TRIM(delivery_status) = ''
+                    THEN 'published'
+                ELSE delivery_status
+            END,
+            verification_id = COALESCE(verification_id, ''),
+            published_at = CASE
+                WHEN (delivery_status IS NULL OR TRIM(delivery_status) = ''
+                      OR delivery_status = 'published')
+                     AND (published_at IS NULL OR TRIM(published_at) = '')
+                    THEN created_at
+                ELSE COALESCE(published_at, '')
+            END
+        """
+    )
+
+
+def _ensure_artifact_pending_run_fence(conn: sqlite3.Connection) -> None:
+    """Install the database-level ownership fence for candidate Artifacts.
+
+    ``db.init_db`` creates the Artifact table before the task-state service
+    creates ``task_runs`` on a brand-new database.  SQLite accepts a trigger
+    that references a missing table but then makes *every* Artifact insert
+    fail while that table is absent.  The migration therefore calls this
+    helper only for upgraded databases that already have ``task_runs``;
+    ``TaskStateService.init_schema`` calls it again after creating that table
+    for fresh installations.
+    """
+
+    has_artifacts = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'artifacts'"
+    ).fetchone()
+    has_runs = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'task_runs'"
+    ).fetchone()
+    if has_artifacts is None or has_runs is None:
+        return
+    artifact_columns = {
+        str(row[1]) for row in conn.execute("PRAGMA table_info(artifacts)").fetchall()
+    }
+    run_columns = {
+        str(row[1]) for row in conn.execute("PRAGMA table_info(task_runs)").fetchall()
+    }
+    if not {"task_id", "run_id", "delivery_status"}.issubset(artifact_columns):
+        return
+    if not {"id", "task_id", "status", "intake_state"}.issubset(run_columns):
+        return
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_artifacts_pending_run_insert
+        BEFORE INSERT ON artifacts
+        WHEN NEW.delivery_status = 'pending_verification'
+             AND NOT EXISTS (
+                 SELECT 1 FROM task_runs AS candidate_run
+                 WHERE candidate_run.id = NEW.run_id
+                   AND candidate_run.task_id = NEW.task_id
+                   AND candidate_run.status = 'running'
+                   AND candidate_run.intake_state = 'open'
+             )
+        BEGIN
+            SELECT RAISE(
+                ABORT,
+                'pending_verification artifact requires a matching running/open run'
+            );
+        END;
+        """
+    )
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_artifacts_pending_run_update
+        BEFORE UPDATE ON artifacts
+        WHEN NEW.delivery_status = 'pending_verification'
+             AND NOT EXISTS (
+                 SELECT 1 FROM task_runs AS candidate_run
+                 WHERE candidate_run.id = NEW.run_id
+                   AND candidate_run.task_id = NEW.task_id
+                   AND candidate_run.status = 'running'
+                   AND candidate_run.intake_state = 'open'
+             )
+        BEGIN
+            SELECT RAISE(
+                ABORT,
+                'pending_verification artifact requires a matching running/open run'
+            );
+        END;
+        """
+    )
+
+
+def _artifact_effect_identity_and_pending_run_fence(
+    conn: sqlite3.Connection,
+) -> None:
+    """Add stable effect ownership and prevent late candidate Artifacts."""
+
+    _ensure_column(conn, "artifacts", "tool_effect_id", "TEXT NOT NULL DEFAULT ''")
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_artifacts_tool_effect
+        ON artifacts(tool_effect_id)
+        WHERE TRIM(tool_effect_id) <> ''
+        """
+    )
+    _ensure_artifact_pending_run_fence(conn)
+
+
+def _tool_effect_journal_schema(conn: sqlite3.Connection) -> None:
+    """Register the durable tool-effect state machine in migration history."""
+
+    # Local import avoids a module cycle while keeping one authoritative SQL
+    # definition shared by the migration and the independently testable
+    # journal service.
+    from app.services.tool_effect_journal import TOOL_EFFECT_JOURNAL_SCHEMA_SQL
+
+    _execute_schema_script(conn, TOOL_EFFECT_JOURNAL_SCHEMA_SQL)
+
+
+def _automation_task_run_binding_schema(conn: sqlite3.Connection) -> None:
+    """Add the durable automation -> task_run binding to upgraded databases.
+
+    ``loop_runs`` was introduced in migration 4, so adding this column to that
+    migration only helps fresh databases. Existing installations have already
+    recorded v4 and need a new migration version.
+    """
+
+    _ensure_column(conn, "loop_runs", "task_run_id", "TEXT NOT NULL DEFAULT ''")
+
+
 SCHEMA_MIGRATIONS: tuple[tuple[int, Any], ...] = (
     (1, _shared_scope_schema),
     (2, _expert_team_scope_schema),
     (3, _backfill_legacy_artifact_metadata),
     (4, _automation_schema),
     (6, _rename_legacy_recommended_skill_category),
+    (7, _artifact_delivery_state_schema),
+    (8, _artifact_effect_identity_and_pending_run_fence),
+    (9, _tool_effect_journal_schema),
+    (10, _automation_task_run_binding_schema),
 )
 
 # Keep retired version numbers reserved so existing databases do not
@@ -466,14 +660,39 @@ def _apply_schema_migrations(conn: sqlite3.Connection) -> None:
         int(row[0])
         for row in conn.execute("SELECT version FROM schema_migrations").fetchall()
     } | _RETIRED_SCHEMA_MIGRATIONS
+    guarded_connection = _AtomicMigrationConnection(conn)
     for version, migration in SCHEMA_MIGRATIONS:
         if version in applied:
             continue
-        migration(conn)
-        conn.execute(
-            "INSERT INTO schema_migrations(version, name, applied_at) VALUES (?, ?, ?)",
-            (version, migration.__name__, utc_now()),
-        )
+        # ``init_db`` normally enters with no transaction and receives a
+        # write-locking transaction per version.  Direct upgrade callers may
+        # already own a larger transaction; a SAVEPOINT then preserves the
+        # caller's commit/rollback authority without sacrificing migration
+        # atomicity.
+        outer_transaction = conn.in_transaction
+        savepoint = f"schema_migration_{int(version)}"
+        if outer_transaction:
+            conn.execute(f"SAVEPOINT {savepoint}")
+        else:
+            conn.execute("BEGIN IMMEDIATE")
+        try:
+            migration(guarded_connection)
+            conn.execute(
+                "INSERT INTO schema_migrations(version, name, applied_at) VALUES (?, ?, ?)",
+                (version, migration.__name__, utc_now()),
+            )
+        except BaseException:
+            if outer_transaction:
+                conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+            else:
+                conn.rollback()
+            raise
+        else:
+            if outer_transaction:
+                conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+            else:
+                conn.commit()
 
 
 def utc_now() -> str:
@@ -607,6 +826,9 @@ def init_db() -> None:
                     api_key_env TEXT NOT NULL DEFAULT '',
                     api_key_ciphertext TEXT NOT NULL DEFAULT '',
                     enabled INTEGER NOT NULL DEFAULT 1,
+                    last_test_status TEXT NOT NULL DEFAULT '',
+                    last_test_message TEXT NOT NULL DEFAULT '',
+                    last_test_at TEXT NOT NULL DEFAULT '',
                     config_json TEXT NOT NULL DEFAULT '{}',
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
@@ -672,6 +894,13 @@ def init_db() -> None:
             model_columns = {row[1] for row in conn.execute("PRAGMA table_info(model_configs)").fetchall()}
             if "api_key_ciphertext" not in model_columns:
                 conn.execute("ALTER TABLE model_configs ADD COLUMN api_key_ciphertext TEXT NOT NULL DEFAULT ''")
+            for column, definition in (
+                ("last_test_status", "TEXT NOT NULL DEFAULT ''"),
+                ("last_test_message", "TEXT NOT NULL DEFAULT ''"),
+                ("last_test_at", "TEXT NOT NULL DEFAULT ''"),
+            ):
+                if column not in model_columns:
+                    conn.execute(f"ALTER TABLE model_configs ADD COLUMN {column} {definition}")
             _apply_schema_migrations(conn)
             conn.commit()
 

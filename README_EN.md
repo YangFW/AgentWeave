@@ -11,7 +11,7 @@ Its main capabilities include:
 - Model management: OpenAI and OpenAI-compatible Chat Completions endpoints, with API keys supplied through environment variables or entered directly in the UI.
 - Skill management: create, edit, import, export, and install Skill packages from HTTPS download links.
 - Tool integration: local stdio MCP, remote Streamable HTTP MCP, and regular HTTP tools.
-- File handling: extract text from common text files, Office documents, and PDFs, then generate downloadable Word, PDF, Excel, Markdown, or HTML files. PowerPoint generation requires Node.js and a configured generation component.
+- File handling: extract text from common text files, Office documents, and PDFs, then generate downloadable Word, PDF, Excel, Markdown, HTML, or PPTX files. PPTX uses the bundled Python generator by default; an external Artifact Tool is optional.
 - Task execution: an event stream reports the plan, selected Skills and model, tool calls, file generation, and final validation.
 - Memory and automation: retain explicit long-term preferences or trigger recurring tasks on a schedule or through a webhook.
 
@@ -22,7 +22,7 @@ The current web UI is primarily in Chinese. This guide shows the corresponding C
 ## Requirements
 
 - Python 3.12
-- Node.js and Artifact Tool (only required for PPTX generation)
+- Node.js 22 or a compatible version for frontend script checks. Node.js is only needed when choosing an external Artifact Tool for PPTX generation.
 - SQLite (included with Python; no separate installation is needed)
 
 ## Local setup
@@ -31,8 +31,13 @@ The current web UI is primarily in Chinese. This guide shows the corresponding C
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-uvicorn app.main:app --host 127.0.0.1 --port 8000
+cp .env.example .env.local
+./start-local.sh
 ```
+
+`.env.local` stores machine-specific network switches, host allowlists, and optional environment-variable credentials. Git ignores this file, so it is not uploaded to the repository. Online models require `APP_ALLOW_OUTBOUND_NETWORK=true` and the model Base URL hostname in `APP_MODEL_HOST_ALLOWLIST`. If the API key is entered directly in the UI, it does not need to be duplicated in `.env.local`.
+
+For the built-in offline model only, you may omit `.env.local` and run `./start-local.sh`; AgentNexus then starts with its network-disabled secure defaults.
 
 Windows PowerShell:
 
@@ -40,7 +45,8 @@ Windows PowerShell:
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
-uvicorn app.main:app --host 127.0.0.1 --port 8000
+Copy-Item .env.example .env.local
+uvicorn app.main:app --env-file .env.local --host 127.0.0.1 --port 8000
 ```
 
 Open [http://127.0.0.1:8000/](http://127.0.0.1:8000/) in a browser. The health-check endpoint is [http://127.0.0.1:8000/api/health](http://127.0.0.1:8000/api/health).
@@ -53,9 +59,24 @@ Do not open `web/index.html` directly with `file://`. A static page cannot save 
 docker compose up --build
 ```
 
-The current Dockerfile contains only the Python environment, so PPTX generation is unavailable in the container by default. To generate PowerPoint files, install Node.js and the required generation component in a custom image, or run the platform in a local Python environment.
+The current Dockerfile is Python-based. The bundled Python PPTX generator does not require Docker, Node.js, or npm; Node.js and an approved generation component are only needed when choosing the external Artifact Tool path.
 
 Compose binds the service to `127.0.0.1:8000` on the host and disables application-level outbound network access by default. To use online models or external tools, set `APP_ALLOW_OUTBOUND_NETWORK=true` and enable the relevant capability-specific switches, then recreate the container.
+
+## Testing
+
+After installing the runtime dependencies, run the full regression suite from the repository root:
+
+```bash
+node --check web/diagnostics-routing.js
+node --check web/app.js
+python -m compileall -q app
+python -m unittest discover -s tests -p 'test_*.py' -v
+```
+
+Tests use temporary databases and mocked services by default. They do not require model API keys and do not call external models, MCP services, or web-search providers. Frontend smoke tests also fetch the homepage and JavaScript assets through FastAPI's static file service, verifying diagnostics routing load order, cache-version consistency, and that network diagnostics target the web-search MCP instead of weather or local filesystem tools.
+
+GitHub Actions runs the same frontend script checks, application compilation, and regression tests on Python 3.12 and 3.13 with outbound network, remote installation, and external-tool switches disabled.
 
 ## Model configuration
 
@@ -67,10 +88,12 @@ Open “模型设置” (Model Settings), select “添加模型” (Add Model),
 To use an environment variable, define the key in the process that starts AgentNexus:
 
 ```bash
-export OPENAI_API_KEY='your-api-key'
-export APP_ALLOW_OUTBOUND_NETWORK=true
-export APP_MODEL_HOST_ALLOWLIST='api.openai.com'
-uvicorn app.main:app --host 127.0.0.1 --port 8000
+cp .env.example .env.local
+# Edit .env.local:
+# OPENAI_API_KEY=your-api-key
+# APP_ALLOW_OUTBOUND_NETWORK=true
+# APP_MODEL_HOST_ALLOWLIST=api.openai.com
+./start-local.sh
 ```
 
 In the UI, select “环境变量” (Environment Variable) and enter `OPENAI_API_KEY`. Base URL must be the provider's OpenAI-compatible API root, such as `https://api.openai.com/v1`; AgentNexus appends `/chat/completions` when sending a request. Set `APP_MODEL_HOST_ALLOWLIST` to the allowed model hostnames, separated by commas and without schemes or paths.
@@ -116,14 +139,20 @@ For complete installation methods, examples, and security controls, see the [Pla
 
 File uploads are enabled by default. Extractable text from TXT, Markdown, CSV, JSON, YAML, common source-code files, DOCX, XLSX, PPTX, and PDF files can be added to task context. Scanned PDFs are not processed with OCR, and legacy Office formats are outside the default parsing scope.
 
-AgentNexus has built-in generation for DOCX, PDF, XLSX, Markdown, and HTML. PPTX generation is available only when Node.js and Artifact Tool are installed and the configured entry point is valid:
+AgentNexus has built-in generation for DOCX, PDF, XLSX, Markdown, HTML, and PPTX through `python-pptx`. In the UI, open “模型设置 → 文档交付 → PPTX 配置向导” and choose the bundled Python generator. The equivalent setting is:
+
+```bash
+export APP_PPTX_GENERATOR='python'
+```
+
+If the deployment already has an approved Artifact Tool, the optional external path can be configured with Node.js and its entry point:
 
 ```bash
 export APP_NODE_BINARY='node'
 export APP_ARTIFACT_TOOL_ENTRYPOINT='/absolute/path/to/artifact_tool.mjs'
 ```
 
-The project does not install Artifact Tool automatically. A missing or invalid configuration causes PPTX tasks to fail with an explicit error and does not affect the other document formats.
+The project does not install or execute Artifact Tool from arbitrary URLs. A missing or invalid PPTX configuration is reported in the conversation with an actionable next step and does not affect the other document formats.
 
 Files are stored in runtime directories under `data/` and accessed through controlled preview and download endpoints. Databases, uploaded files, generated files, and local machine keys are runtime data and must not be committed to the repository.
 

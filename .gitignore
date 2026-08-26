@@ -39,22 +39,10 @@ node_modules/
 .npm/
 .yarn/
 
-# Test and coverage output
-tests/
-test/
-__tests__/
-test_*.py
-*_test.py
-*.test.js
-*.test.mjs
-*.test.jsx
-*.test.ts
-*.test.tsx
-*.spec.js
-*.spec.mjs
-*.spec.jsx
-*.spec.ts
-*.spec.tsx
+# Generated QA renderings and local dependency links for sample fixtures
+/tests/fixtures/*_build/
+
+# Test caches and coverage output
 .coverage
 .coverage.*
 htmlcov/

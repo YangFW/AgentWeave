@@ -1,0 +1,21 @@
+{
+  "project": {
+    "id": "agentnexus-sample",
+    "name": "AgentNexus 测试项目",
+    "language": "zh-CN",
+    "purpose": "验证平台的对话、工具编排和文档产物能力"
+  },
+  "capabilities": [
+    {"id": "conversation", "enabled": true, "mode": ["normal", "expert"]},
+    {"id": "skills", "enabled": true, "install_sources": ["upload", "market", "url"]},
+    {"id": "mcp", "enabled": true, "transports": ["stdio", "streamable_http", "http"]},
+    {"id": "artifacts", "enabled": true, "formats": ["md", "html", "docx", "xlsx", "pptx", "pdf"]}
+  ],
+  "test_status": {
+    "total": 42,
+    "passed": 18,
+    "partial": 3,
+    "not_started": 21
+  },
+  "notes": "本 JSON 不含真实密钥；api_key 字段只能使用环境变量引用。"
+}

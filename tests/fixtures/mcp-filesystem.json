@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "import-e2e-filesystem": {
+      "name": "文件导入测试 MCP",
+      "description": "用于验证 MCP JSON 文件导入和工具发现",
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-filesystem",
+        "/workspace"
+      ],
+      "env": {},
+      "enabled": true
+    }
+  }
+}

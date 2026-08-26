@@ -414,14 +414,20 @@ class ContextService:
             owns_connection = self._shared_connection is None
             original_row_factory = conn.row_factory
             conn.row_factory = sqlite3.Row
+            # A caller such as the task-state publication fence may lend this
+            # service its already-open SQLite transaction.  In that case the
+            # memory write must participate in the outer commit instead of
+            # opening/committing a nested transaction (which SQLite forbids).
+            # Standalone API calls still own their normal BEGIN/COMMIT cycle.
+            owns_transaction = bool(write and not conn.in_transaction)
             try:
-                if write:
+                if owns_transaction:
                     conn.execute("BEGIN IMMEDIATE")
                 yield conn
-                if write:
+                if owns_transaction:
                     conn.commit()
             except Exception:
-                if write:
+                if owns_transaction:
                     conn.rollback()
                 raise
             finally:
@@ -439,6 +445,20 @@ class ContextService:
             init_schema(conn)
         finally:
             conn.close()
+
+    def using_connection(self, connection: sqlite3.Connection) -> ContextService:
+        """Return a view that participates in the caller's SQLite transaction.
+
+        This is used by atomic Task/Run publication paths.  Schema creation is
+        intentionally disabled because the outer platform transaction already
+        targets an initialized database.
+        """
+
+        return ContextService(
+            connection=connection,
+            clock=self._clock,
+            auto_init=False,
+        )
 
     def _now(self) -> str:
         return _normalise_timestamp(self._clock(), allow_empty=False)

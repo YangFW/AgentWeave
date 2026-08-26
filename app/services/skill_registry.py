@@ -61,6 +61,63 @@ def skill_to_api(row: dict[str, Any]) -> dict[str, Any]:
 
 
 class SkillRegistry:
+    @staticmethod
+    def _content_payload(
+        content: str,
+        *,
+        fallback_id: str = "",
+        enabled: bool = True,
+    ) -> dict[str, Any]:
+        meta = parse_frontmatter(content)
+        # Prefer package metadata because downloaded entry files often share
+        # the generic name `SKILL.md`; fall back to a content hash when needed.
+        raw_id = str(meta.get("id") or meta.get("name") or fallback_id).strip()
+        skill_id = re.sub(r"[^A-Za-z0-9_]+", "_", raw_id.replace("-", "_")).strip("_")
+        if skill_id.lower() in {"", "skill", "download", "downloaded_skill"}:
+            skill_id = "skill_" + hashlib.sha256(content.encode("utf-8")).hexdigest()[:12]
+        if not re.fullmatch(r"[A-Za-z0-9_]{2,80}", skill_id):
+            raise ValueError("SKILL.md 必须提供合法 id（字母、数字、下划线，2-80 位）")
+        return {
+            "id": skill_id,
+            "name": meta.get("name") or skill_id,
+            "description": meta.get("description") or "通过安装包导入的 Skill",
+            "category": meta.get("category") or "installed",
+            "version": meta.get("version") or "0.1.0",
+            "content": content,
+            "enabled": enabled,
+            "required_mcps": [
+                item.strip()
+                for item in str(meta.get("required_mcps", "")).split(",")
+                if item.strip()
+            ],
+        }
+
+    @staticmethod
+    def _skill_to_api_in_transaction(
+        conn: Any, row: Any
+    ) -> dict[str, Any]:
+        value = dict(row)
+        paths = [
+            str(item[0])
+            for item in conn.execute(
+                "SELECT path FROM skill_files WHERE skill_id = ? ORDER BY path",
+                (value["id"],),
+            ).fetchall()
+        ]
+        existing_lower = {path.lower() for path in paths}
+        missing = [
+            path
+            for path in referenced_package_files(str(value.get("content") or ""))
+            if path.lower() not in existing_lower
+        ]
+        return {
+            **value,
+            "enabled": bool(value.get("enabled")),
+            "required_mcps": db.json_loads(value.get("required_mcps"), []),
+            "file_count": len(paths),
+            "package_missing": missing,
+        }
+
     def load_builtin_skills(self) -> None:
         if BUILTIN_SKILLS_DIR.exists():
             for skill_dir in sorted(BUILTIN_SKILLS_DIR.iterdir()):
@@ -125,47 +182,205 @@ class SkillRegistry:
         return self.get_skill(payload["id"]) or payload
 
     def install_content(self, content: str, fallback_id: str = "", enabled: bool = True) -> dict[str, Any]:
-        meta = parse_frontmatter(content)
-        # Prefer package metadata because downloaded entry files often share the
-        # generic name `SKILL.md`; fall back to a content hash when needed.
-        raw_id = str(meta.get("id") or meta.get("name") or fallback_id).strip()
-        skill_id = re.sub(r"[^A-Za-z0-9_]+", "_", raw_id.replace("-", "_")).strip("_")
-        if skill_id.lower() in {"", "skill", "download", "downloaded_skill"}:
-            skill_id = "skill_" + hashlib.sha256(content.encode("utf-8")).hexdigest()[:12]
-        if not re.fullmatch(r"[A-Za-z0-9_]{2,80}", skill_id):
-            raise ValueError("SKILL.md 必须提供合法 id（字母、数字、下划线，2-80 位）")
-        payload = {
-            "id": skill_id,
-            "name": meta.get("name") or skill_id,
-            "description": meta.get("description") or "通过安装包导入的 Skill",
-            "category": meta.get("category") or "installed",
-            "version": meta.get("version") or "0.1.0",
-            "content": content,
-            "enabled": enabled,
-            "required_mcps": [x.strip() for x in str(meta.get("required_mcps", "")).split(",") if x.strip()],
-        }
-        current = self.get_skill(skill_id)
-        return self.update_skill(skill_id, payload) if current else self.create_skill(payload)
+        conn = db.get_conn()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            installed = self.install_content_in_transaction(
+                conn,
+                content,
+                fallback_id=fallback_id,
+                enabled=enabled,
+            )
+            conn.commit()
+            return installed
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def install_content_in_transaction(
+        self,
+        conn: Any,
+        content: str,
+        fallback_id: str = "",
+        enabled: bool = True,
+    ) -> dict[str, Any]:
+        """Install one entry file on a caller-owned SQLite transaction.
+
+        Agent platform commands use this path so the registry mutation and the
+        Task/Run terminal publication share one linearization point.  The
+        method deliberately never commits or opens another connection.
+        """
+
+        payload = self._content_payload(
+            content, fallback_id=fallback_id, enabled=enabled
+        )
+        skill_id = str(payload["id"])
+        now = db.utc_now()
+        current = conn.execute(
+            "SELECT id FROM skills WHERE id = ?", (skill_id,)
+        ).fetchone()
+        if current is None:
+            conn.execute(
+                """
+                INSERT INTO skills(
+                    id, name, description, category, version, content, enabled,
+                    required_mcps, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    skill_id,
+                    payload["name"],
+                    payload["description"],
+                    payload["category"],
+                    payload["version"],
+                    content,
+                    1 if enabled else 0,
+                    db.json_dumps(payload["required_mcps"]),
+                    now,
+                    now,
+                ),
+            )
+        else:
+            conn.execute(
+                """
+                UPDATE skills
+                SET name = ?, description = ?, category = ?, version = ?,
+                    content = ?, enabled = ?, required_mcps = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    payload["name"],
+                    payload["description"],
+                    payload["category"],
+                    payload["version"],
+                    content,
+                    1 if enabled else 0,
+                    db.json_dumps(payload["required_mcps"]),
+                    now,
+                    skill_id,
+                ),
+            )
+        raw = content.encode("utf-8")
+        conn.execute(
+            """
+            INSERT INTO skill_files(
+                skill_id, path, content, content_type, is_binary, size, updated_at
+            ) VALUES (?, 'SKILL.md', ?, 'text/markdown', 0, ?, ?)
+            ON CONFLICT(skill_id, path) DO UPDATE SET
+                content = excluded.content,
+                content_type = excluded.content_type,
+                is_binary = excluded.is_binary,
+                size = excluded.size,
+                updated_at = excluded.updated_at
+            """,
+            (skill_id, raw, len(raw), now),
+        )
+        row = conn.execute(
+            "SELECT * FROM skills WHERE id = ?", (skill_id,)
+        ).fetchone()
+        assert row is not None
+        return self._skill_to_api_in_transaction(conn, row)
 
     def install_package(self, files: dict[str, bytes], fallback_id: str = "", enabled: bool = True) -> dict[str, Any]:
+        conn = db.get_conn()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            installed = self.install_package_in_transaction(
+                conn,
+                files,
+                fallback_id=fallback_id,
+                enabled=enabled,
+            )
+            conn.commit()
+            return installed
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def install_package_in_transaction(
+        self,
+        conn: Any,
+        files: dict[str, bytes],
+        fallback_id: str = "",
+        enabled: bool = True,
+    ) -> dict[str, Any]:
+        """Install a complete package without escaping the caller transaction."""
+
         normalized = {self._safe_path(path): content for path, content in files.items()}
-        skill_paths = [path for path in normalized if PurePosixPath(path).name == "SKILL.md"]
+        skill_paths = [
+            path for path in normalized if PurePosixPath(path).name == "SKILL.md"
+        ]
         if len(skill_paths) != 1:
             raise ValueError("Skill 包必须且只能包含一个 SKILL.md")
         skill_path = skill_paths[0]
         root = PurePosixPath(skill_path).parent
         package: dict[str, bytes] = {}
-        for path, content in normalized.items():
+        for path, raw in normalized.items():
             pure = PurePosixPath(path)
             try:
                 relative = pure.relative_to(root) if str(root) != "." else pure
             except ValueError:
                 continue
-            package[self._safe_path(relative.as_posix())] = content
-        content = package["SKILL.md"].decode("utf-8")
-        skill = self.install_content(content, fallback_id=fallback_id or root.name, enabled=enabled)
-        self.replace_package(skill["id"], package)
-        return self.get_skill(skill["id"]) or skill
+            safe = self._safe_path(relative.as_posix())
+            package[safe] = raw
+        if "SKILL.md" not in package:
+            raise ValueError("Skill 包缺少 SKILL.md")
+        if len(package) > 200:
+            raise ValueError("Skill 包文件数不能超过 200")
+        if sum(len(raw) for raw in package.values()) > 2 * 1024 * 1024:
+            raise ValueError("Skill 包不能超过 2MB")
+        if any(len(raw) > 1024 * 1024 for raw in package.values()):
+            raise ValueError("单个 Skill 文件不能超过 1MB")
+        try:
+            content = package["SKILL.md"].decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError("SKILL.md 必须是 UTF-8 文本") from exc
+
+        skill = self.install_content_in_transaction(
+            conn,
+            content,
+            fallback_id=fallback_id or root.name,
+            enabled=enabled,
+        )
+        skill_id = str(skill["id"])
+        now = db.utc_now()
+        conn.execute("DELETE FROM skill_files WHERE skill_id = ?", (skill_id,))
+        for path, raw in package.items():
+            try:
+                raw.decode("utf-8")
+                is_binary = 0
+            except UnicodeDecodeError:
+                is_binary = 1
+            if path == "SKILL.md" and is_binary:
+                raise ValueError("SKILL.md 必须是 UTF-8 文本")
+            content_type = mimetypes.guess_type(path)[0] or (
+                "application/octet-stream" if is_binary else "text/plain"
+            )
+            conn.execute(
+                """
+                INSERT INTO skill_files(
+                    skill_id, path, content, content_type, is_binary, size, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    skill_id,
+                    path,
+                    raw,
+                    content_type,
+                    is_binary,
+                    len(raw),
+                    now,
+                ),
+            )
+        row = conn.execute(
+            "SELECT * FROM skills WHERE id = ?", (skill_id,)
+        ).fetchone()
+        assert row is not None
+        return self._skill_to_api_in_transaction(conn, row)
 
     def install_from_path(self, raw_path: str, enabled: bool = True) -> dict[str, Any]:
         roots = [Path(p).expanduser().resolve() for p in os.getenv("APP_SKILL_LOCAL_ROOTS", "").split(os.pathsep) if p]
@@ -229,6 +444,33 @@ class SkillRegistry:
             parts.append(f"\n### Package file: {item['path']}\n{excerpt}")
             used += len(excerpt)
         return "\n".join(parts)
+
+    def package_hash(self, skill_id: str) -> str:
+        """Hash the complete installed package, including binary assets.
+
+        Runtime prompt excerpts are intentionally bounded and therefore cannot
+        serve as an immutable capability identity.  The length-prefixed package
+        encoding avoids path/content boundary ambiguity and is stable across
+        database reads.
+        """
+
+        if not self.get_skill(skill_id):
+            raise ValueError("Skill not found")
+        rows = db.query_all(
+            "SELECT path, content FROM skill_files WHERE skill_id = ? ORDER BY path",
+            (skill_id,),
+        )
+        digest = hashlib.sha256()
+        for row in rows:
+            path = str(row.get("path") or "").encode("utf-8")
+            content = row.get("content") or b""
+            if isinstance(content, str):
+                content = content.encode("utf-8")
+            digest.update(len(path).to_bytes(8, "big"))
+            digest.update(path)
+            digest.update(len(content).to_bytes(8, "big"))
+            digest.update(content)
+        return digest.hexdigest()
 
     def get_file(self, skill_id: str, path: str) -> dict[str, Any] | None:
         safe = self._safe_path(path)
@@ -303,6 +545,14 @@ class SkillRegistry:
             allowed = set(allowed_ids)
             skills = [s for s in skills if s["id"] in allowed]
         normalized = message.lower()
+        # Negative constraints describe capabilities that must not be used;
+        # treating their nouns as positive keywords inverts user intent (for
+        # example “不要调用天气工具” used to select tool-backed Skills).
+        normalized = re.sub(
+            r"(?:不要|不用|无需|禁止|不必|别再|请勿)[^。！？!?；;\n]*",
+            " ",
+            normalized,
+        )
         ascii_tokens = set(re.findall(r"[a-zA-Z0-9_\-]{2,}", normalized))
         chinese_chunks = re.findall(r"[\u4e00-\u9fff]+", normalized)
         stop_grams = {"这个", "那个", "一下", "帮我", "用户", "使用", "进行", "要求", "任务", "问题", "可以", "需要", "当前", "输出"}
@@ -348,6 +598,32 @@ class SkillRegistry:
             specialty_keyword_guards = {
                 "mermaid_diagram": ["mermaid", "流程图", "时序图", "架构图", "状态图", "关系图"],
                 "product_requirement_document": ["prd", "产品需求文档", "用户故事", "验收标准"],
+                "research_report": [
+                    "联网", "搜索", "最新", "调研", "研究报告", "竞品", "行业研究",
+                    "来源", "引用", "参考链接", "新闻", "web search",
+                ],
+                "context_parameter_guard": [
+                    "这个项目", "这个任务", "刚才", "前面", "之前", "按原来的",
+                    "按刚才", "阈值", "把它导出", "继续生成", "继续导出",
+                ],
+                "data_analysis": [
+                    "数据分析", "分析数据", "数据集", "表格", "excel", "xlsx",
+                    "csv", "统计", "趋势", "指标", "图表", "可视化",
+                ],
+                "meeting_minutes": [
+                    "会议纪要", "会议记录", "行动项", "待办事项", "参会人",
+                    "会议录音", "会议内容", "议程",
+                ],
+                # Planning is an opt-in capability.  Its Skill declares a
+                # sequential-thinking MCP, so matching it on generic words
+                # such as “问题” or “方案” would unnecessarily bind a tool
+                # that simple summaries and lookups do not need.  Keep the
+                # trigger set focused on genuinely complex reasoning asks.
+                "complex_problem_planning": [
+                    "复杂问题", "复杂方案", "方案比较", "方案对比", "架构决策",
+                    "架构设计", "根因排查", "故障排查", "多约束", "技术选型",
+                    "决策分析", "权衡利弊", "trade-off", "tradeoff", "root cause",
+                ],
             }
             if skill["id"] in specialty_keyword_guards and not any(
                 keyword in normalized for keyword in specialty_keyword_guards[skill["id"]]
@@ -366,7 +642,10 @@ class SkillRegistry:
             }
             if skill["id"] in format_guards and not any(k in normalized for k in format_guards[skill["id"]]):
                 score = 0.0
-            if score > 0:
+            # A single shared Chinese bigram (0.7) is common across unrelated
+            # skills and must not grant that Skill's MCP permissions.  Require
+            # at least one stronger semantic signal or an explicit ASCII token.
+            if score >= 1.0:
                 results.append({"skill": skill, "score": round(score, 3)})
         results.sort(key=lambda x: x["score"], reverse=True)
         return results[:5]

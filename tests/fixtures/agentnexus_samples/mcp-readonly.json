@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "agentnexus-sample-readonly": {
+      "name": "AgentNexus 只读示例工具",
+      "description": "用于验证 MCP JSON 导入、工具发现和只读权限提示；不包含真实密钥。",
+      "command": "python3",
+      "args": ["-c", "print('AgentNexus sample MCP placeholder')"],
+      "env": {},
+      "enabled": false,
+      "read_only": true,
+      "timeout": 30
+    }
+  }
+}

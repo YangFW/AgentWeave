@@ -9,7 +9,8 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from app import db
-from app.services.agent_runtime import AgentRuntime, create_task_record
+from app.services.agent_runtime import AgentRuntime
+from app.services.task_state import TaskStateService, serialize_checkpoint_state
 from app.services.secret_store import secret_store
 
 
@@ -78,7 +79,10 @@ def serialize_run(row: dict[str, Any]) -> dict[str, Any]:
         return {}
     result = {
         key: row.get(key, "")
-        for key in ("id", "loop_id", "task_id", "status", "started_at", "finished_at", "trigger_event_id")
+        for key in (
+            "id", "loop_id", "task_id", "task_run_id", "status", "started_at",
+            "finished_at", "trigger_event_id",
+        )
     }
     result["run_number"] = int(row.get("run_number", 0) or 0)
     result["attempt"] = int(row.get("attempt", 1) or 1)
@@ -313,6 +317,7 @@ class LoopScheduler:
 
     def __init__(self, runtime: AgentRuntime, poll_seconds: float = 1.0) -> None:
         self.runtime = runtime
+        self.task_state = getattr(runtime, "task_state", None) or TaskStateService()
         self.poll_seconds = poll_seconds
         self._runner: asyncio.Task[None] | None = None
         self._active: set[str] = set()
@@ -493,21 +498,10 @@ class LoopScheduler:
         trigger_payload: bytes,
     ) -> dict[str, Any]:
         run_id = "run_" + uuid.uuid4().hex[:12]
+        task_id = "task_" + uuid.uuid4().hex[:12]
+        task_run_id = "trun_" + uuid.uuid4().hex[:12]
         started_at = db.utc_now()
-        db.execute(
-            """INSERT INTO loop_runs(
-                   id, loop_id, run_number, attempt, status, started_at, trigger_event_id,
-                   input_state_json
-               ) VALUES (?, ?, ?, ?, 'running', ?, ?, ?)""",
-            (run_id, loop["id"], logical_run, attempt, started_at, trigger_event_id, db.json_dumps(input_state)),
-        )
-        if trigger_event_id:
-            db.execute(
-                """UPDATE automation_trigger_events SET status = 'running', run_id = ?, started_at = ?
-                   WHERE id = ?""",
-                (run_id, started_at, trigger_event_id),
-            )
-        task_id = ""
+        attempt_record_created = False
         try:
             message = f"[自动化：{loop['name']}｜第 {logical_run} 轮｜尝试 {attempt}]\n{loop['prompt']}"
             if trigger_payload:
@@ -517,21 +511,93 @@ class LoopScheduler:
                 except (UnicodeDecodeError, json.JSONDecodeError):
                     displayed = trigger_payload.decode("utf-8", errors="replace")
                 message += f"\n\n[触发输入]\n{displayed[:100_000]}"
-            task = create_task_record(
-                message,
-                loop["agent_id"],
-                # Keep automation conversations isolated while ownership is
-                # carried by the loop's explicit organization/workspace/user scope.
-                workspace=f"loop:{loop['id']}",
-                model_id=loop["model_id"],
-                conversation_id=f"loop_{loop['id']}",
-                organization_id=loop.get("organization_id") or "local-org",
-                user_id=loop.get("user_id") or "local-user",
-            )
-            task_id = task["id"]
-            db.execute("UPDATE loop_runs SET task_id = ? WHERE id = ?", (task_id, run_id))
-            db.execute("UPDATE loops SET last_task_id = ? WHERE id = ?", (task_id, loop["id"]))
-            await self.runtime.run_task(task_id)
+            title = message.strip().replace("\n", " ")[:60] or "新任务"
+            scope_org = loop.get("organization_id") or "local-org"
+            scope_user = loop.get("user_id") or "local-user"
+            workspace = f"loop:{loop['id']}"
+            metadata = {
+                "trigger": "automation",
+                "automation_run": True,
+                "executor_type": "automation",
+                "executor_id": loop["id"],
+                "automation_run_id": run_id,
+                "agent_id": loop["agent_id"],
+                "workspace": workspace,
+                "organization_id": scope_org,
+                "user_id": scope_user,
+            }
+            with self.task_state.transaction(write=True) as conn:
+                conn.execute(
+                    """INSERT INTO loop_runs(
+                           id, loop_id, task_id, task_run_id, run_number,
+                           attempt, status, started_at, trigger_event_id,
+                           input_state_json
+                       ) VALUES (?, ?, ?, ?, ?, ?, 'running', ?, ?, ?)""",
+                    (
+                        run_id,
+                        loop["id"],
+                        task_id,
+                        task_run_id,
+                        logical_run,
+                        attempt,
+                        started_at,
+                        trigger_event_id,
+                        db.json_dumps(input_state),
+                    ),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO tasks(
+                        id, title, message, agent_id, model_id, conversation_id,
+                        workspace, organization_id, user_id, parent_task_id,
+                        executor_type, executor_id, status, result_json,
+                        artifacts_json, attachments_json, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '', 'automation', ?,
+                              'queued', '{}', '[]', '[]', ?, ?)
+                    """,
+                    (
+                        task_id,
+                        title,
+                        message,
+                        loop["agent_id"],
+                        loop["model_id"],
+                        f"loop_{loop['id']}",
+                        workspace,
+                        scope_org,
+                        scope_user,
+                        loop["id"],
+                        started_at,
+                        started_at,
+                    ),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO task_runs(
+                        id, task_id, attempt, status, resumed_from_checkpoint_id,
+                        metadata_json, created_at, updated_at
+                    ) VALUES (?, ?, 1, 'queued', '', ?, ?, ?)
+                    """,
+                    (
+                        task_run_id,
+                        task_id,
+                        serialize_checkpoint_state(metadata),
+                        started_at,
+                        started_at,
+                    ),
+                )
+                if trigger_event_id:
+                    conn.execute(
+                        """UPDATE automation_trigger_events
+                           SET status = 'running', run_id = ?, started_at = ?
+                           WHERE id = ?""",
+                        (run_id, started_at, trigger_event_id),
+                    )
+                conn.execute(
+                    "UPDATE loops SET last_task_id = ?, updated_at = ? WHERE id = ?",
+                    (task_id, started_at, loop["id"]),
+                )
+            attempt_record_created = True
+            await self.runtime.run_task(task_id, run_id=task_run_id)
             finished_task = db.query_one(
                 "SELECT status, result_json, artifacts_json FROM tasks WHERE id = ?", (task_id,)
             ) or {}
@@ -544,6 +610,8 @@ class LoopScheduler:
                 artifacts = []
             error: dict[str, Any] = {}
         except Exception as exc:
+            if not attempt_record_created:
+                raise
             task_status = "failed"
             task_result = {"error": str(exc)}
             artifacts = []

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from app import db
+from app.services.model_defaults import configured_default_model_id
 
 
 DEFAULT_AGENTS = (
@@ -24,6 +25,7 @@ def seed_agents() -> None:
     """Create the built-in assistant without overwriting user customizations."""
 
     now = db.utc_now()
+    preferred_model = configured_default_model_id()
     for agent in DEFAULT_AGENTS:
         if db.query_one("SELECT id FROM agents WHERE id = ?", (agent["id"],)):
             continue
@@ -38,7 +40,7 @@ def seed_agents() -> None:
                 agent["id"],
                 agent["name"],
                 agent["description"],
-                agent["model"],
+                preferred_model if agent["id"] == "general-agent" else agent["model"],
                 agent["system_prompt"],
                 db.json_dumps(agent["skills"]),
                 db.json_dumps(agent["mcp_servers"]),

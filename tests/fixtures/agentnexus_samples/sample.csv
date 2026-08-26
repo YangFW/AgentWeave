@@ -1,0 +1,7 @@
+task_id,module,status,owner,elapsed_seconds,defect_count,priority
+N-01,weather-context,passed,测试员A,18,0,P1
+N-02,artifact-delivery,partial,测试员A,42,1,P0
+N-04,markdown-context,passed,测试员B,26,0,P1
+N-06,mcp-parameter-guard,not_started,测试员B,0,0,P0
+E-01,expert-team-review,not_started,测试员C,0,0,P1
+KB-01,knowledge-base,passed,测试员C,31,0,P1

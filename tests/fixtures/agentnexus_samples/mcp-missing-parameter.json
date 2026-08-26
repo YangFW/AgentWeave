@@ -1,0 +1,25 @@
+{
+  "mcpServers": {
+    "agentnexus-sample-missing-parameter": {
+      "name": "缺少参数提示测试工具",
+      "description": "用于验证工具必填参数缺失时的友好提示。",
+      "transport": "http",
+      "url": "https://example.invalid/agentnexus/sample-tool",
+      "enabled": true,
+      "tools": [
+        {
+          "name": "lookup_project_status",
+          "description": "按项目 ID 查询测试状态",
+          "inputSchema": {
+            "type": "object",
+            "properties": {
+              "project_id": {"type": "string", "description": "必填，项目 ID"},
+              "include_history": {"type": "boolean", "default": false}
+            },
+            "required": ["project_id"]
+          }
+        }
+      ]
+    }
+  }
+}

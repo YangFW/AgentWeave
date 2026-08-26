@@ -1,0 +1,67 @@
+name: CI
+
+"on":
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13"]
+    env:
+      APP_ALLOW_OUTBOUND_NETWORK: "false"
+      APP_ALLOW_HTTP_TOOLS: "false"
+      APP_ALLOW_STDIO_MCP: "false"
+      APP_ALLOW_REMOTE_MCP: "false"
+      APP_ALLOW_WEB_SEARCH: "false"
+      APP_ALLOW_HTTP_POLICY: "false"
+      APP_ALLOW_REMOTE_INSTALL: "false"
+      APP_DB_PATH: ${{ runner.temp }}/agentnexus-${{ matrix.python-version }}.db
+      APP_ARTIFACT_DIR: ${{ runner.temp }}/agentnexus-artifacts-${{ matrix.python-version }}
+      APP_UPLOAD_DIR: ${{ runner.temp }}/agentnexus-uploads-${{ matrix.python-version }}
+      APP_SECRET_KEY: agentnexus-ci-only-key
+      APP_SECRET_KEY_FILE: ${{ runner.temp }}/agentnexus-${{ matrix.python-version }}.key
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip check
+
+      - name: Check frontend scripts
+        run: |
+          node --check web/diagnostics-routing.js
+          node --check web/app.js
+
+      - name: Compile application
+        run: python -m compileall -q app
+
+      - name: Run regression tests
+        run: python -m unittest discover -s tests -p 'test_*.py' -v

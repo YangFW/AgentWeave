@@ -82,6 +82,27 @@ class AgentUpdate(BaseModel):
     permissions: dict[str, Any] | None = None
 
 
+class WorkspaceCreate(BaseModel):
+    id: ResourceId
+    name: ResourceName
+    description: str = Field(default="", max_length=2_000)
+    organization_id: str = Field(default="local-org", min_length=1, max_length=128)
+    user_id: str = Field(default="local-user", min_length=1, max_length=128)
+    default_agent_id: ResourceId = "general-agent"
+    default_model_id: ResourceId = "deterministic"
+    settings: dict[str, Any] = Field(default_factory=dict)
+    enabled: bool = True
+
+
+class WorkspaceUpdate(BaseModel):
+    name: ResourceName
+    description: str = Field(default="", max_length=2_000)
+    default_agent_id: ResourceId = "general-agent"
+    default_model_id: ResourceId = "deterministic"
+    settings: dict[str, Any] = Field(default_factory=dict)
+    enabled: bool = True
+
+
 class ExpertTemplateCreate(BaseModel):
     id: str = Field(..., min_length=2, max_length=80, pattern=r"^[A-Za-z0-9_-]+$")
     name: str = Field(..., min_length=1, max_length=120)
@@ -190,6 +211,13 @@ class McpServerUpdate(BaseModel):
     enabled: bool | None = None
     config: dict[str, Any] | None = None
     tools: list[dict[str, Any]] | None = None
+
+
+class PresentationConfigureRequest(BaseModel):
+    mode: Literal["python", "artifact_tool"] = "python"
+    node_binary: str = Field(default="node", max_length=500)
+    entrypoint: str = Field(default="", max_length=2_000)
+    confirmed: bool = False
 
 
 class SkillPathInstall(BaseModel):
@@ -324,6 +352,28 @@ class MemoryUpdate(BaseModel):
     enabled: bool | None = None
     expires_at: str | None = None
     reason: str = Field(default="updated", max_length=300)
+
+
+class KnowledgeBaseCreate(BaseModel):
+    id: str | None = Field(default=None, min_length=2, max_length=80, pattern=r"^[A-Za-z0-9_-]+$")
+    name: str = Field(..., min_length=1, max_length=120)
+    description: str = Field(default="", max_length=2_000)
+    organization_id: str = Field(default="local-org", min_length=1, max_length=128)
+    workspace_id: str = Field(default="default", min_length=1, max_length=128)
+    user_id: str = Field(default="local-user", min_length=1, max_length=128)
+    visibility: str = Field(default="workspace", pattern="^(private|workspace|organization)$")
+    enabled: bool = True
+
+
+class KnowledgeBaseUpdate(BaseModel):
+    name: str = Field(..., min_length=1, max_length=120)
+    description: str = Field(default="", max_length=2_000)
+    visibility: str = Field(default="workspace", pattern="^(private|workspace|organization)$")
+    enabled: bool = True
+
+
+class KnowledgeDocumentUpload(BaseModel):
+    upload_id: str = Field(..., min_length=1, max_length=160)
 
 
 class ConversationSummaryUpdate(BaseModel):

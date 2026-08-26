@@ -7,13 +7,16 @@ import hmac
 import json
 import os
 import re
+import shutil
+import sqlite3
+import subprocess
 import time
 import uuid
 import zipfile
 from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 from urllib.parse import urljoin, urlparse
 
 import httpx
@@ -22,27 +25,45 @@ from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from app import db
+from app.builtin_skill_catalog import BUILTIN_SKILL_CATALOG, get_builtin_skill
 from app.schemas import (
     AgentCreate, AgentUpdate, ApprovalRequest, McpServerCreate, McpServerUpdate,
     ExpertInstallRequest, ExpertMemberRetryRequest, ExpertTeamCreate, ExpertTeamRunCreate,
     ExpertTeamUpdate, ExpertTemplateCreate, ExpertTemplateUpdate,
-    ConversationSummaryUpdate, LoopCreate, LoopUpdate, MemoryCreate, MemoryUpdate, ModelConfigCreate, ModelConfigUpdate, RemoteInstall, SkillCreate, SkillFileUpdate, SkillPathInstall, SkillUpdate,
+    ConversationSummaryUpdate, KnowledgeBaseCreate, KnowledgeBaseUpdate, KnowledgeDocumentUpload,
+    LoopCreate, LoopUpdate, MemoryCreate, MemoryUpdate, ModelConfigCreate,
+    ModelConfigUpdate, RemoteInstall, SkillCreate, SkillFileUpdate,
+    SkillPathInstall, SkillUpdate,
+    PresentationConfigureRequest,
     CheckpointRestoreRequest, PolicyRuleCreate, PolicyRuleUpdate, TaskCommandRequest,
-    TaskCreate, TaskResumeRequest, ToolInvokeRequest,
+    TaskCreate, TaskResumeRequest, ToolInvokeRequest, WorkspaceCreate, WorkspaceUpdate,
 )
 from app.seed import seed_agents
 from app.services.agent_runtime import AgentRuntime, create_task_record
 from app.services.context_service import ContextService, ExecutionScope, MemoryNotFoundError
 from app.services.conversation_summary_service import ConversationSummaryConflictError
+from app.services.diagnostic_service import DiagnosticService
 from app.services.expert_team_service import (
     ExpertConflictError, ExpertNotFoundError, ExpertPermissionError,
     ExpertTeamService, ExpertValidationError,
 )
 from app.services.event_bus import emit
+from app.services.knowledge_base_service import (
+    KnowledgeBaseError,
+    KnowledgeBaseNotFoundError,
+    KnowledgeBaseService,
+)
+from app.services.workspace_service import (
+    WorkspaceError,
+    WorkspaceNotFoundError,
+    WorkspaceService,
+)
 from app.services.mcp_gateway import (
     ARTIFACT_DIR,
+    BUILTIN_SERVERS,
     McpGateway,
     ToolError,
+    presentation_configuration_status,
     presentation_generation_status,
     resolve_artifact_path,
 )
@@ -61,10 +82,63 @@ from app.services.network_policy import (
 from app.services.policy_engine import PolicyConfigurationError, PolicyEngine, PolicyRule
 from app.services.secret_store import secret_store
 from app.services.skill_registry import SkillRegistry, referenced_package_files
-from app.services.task_state import StateNotFoundError, TaskStateError, TaskStateService
+from app.services.task_state import (
+    PublicationConflict,
+    RunIntakeClosed,
+    StateNotFoundError,
+    TaskStateError,
+    TaskStateService,
+)
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 WEB_DIR = BASE_DIR / "web"
+
+
+def _load_local_env_file() -> None:
+    """Load project-local settings when the server is started directly.
+
+    Docker/Compose and shell-based launches can inject environment variables
+    themselves, but a direct ``uvicorn`` launch should behave the same way for
+    this platform.  Existing process variables win so deployment-level
+    settings are never silently overridden by the local file.
+    """
+
+    raw_path = str(os.getenv("AGENTNEXUS_ENV_FILE") or ".env.local").strip()
+    env_path = Path(raw_path).expanduser()
+    if not env_path.is_absolute():
+        env_path = BASE_DIR / env_path
+    try:
+        env_path = env_path.resolve()
+        env_path.relative_to(BASE_DIR.resolve())
+    except ValueError:
+        # Keep the startup path bounded to the project directory.  An invalid
+        # override is ignored rather than preventing the offline fallback from
+        # starting.
+        return
+    if not env_path.is_file():
+        return
+    try:
+        lines = env_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[7:].lstrip()
+        key, separator, value = line.partition("=")
+        key = key.strip()
+        if not separator or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+            value = value.replace("\\\\", "\\").replace('\\"', '"').replace("\\'", "'")
+        os.environ.setdefault(key, value)
+
+
+_load_local_env_file()
 UPLOAD_DIR = Path(os.getenv("APP_UPLOAD_DIR", str(BASE_DIR / "data" / "uploads")))
 
 app = FastAPI(title="AgentNexus", version="0.1.0")
@@ -82,6 +156,13 @@ policy_engine = PolicyEngine(
     ],
 )
 context_service = ContextService(auto_init=False)
+knowledge_service = KnowledgeBaseService(auto_init=False)
+workspace_service = WorkspaceService(auto_init=False)
+diagnostic_service = DiagnosticService(
+    workspace_service=workspace_service,
+    knowledge_service=knowledge_service,
+    capabilities_provider=lambda: capabilities(),
+)
 
 
 def _is_env_name(value: str) -> bool:
@@ -130,7 +211,9 @@ async def _download_remote_install(url: str, max_bytes: int) -> tuple[bytes, str
     return response.content, filename
 
 
-def _install_skill_bytes(raw: bytes, filename: str) -> dict[str, Any]:
+def _skill_package_from_bytes(
+    raw: bytes, filename: str
+) -> tuple[dict[str, bytes], str]:
     if len(raw) > 2 * 1024 * 1024:
         raise ValueError("Skill 安装包不能超过 2MB")
     if filename.lower().endswith(".zip") or raw.startswith(b"PK\x03\x04"):
@@ -151,14 +234,24 @@ def _install_skill_bytes(raw: bytes, filename: str) -> dict[str, Any]:
             if len(candidates) > 1:
                 raise ValueError("ZIP 中只能包含一个 Skill 包")
             fallback = Path(candidates[0]).parent.name or Path(filename).stem
-            return skill_registry.install_package(files, fallback_id=fallback)
-    else:
-        content = raw.decode("utf-8")
-        fallback = Path(filename).stem if filename.lower().endswith(".md") else "downloaded_skill"
-    return skill_registry.install_content(content, fallback_id=fallback)
+            return files, fallback
+    raw.decode("utf-8")
+    fallback = (
+        Path(filename).stem
+        if filename.lower().endswith(".md")
+        else "downloaded_skill"
+    )
+    return {"SKILL.md": raw}, fallback
 
 
-async def _install_skill_remote_url(url: str) -> dict[str, Any]:
+def _install_skill_bytes(raw: bytes, filename: str) -> dict[str, Any]:
+    files, fallback = _skill_package_from_bytes(raw, filename)
+    return skill_registry.install_package(files, fallback_id=fallback)
+
+
+async def _load_skill_remote_url(url: str) -> dict[str, Any]:
+    """Download and validate a Skill package without mutating the registry."""
+
     raw, filename = await _download_remote_install(url, 2 * 1024 * 1024)
     if not filename.lower().endswith(".zip") and not raw.startswith(b"PK\x03\x04"):
         content = raw.decode("utf-8")
@@ -181,32 +274,61 @@ async def _install_skill_remote_url(url: str) -> dict[str, Any]:
             if total > 2 * 1024 * 1024:
                 raise ValueError("Skill 包及引用文件合计超过 2MB")
             files[stored_relative] = child
-        return skill_registry.install_package(files, fallback_id=Path(filename).stem)
-    return _install_skill_bytes(raw, filename)
+        return {"files": files, "fallback_id": Path(filename).stem}
+    files, fallback = _skill_package_from_bytes(raw, filename)
+    return {"files": files, "fallback_id": fallback}
+
+
+async def _install_skill_remote_url(url: str) -> dict[str, Any]:
+    package = await _load_skill_remote_url(url)
+    return skill_registry.install_package(
+        package["files"], fallback_id=str(package.get("fallback_id") or "")
+    )
+
+
+async def _load_mcp_remote_url(url: str) -> Any:
+    """Download and validate MCP JSON without changing installed servers."""
+
+    raw, _ = await _download_remote_install(url, 1024 * 1024)
+    return json.loads(raw.decode("utf-8"))
 
 
 async def _install_mcp_remote_url(url: str) -> list[dict[str, Any]]:
-    raw, _ = await _download_remote_install(url, 1024 * 1024)
-    return mcp_gateway.import_config(json.loads(raw.decode("utf-8")))
+    return mcp_gateway.import_config(await _load_mcp_remote_url(url))
 
 
 runtime = AgentRuntime(
     skill_registry,
     mcp_gateway,
     model_gateway,
-    skill_url_installer=_install_skill_remote_url,
-    mcp_url_installer=_install_mcp_remote_url,
+    skill_url_loader=_load_skill_remote_url,
+    mcp_url_loader=_load_mcp_remote_url,
     task_state=task_state,
     policy_engine=policy_engine,
     context_service=context_service,
+    knowledge_service=knowledge_service,
 )
 loop_scheduler = LoopScheduler(runtime)
 expert_team_service = ExpertTeamService(runtime, task_state=task_state)
 _runtime_tasks: set[asyncio.Task[Any]] = set()
 
 
-def _schedule_runtime(task_id: str, run_id: str | None = None) -> asyncio.Task[Any]:
-    background = asyncio.create_task(runtime.run_task(task_id, run_id=run_id))
+def _schedule_runtime(
+    task_id: str,
+    run_id: str | None = None,
+    *,
+    activation_result: dict[str, Any] | None = None,
+) -> asyncio.Task[Any]:
+    continuation = (
+        runtime.run_task(
+            task_id,
+            run_id=run_id,
+            activation_result=activation_result,
+        )
+        if activation_result is not None
+        else runtime.run_task(task_id, run_id=run_id)
+    )
+    background = asyncio.create_task(continuation)
     _runtime_tasks.add(background)
     background.add_done_callback(_runtime_tasks.discard)
     return background
@@ -259,20 +381,227 @@ def _fail_running_nodes(run_id: str, reason: str) -> None:
             continue
 
 
+_ORCHESTRATED_EXECUTOR_TYPES = frozenset(
+    {"team", "team_member", "team_supervisor", "automation"}
+)
+
+
+def _persisted_run_executor(run: Mapping[str, Any]) -> tuple[str, str, bool]:
+    """Resolve durable execution ownership without trusting startup memory.
+
+    The Task row is the authoritative dispatcher contract.  Run metadata is a
+    second durable fence: an old or partially migrated row that advertises an
+    orchestrated owner in either place is never handed to the ordinary Agent
+    runtime.  ``consistent`` is false when both projections are populated but
+    disagree, allowing the owning orchestrator to quarantine the row.
+    """
+
+    task = db.query_one(
+        "SELECT executor_type, executor_id FROM tasks WHERE id = ?",
+        (str(run.get("task_id") or ""),),
+    ) or {}
+    task_type = str(task.get("executor_type") or "agent").strip() or "agent"
+    task_id = str(task.get("executor_id") or "").strip()
+    metadata = run.get("metadata") if isinstance(run.get("metadata"), Mapping) else {}
+    metadata_type = str((metadata or {}).get("executor_type") or "").strip()
+    metadata_id = str((metadata or {}).get("executor_id") or "").strip()
+    advertised_types = {item for item in (task_type, metadata_type) if item}
+    orchestrated = advertised_types & _ORCHESTRATED_EXECUTOR_TYPES
+    executor_type = task_type
+    executor_id = task_id
+    if task_type == "agent" and orchestrated:
+        executor_type = sorted(orchestrated)[0]
+        executor_id = metadata_id
+    consistent = not (
+        metadata_type
+        and task_type != metadata_type
+        and (task_type in _ORCHESTRATED_EXECUTOR_TYPES or metadata_type in _ORCHESTRATED_EXECUTOR_TYPES)
+    )
+    if task_id and metadata_id and task_id != metadata_id:
+        consistent = False
+    return executor_type, executor_id, consistent
+
+
+def _ordinary_runtime_owned(run: Mapping[str, Any]) -> bool:
+    executor_type, _, consistent = _persisted_run_executor(run)
+    return consistent and executor_type == "agent"
+
+
+def _approval_command_for_restart(
+    task_id: str,
+    run_id: str,
+    result: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Find the one durable non-policy approval continuation, if decided."""
+
+    commands = task_state.list_commands(
+        task_id=task_id,
+        run_id=run_id,
+        command_types=["approval"],
+        limit=100,
+    )
+    active = [
+        item for item in commands if item.get("status") in {"queued", "claimed"}
+    ]
+    if active:
+        return active[0]
+
+    proof_command_ids: set[str] = set()
+    for key in (
+        "skill_recommendation_decision",
+        "generic_approval_decision",
+        "approval_decision",
+    ):
+        proof = result.get(key)
+        if isinstance(proof, dict) and str(proof.get("command_id") or ""):
+            proof_command_ids.add(str(proof["command_id"]))
+    for item in commands:
+        if item.get("status") != "completed":
+            continue
+        command_result = item.get("result") or {}
+        if str(item.get("id") or "") in proof_command_ids or (
+            isinstance(command_result, dict)
+            and str(command_result.get("action") or "")
+            in {"install_recommended_skill", "generic_approval"}
+        ):
+            return item
+    return None
+
+
+def _prepare_waiting_approval_recovery(
+    preserve_task_ids: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Reconcile durable approval input without disturbing undecided waits.
+
+    Policy decisions become immutable proof first; their now-running attempt is
+    then handled by normal checkpoint recovery.  Recommendation and generic
+    decisions remain on the same waiting Run and are returned for safe
+    continuation scheduling.  A pending cancel always wins at startup.
+    """
+
+    continuations: list[dict[str, Any]] = []
+    preserved = preserve_task_ids or set()
+    for waiting_run in task_state.list_runs(status="waiting_approval", limit=1000):
+        task_id = str(waiting_run["task_id"])
+        if task_id in preserved:
+            continue
+        task = db.query_one(
+            "SELECT status, result_json FROM tasks WHERE id = ?", (task_id,)
+        )
+        if not task or str(task.get("status") or "") != "waiting_approval":
+            continue
+        if task_state.is_cancel_requested(task_id, run_id=waiting_run["id"]):
+            task_state.commit_cancellation(
+                task_id=task_id,
+                run_id=waiting_run["id"],
+                result={
+                    "cancelled": True,
+                    "recovered_after_restart": True,
+                },
+            )
+            continue
+
+        result = db.json_loads(task.get("result_json"), {})
+        metadata = waiting_run.get("metadata") or {}
+        pending_policy = (
+            metadata.get("pending_policy_approval")
+            if isinstance(metadata, dict)
+            else None
+        )
+        is_policy = result.get("pending_action") == "policy_approval" or isinstance(
+            pending_policy, dict
+        )
+        if is_policy:
+            approval_id = str(
+                result.get("policy_approval_id")
+                or (
+                    pending_policy.get("approval_id")
+                    if isinstance(pending_policy, dict)
+                    else ""
+                )
+                or ""
+            )
+            # An undecided approval is a healthy durable wait.  Do not fail the
+            # Run and do not recreate its public approval event.
+            if not approval_id:
+                continue
+            decision = task_state.commit_policy_approval_decision(
+                task_id=task_id,
+                run_id=waiting_run["id"],
+                approval_id=approval_id,
+                worker_id=f"restart-recovery:{waiting_run['id']}",
+            )
+            if decision is None:
+                continue
+            # The transaction above changed Task/Run to running and persisted
+            # the exact command proof.  _recover_interrupted_runs will now
+            # create a checkpoint-bound retry without asking again.
+            continue
+
+        command = _approval_command_for_restart(
+            task_id, str(waiting_run["id"]), result
+        )
+        if command is None:
+            continue
+        payload = command.get("payload") or {}
+        command_result = command.get("result") or {}
+        approved_value = (
+            command_result.get("approved")
+            if isinstance(command_result, dict)
+            and isinstance(command_result.get("approved"), bool)
+            else payload.get("approved")
+        )
+        if not isinstance(approved_value, bool):
+            raise TaskStateError(
+                "Persisted approval continuation is missing a boolean decision"
+            )
+        continuations.append(
+            {
+                "task_id": task_id,
+                "run_id": str(waiting_run["id"]),
+                "command_id": str(command["id"]),
+                "approved": approved_value,
+                "note": str(payload.get("note") or ""),
+            }
+        )
+    return continuations
+
+
 def _recover_interrupted_runs(
     exclude_task_ids: set[str] | None = None,
     preserve_task_ids: set[str] | None = None,
 ) -> list[dict[str, Any]]:
-    """Recover ordinary Agent runs without stealing orchestrated work.
+    """Recover only runs durably owned by the ordinary Agent runtime.
 
     ``exclude_task_ids`` are interrupted automation attempts and are closed as
-    failed. ``preserve_task_ids`` belong to another durable orchestrator (for
-    example a queued expert-team run); they are ignored here and left intact
-    for that orchestrator to schedule.
+    failed. ``preserve_task_ids`` remains a compatibility quarantine for
+    callers, but ownership is always reloaded from ``tasks.executor_type`` /
+    ``executor_id`` and the Run metadata.  An orchestrated row can therefore
+    never become an ordinary Agent run merely because a transient startup list
+    was empty on a later restart.
     """
     excluded = exclude_task_ids or set()
     preserved = preserve_task_ids or set()
     protected = excluded | preserved
+
+    # Early platform revisions could commit a terminal Task projection before
+    # closing its Run. Those split-state rows are not interrupted work: the
+    # user already received a terminal result, so rerunning them could duplicate
+    # side effects or overwrite published artifacts. Reconcile every such Run
+    # transactionally before ordinary restart recovery decides what to resume.
+    legacy_terminal_runs = db.query_all(
+        """
+        SELECT r.id
+        FROM task_runs AS r
+        JOIN tasks AS t ON t.id = r.task_id
+        WHERE r.status IN ('running', 'paused', 'waiting_approval')
+          AND t.status IN ('completed', 'failed', 'cancelled')
+        ORDER BY r.created_at, r.attempt, r.id
+        """
+    )
+    for legacy_run in legacy_terminal_runs:
+        task_state.reconcile_legacy_terminal_projection(str(legacy_run["id"]))
+
     for task_id in excluded:
         task = db.query_one("SELECT status FROM tasks WHERE id = ?", (task_id,))
         if task and task.get("status") not in {"completed", "failed", "cancelled"}:
@@ -285,21 +614,16 @@ def _recover_interrupted_runs(
         *task_state.list_runs(status="running", limit=1000),
         *task_state.list_runs(status="paused", limit=1000),
     ]
-    for waiting_run in task_state.list_runs(status="waiting_approval", limit=1000):
-        waiting_task = db.query_one(
-            "SELECT result_json FROM tasks WHERE id = ?", (waiting_run["task_id"],)
-        ) or {}
-        waiting_result = db.json_loads(waiting_task.get("result_json"), {})
-        if waiting_result.get("pending_action") == "policy_approval":
-            interrupted_runs.append(waiting_run)
     for old_run in interrupted_runs:
         task = db.query_one("SELECT id FROM tasks WHERE id = ?", (old_run["task_id"],))
         if not task:
             continue
+        if not _ordinary_runtime_owned(old_run):
+            continue
         if old_run["task_id"] in preserved:
             continue
-        _fail_running_nodes(old_run["id"], "平台服务重启，旧执行尝试已中断")
         if old_run["task_id"] in excluded:
+            _fail_running_nodes(old_run["id"], "平台服务重启，旧执行尝试已中断")
             task_state.finish_run(
                 old_run["id"],
                 status="failed",
@@ -311,32 +635,20 @@ def _recover_interrupted_runs(
                 result={"error": "自动化尝试因平台服务重启而中断", "error_type": "ServiceRestart"},
             )
             continue
-        task_state.finish_run(
-            old_run["id"],
-            status="failed",
-            error={"message": "平台服务重启，已创建恢复尝试", "error_type": "ServiceRestart"},
-            metadata={"interrupted": True},
-        )
-        checkpoint = task_state.latest_checkpoint(old_run["id"], include_state=False)
-        new_run = task_state.create_run(
-            old_run["task_id"],
-            resumed_from_checkpoint_id=checkpoint["id"] if checkpoint else None,
-            metadata={"recovered_after_restart": True, "previous_run_id": old_run["id"]},
-        )
-        db.update_task_status(old_run["task_id"], "queued")
-        emit_data = {
-            "previous_run_id": old_run["id"],
-            "run_id": new_run["id"],
-            "checkpoint_id": checkpoint["id"] if checkpoint else "",
-        }
-        db.insert_event(
-            old_run["task_id"],
-            "recovery_scheduled",
-            "已安排服务重启恢复",
-            "将从最近安全检查点创建新的运行尝试。" if checkpoint else "未找到检查点，将从任务起点重新执行。",
-            emit_data,
-        )
-        recovered.append(new_run)
+        if task_state.is_cancel_requested(
+            old_run["task_id"], run_id=old_run["id"]
+        ):
+            task_state.commit_cancellation(
+                task_id=old_run["task_id"],
+                run_id=old_run["id"],
+                result={
+                    "cancelled": True,
+                    "recovered_after_restart": True,
+                },
+            )
+            continue
+        recovery = task_state.recover_interrupted_attempt(old_run["id"])
+        recovered.append(recovery["run"])
 
     # Queued runs survive a restart unchanged. Legacy queued tasks without a
     # task_run receive one before they are scheduled.
@@ -348,13 +660,21 @@ def _recover_interrupted_runs(
                 error={"message": "自动化尝试因平台服务重启而中断", "error_type": "ServiceRestart"},
                 metadata={"interrupted": True, "automation_run": True},
             )
-    queued_runs = [item for item in all_queued_runs if item["task_id"] not in protected]
+    queued_runs = [
+        item
+        for item in all_queued_runs
+        if item["task_id"] not in protected and _ordinary_runtime_owned(item)
+    ]
     known_queued_tasks = {item["task_id"] for item in queued_runs}
     tasks_with_runs = {
         item["task_id"] for item in task_state.list_runs(limit=10_000)
     }
-    for task in db.query_all("SELECT id FROM tasks WHERE status = 'running'"):
+    for task in db.query_all(
+        "SELECT id, executor_type FROM tasks WHERE status = 'running'"
+    ):
         if task["id"] in preserved:
+            continue
+        if str(task.get("executor_type") or "agent") != "agent":
             continue
         if task["id"] in excluded:
             db.update_task_status(
@@ -377,8 +697,15 @@ def _recover_interrupted_runs(
             "检测到升级前遗留的运行中任务，将从任务起点重新执行。",
             {"run_id": legacy_run["id"]},
         )
-    for task in db.query_all("SELECT id FROM tasks WHERE status = 'queued'"):
-        if task["id"] not in protected and task["id"] not in known_queued_tasks:
+    for task in db.query_all(
+        "SELECT id, executor_type FROM tasks WHERE status = 'queued'"
+    ):
+        if (
+            str(task.get("executor_type") or "agent") == "agent"
+            and task["id"] not in protected
+            and task["id"] not in known_queued_tasks
+            and task["id"] not in tasks_with_runs
+        ):
             queued_runs.append(task_state.create_run(task["id"], metadata={"legacy_task": True}))
     by_id = {item["id"]: item for item in [*queued_runs, *recovered]}
     return list(by_id.values())
@@ -387,10 +714,16 @@ def _recover_interrupted_runs(
 @app.on_event("startup")
 async def on_startup() -> None:
     db.init_db()
+    workspace_service.init_schema()
     context_service.init_schema()
+    knowledge_service.init_schema()
     task_state.init_schema()
+    runtime.tool_effect_journal.init_schema()
+    runtime.tool_effect_journal.recover_interrupted_executions(
+        reason="service_restart"
+    )
     interrupted_loop_tasks = loop_scheduler.recover_interrupted_runs()
-    queued_team_runs = expert_team_service.queued_runs_for_recovery()
+    queued_team_runs = expert_team_service.reconcile_interrupted_orchestrated_runs()
     queued_team_task_ids = {item["parent_task_id"] for item in queued_team_runs}
     _migrate_legacy_model_keys()
     skill_registry.load_builtin_skills()
@@ -398,8 +731,32 @@ async def on_startup() -> None:
     seed_agents()
     _reload_policy_rules()
     loop_scheduler.start()
+    approval_continuations = _prepare_waiting_approval_recovery(
+        queued_team_task_ids
+    )
     for run in _recover_interrupted_runs(interrupted_loop_tasks, queued_team_task_ids):
-        _schedule_runtime(run["task_id"], run["id"])
+        recovery_activation = (run.get("metadata") or {}).get(
+            "recovery_activation_result"
+        )
+        if isinstance(recovery_activation, dict):
+            _schedule_runtime(
+                run["task_id"],
+                run["id"],
+                activation_result=recovery_activation,
+            )
+        else:
+            _schedule_runtime(run["task_id"], run["id"])
+    for continuation in approval_continuations:
+        background = asyncio.create_task(
+            _resume_after_approval_safely(
+                continuation["task_id"],
+                continuation["approved"],
+                continuation["note"],
+                continuation["command_id"],
+            )
+        )
+        _runtime_tasks.add(background)
+        background.add_done_callback(_runtime_tasks.discard)
     for team_run in queued_team_runs:
         _schedule_team_run(team_run["id"])
 
@@ -419,9 +776,120 @@ def health() -> dict[str, Any]:
     return {"ok": True, "name": "AgentNexus", "product": "AgentNexus", "display_name": "智枢"}
 
 
+def _presentation_env_file() -> Path:
+    """Resolve the local env file used by the one-click PPTX setup."""
+
+    raw = str(os.getenv("AGENTNEXUS_ENV_FILE") or ".env.local").strip()
+    candidate = Path(raw).expanduser()
+    if not candidate.is_absolute():
+        candidate = BASE_DIR / candidate
+    resolved = candidate.resolve()
+    try:
+        resolved.relative_to(BASE_DIR.resolve())
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="配置文件必须位于项目目录内") from exc
+    return resolved
+
+
+def _persist_env_values(values: Mapping[str, str]) -> Path:
+    path = _presentation_env_file()
+    text = path.read_text(encoding="utf-8") if path.exists() else ""
+    if text and not text.endswith("\n"):
+        text += "\n"
+    for key, value in values.items():
+        escaped = str(value).replace("\\", "\\\\").replace('"', '\\"')
+        line = f'{key}="{escaped}"'
+        pattern = re.compile(rf"(?m)^\s*{re.escape(key)}\s*=.*$")
+        if pattern.search(text):
+            text = pattern.sub(line, text, count=1)
+        else:
+            text += f"{line}\n"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def _resolve_local_binary(value: str, *, label: str) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        raise HTTPException(status_code=400, detail=f"请填写{label}")
+    candidate = Path(raw).expanduser()
+    resolved = str(candidate.resolve()) if candidate.is_file() else shutil.which(raw) or ""
+    if not resolved or not Path(resolved).is_file():
+        raise HTTPException(status_code=400, detail=f"找不到{label}：{raw}")
+    return resolved
+
+
+@app.get("/api/presentation/configuration")
+def get_presentation_configuration() -> dict[str, Any]:
+    return presentation_configuration_status()
+
+
+@app.post("/api/presentation/configure")
+def configure_presentation(payload: PresentationConfigureRequest) -> dict[str, Any]:
+    if not payload.confirmed:
+        raise HTTPException(status_code=400, detail="请先确认将配置写入本机 .env.local")
+    mode = str(payload.mode or "python").strip().lower()
+    if mode == "python":
+        try:
+            import pptx  # noqa: F401
+        except Exception as exc:
+            raise HTTPException(
+                status_code=400,
+                detail="平台内置 Python PPTX 组件不可用，请在当前 .venv 中安装 python-pptx 后重试",
+            ) from exc
+        values = {"APP_PPTX_GENERATOR": "python"}
+        os.environ.update(values)
+    elif mode == "artifact_tool":
+        node_binary = _resolve_local_binary(payload.node_binary, label="Node.js 可执行文件")
+        entrypoint = Path(str(payload.entrypoint or "").strip()).expanduser()
+        if not entrypoint.is_absolute():
+            entrypoint = (BASE_DIR / entrypoint).resolve()
+        else:
+            entrypoint = entrypoint.resolve()
+        if not entrypoint.is_file():
+            raise HTTPException(status_code=400, detail=f"找不到 Artifact Tool 入口文件：{entrypoint}")
+        check = subprocess.run(
+            [
+                node_binary,
+                "--input-type=module",
+                "-e",
+                "const m=await import(process.argv[1]); if(!m.Presentation || !m.PresentationFile) process.exit(2);",
+                str(entrypoint),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+        if check.returncode != 0:
+            raise HTTPException(
+                status_code=400,
+                detail="Artifact Tool 入口无法加载，或未导出 Presentation 与 PresentationFile",
+            )
+        values = {
+            "APP_PPTX_GENERATOR": "artifact_tool",
+            "APP_NODE_BINARY": node_binary,
+            "APP_ARTIFACT_TOOL_ENTRYPOINT": str(entrypoint),
+        }
+        os.environ.update(values)
+    else:
+        raise HTTPException(status_code=400, detail="PPTX 生成模式只能是 python 或 artifact_tool")
+    env_file = _persist_env_values(values)
+    status = presentation_configuration_status()
+    return {
+        "ok": bool(status.get("configured")),
+        "configuration": status,
+        "env_file": str(env_file),
+        "restart_required": False,
+        "message": "PPTX 生成器已配置，当前服务立即生效；以后重启平台也会保留此配置。",
+    }
+
+
 @app.get("/api/capabilities")
 def capabilities() -> dict[str, Any]:
     presentation = presentation_generation_status()
+    presentation_setup = presentation_configuration_status()
     outbound_enabled = outbound_network_enabled()
     return {
         "outbound_network": {"supported": True, "enabled": outbound_enabled},
@@ -448,13 +916,32 @@ def capabilities() -> dict[str, Any]:
         "remote_install": {"supported": True, "enabled": outbound_enabled and _remote_install_flag()},
         "direct_api_key": {"supported": True, "encrypted": True, "storage": "local"},
         "models": ["deterministic", "openai", "openai_compatible"],
+        "workspaces": {
+            "supported": True,
+            "default_id": "default",
+            "scope": "organization",
+            "current_user": "local-user",
+        },
         "document_output": {
             "formats": ["markdown", "docx", "pdf", "xlsx", "csv", "html"],
             "optional_formats": ["pptx"],
             "pptx_configured": bool(presentation.get("configured")),
             "pptx_reason": str(presentation.get("reason") or ""),
+            "pptx_setup": {
+                "mode": presentation_setup.get("mode"),
+                "node_binary": presentation_setup.get("node_binary"),
+                "entrypoint": presentation_setup.get("entrypoint"),
+                "native_python_available": bool(presentation_setup.get("native_python_available")),
+            },
         },
         "memory": {"supported": True, "scopes": ["organization", "workspace", "user", "agent", "conversation"], "revision_history": True, "conversation_summary": {"automatic": True, "viewable": True, "editable": True, "deletable": True}},
+        "knowledge_base": {
+            "supported": True,
+            "scopes": ["private", "workspace", "organization"],
+            "retrieval": "keyword",
+            "runtime_injection": True,
+            "indexed_upload_formats": ["txt", "md", "csv", "json", "yaml", "html", "docx", "xlsx", "pptx", "pdf"],
+        },
         "expert_teams": {
             "supported": True,
             "template_installation": True,
@@ -480,6 +967,143 @@ def capabilities() -> dict[str, Any]:
             "arbitrary_shell": False,
         },
     }
+
+
+@app.get("/api/diagnostics")
+def diagnostics(
+    organization_id: str = "local-org",
+    workspace_id: str = "default",
+    user_id: str = "local-user",
+) -> dict[str, Any]:
+    return diagnostic_service.run(
+        organization_id=organization_id,
+        workspace_id=workspace_id,
+        user_id=user_id,
+    )
+
+
+def _skill_marketplace_plan(item: dict[str, Any], installed: dict[str, Any] | None) -> dict[str, Any]:
+    content = str(item.get("content") or "")
+    required_mcps = list(item.get("required_mcps") or [])
+    if not required_mcps:
+        for line in content.splitlines()[:20]:
+            if line.strip().startswith("required_mcps:"):
+                raw = line.split(":", 1)[1].strip().strip("[]")
+                required_mcps = [part.strip().strip("'\"") for part in raw.split(",") if part.strip()]
+                break
+    writes_documents = any(keyword in content for keyword in ("生成 Word", "生成 DOCX", "生成 Word、PDF", "生成 Word、PDF 或 Markdown", "调用报告工具"))
+    return {
+        "method": "builtin_catalog",
+        "requires_approval": False,
+        "will_create": [] if installed else ["skill"],
+        "will_enable": ["skill"] if installed and not installed.get("enabled") else [],
+        "required_mcps": required_mcps,
+        "permissions": {
+            "reads_uploaded_files": True,
+            "writes_artifacts": writes_documents,
+            "runs_local_process": False,
+            "uses_network": False,
+        },
+        "impact": "安装后会进入技能中心并可被普通模式自动匹配；不会自动执行包内脚本。",
+        "post_install": "在“技能中心”查看、停用、编辑或导出，也可以绑定到指定智能体。",
+    }
+
+
+def _mcp_marketplace_plan(server: dict[str, Any], installed: dict[str, Any] | None) -> dict[str, Any]:
+    kind = str(server.get("kind") or "builtin")
+    tools = [tool for tool in server.get("tools", []) if isinstance(tool, dict)]
+    effects = sorted({str(tool.get("effect") or "read") for tool in tools})
+    uses_network = server.get("id") in {"weather", "web-search"} or kind in {"mcp_http", "http"}
+    writes_artifacts = any(effect in {"write", "side_effect"} for effect in effects)
+    return {
+        "method": "builtin_mcp",
+        "requires_approval": False,
+        "will_create": [] if installed else ["mcp_server"],
+        "will_enable": ["mcp_server"] if not installed or not installed.get("enabled") else [],
+        "tools": [str(tool.get("name") or "") for tool in tools if tool.get("name")],
+        "tool_effects": effects,
+        "permissions": {
+            "reads_uploaded_files": False,
+            "writes_artifacts": writes_artifacts,
+            "runs_local_process": kind == "mcp_stdio",
+            "uses_network": uses_network,
+        },
+        "impact": "启用后工具服务会出现在工具接入页；智能体仍需拥有对应 MCP 权限才会在任务中调用。",
+        "post_install": "在“工具接入”查看工具 Schema、连接状态和调用测试；再到智能体配置里绑定服务 ID。",
+    }
+
+
+@app.get("/api/marketplace")
+def marketplace() -> dict[str, Any]:
+    skills: list[dict[str, Any]] = []
+    for item in BUILTIN_SKILL_CATALOG:
+        installed = skill_registry.get_skill(item["id"])
+        skills.append(
+            {
+                "id": item["id"],
+                "name": item["name"],
+                "description": item["description"],
+                "keywords": list(item.get("keywords") or []),
+                "source_label": item.get("source_label", "智枢内置目录"),
+                "installed": bool(installed),
+                "enabled": bool(installed.get("enabled")) if installed else False,
+                "category": installed.get("category") if installed else item["id"],
+                "install_plan": _skill_marketplace_plan(item, installed),
+            }
+        )
+    mcps: list[dict[str, Any]] = []
+    for server in BUILTIN_SERVERS:
+        installed = mcp_gateway.get_server(server["id"])
+        mcps.append(
+            {
+                "id": server["id"],
+                "name": server["name"],
+                "description": server["description"],
+                "tools": [tool.get("name") for tool in server.get("tools", [])],
+                "source_label": "平台内置 MCP",
+                "installed": bool(installed),
+                "enabled": bool(installed.get("enabled")) if installed else False,
+                "kind": installed.get("kind") if installed else server.get("kind", "builtin"),
+                "install_plan": _mcp_marketplace_plan(server, installed),
+            }
+        )
+    return {"skills": skills, "mcp_servers": mcps}
+
+
+@app.post("/api/marketplace/skills/{skill_id}/install")
+def install_marketplace_skill(skill_id: str) -> dict[str, Any]:
+    builtin = get_builtin_skill(skill_id)
+    if not builtin:
+        raise HTTPException(status_code=404, detail="市场中没有这个 Skill")
+    current = skill_registry.get_skill(skill_id)
+    if current:
+        if not current.get("enabled"):
+            return skill_registry.update_skill(skill_id, {"enabled": True}) or current
+        return current
+    payload = {
+        "id": builtin["id"],
+        "name": builtin["name"],
+        "description": builtin["description"],
+        "category": "recommended",
+        "version": "1.0.0",
+        "content": builtin["content"],
+        "enabled": True,
+        "required_mcps": [],
+    }
+    return skill_registry.create_skill(payload)
+
+
+@app.post("/api/marketplace/mcp/{server_id}/enable")
+def enable_marketplace_mcp(server_id: str) -> dict[str, Any]:
+    builtin = next((item for item in BUILTIN_SERVERS if item["id"] == server_id), None)
+    if not builtin:
+        raise HTTPException(status_code=404, detail="市场中没有这个 MCP")
+    if not mcp_gateway.get_server(server_id):
+        mcp_gateway.seed_builtin_servers()
+    updated = mcp_gateway.update_server(server_id, {"enabled": True})
+    if not updated:
+        raise HTTPException(status_code=404, detail="MCP server not found")
+    return updated
 
 
 def _api_scope(
@@ -509,6 +1133,99 @@ def _expert_http_error(exc: Exception) -> HTTPException:
     if isinstance(exc, ExpertConflictError):
         return HTTPException(status_code=409, detail=str(exc))
     return HTTPException(status_code=400, detail=str(exc))
+
+
+@app.get("/api/workspaces")
+def list_workspaces(
+    organization_id: str = "local-org",
+    user_id: str = "local-user",
+    include_disabled: bool = False,
+) -> list[dict[str, Any]]:
+    try:
+        return workspace_service.list_workspaces(
+            _api_scope(organization_id, "default", user_id),
+            include_disabled=include_disabled,
+        )
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/workspaces", status_code=201)
+def create_workspace(payload: WorkspaceCreate) -> dict[str, Any]:
+    try:
+        return workspace_service.create_workspace(
+            _api_scope(payload.organization_id, "default", payload.user_id),
+            workspace_id=payload.id,
+            name=payload.name,
+            description=payload.description,
+            default_agent_id=payload.default_agent_id,
+            default_model_id=payload.default_model_id,
+            settings=payload.settings,
+            enabled=payload.enabled,
+        )
+    except sqlite3.IntegrityError as exc:
+        raise HTTPException(status_code=409, detail="项目 ID 已存在") from exc
+    except (WorkspaceError, TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/workspaces/{workspace_id}")
+def get_workspace(
+    workspace_id: str,
+    organization_id: str = "local-org",
+    user_id: str = "local-user",
+) -> dict[str, Any]:
+    try:
+        item = workspace_service.get_workspace(
+            workspace_id, _api_scope(organization_id, "default", user_id)
+        )
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not item:
+        raise HTTPException(status_code=404, detail="项目不存在或当前实例不可见")
+    return item
+
+
+@app.put("/api/workspaces/{workspace_id}")
+def update_workspace(
+    workspace_id: str,
+    payload: WorkspaceUpdate,
+    organization_id: str = "local-org",
+    user_id: str = "local-user",
+) -> dict[str, Any]:
+    try:
+        return workspace_service.update_workspace(
+            workspace_id,
+            _api_scope(organization_id, "default", user_id),
+            name=payload.name,
+            description=payload.description,
+            default_agent_id=payload.default_agent_id,
+            default_model_id=payload.default_model_id,
+            settings=payload.settings,
+            enabled=payload.enabled,
+        )
+    except WorkspaceNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (WorkspaceError, TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.delete("/api/workspaces/{workspace_id}")
+def delete_workspace(
+    workspace_id: str,
+    organization_id: str = "local-org",
+    user_id: str = "local-user",
+) -> dict[str, Any]:
+    try:
+        return workspace_service.delete_workspace(
+            workspace_id, _api_scope(organization_id, "default", user_id)
+        )
+    except WorkspaceNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except WorkspaceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 def _public_expert_selection(
@@ -991,6 +1708,159 @@ def get_effective_context(
     )
 
 
+@app.get("/api/knowledge-bases")
+def list_knowledge_bases(
+    organization_id: str = "local-org",
+    workspace_id: str = "default",
+    user_id: str = "local-user",
+    include_disabled: bool = True,
+) -> list[dict[str, Any]]:
+    try:
+        return knowledge_service.list_bases(
+            _api_scope(organization_id, workspace_id, user_id),
+            include_disabled=include_disabled,
+        )
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/knowledge-bases", status_code=201)
+def create_knowledge_base(payload: KnowledgeBaseCreate) -> dict[str, Any]:
+    try:
+        return knowledge_service.create_base(
+            _api_scope(payload.organization_id, payload.workspace_id, payload.user_id),
+            base_id=payload.id,
+            name=payload.name,
+            description=payload.description,
+            visibility=payload.visibility,
+            enabled=payload.enabled,
+        )
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/knowledge-bases/{base_id}")
+def get_knowledge_base(
+    base_id: str,
+    organization_id: str = "local-org",
+    workspace_id: str = "default",
+    user_id: str = "local-user",
+) -> dict[str, Any]:
+    try:
+        item = knowledge_service.get_base(
+            base_id, _api_scope(organization_id, workspace_id, user_id)
+        )
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not item:
+        raise HTTPException(status_code=404, detail="知识库不存在或当前作用域不可见")
+    return item
+
+
+@app.put("/api/knowledge-bases/{base_id}")
+def update_knowledge_base(
+    base_id: str,
+    payload: KnowledgeBaseUpdate,
+    organization_id: str = "local-org",
+    workspace_id: str = "default",
+    user_id: str = "local-user",
+) -> dict[str, Any]:
+    try:
+        return knowledge_service.update_base(
+            base_id,
+            _api_scope(organization_id, workspace_id, user_id),
+            name=payload.name,
+            description=payload.description,
+            visibility=payload.visibility,
+            enabled=payload.enabled,
+        )
+    except KnowledgeBaseNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.delete("/api/knowledge-bases/{base_id}")
+def delete_knowledge_base(
+    base_id: str,
+    organization_id: str = "local-org",
+    workspace_id: str = "default",
+    user_id: str = "local-user",
+) -> dict[str, Any]:
+    try:
+        return knowledge_service.delete_base(
+            base_id, _api_scope(organization_id, workspace_id, user_id)
+        )
+    except KnowledgeBaseNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/knowledge-bases/{base_id}/documents")
+def list_knowledge_documents(
+    base_id: str,
+    organization_id: str = "local-org",
+    workspace_id: str = "default",
+    user_id: str = "local-user",
+) -> list[dict[str, Any]]:
+    try:
+        return knowledge_service.list_documents(
+            base_id, _api_scope(organization_id, workspace_id, user_id)
+        )
+    except KnowledgeBaseNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/knowledge-bases/{base_id}/documents/upload", status_code=201)
+def index_knowledge_upload(
+    base_id: str,
+    payload: KnowledgeDocumentUpload,
+    organization_id: str = "local-org",
+    workspace_id: str = "default",
+    user_id: str = "local-user",
+) -> dict[str, Any]:
+    upload = db.query_one("SELECT * FROM uploads WHERE id = ?", (payload.upload_id,))
+    if not upload:
+        raise HTTPException(status_code=404, detail="上传文件不存在")
+    try:
+        return knowledge_service.index_upload(
+            base_id,
+            _api_scope(organization_id, workspace_id, user_id),
+            upload=upload,
+        )
+    except KnowledgeBaseNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except KnowledgeBaseError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/knowledge/search")
+def search_knowledge(
+    q: str,
+    base_id: str = "",
+    organization_id: str = "local-org",
+    workspace_id: str = "default",
+    user_id: str = "local-user",
+    limit: int = 5,
+) -> dict[str, Any]:
+    try:
+        return knowledge_service.search(
+            _api_scope(organization_id, workspace_id, user_id),
+            query=q,
+            base_id=base_id,
+            limit=limit,
+        )
+    except KnowledgeBaseNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @app.get("/api/conversation-summaries")
 def list_conversation_summaries(
     organization_id: str = "local-org",
@@ -1418,18 +2288,90 @@ async def discover_mcp_tools(server_id: str) -> list[dict[str, Any]]:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+def _model_capabilities(row: dict[str, Any]) -> dict[str, Any]:
+    provider = str(row.get("provider") or "")
+    config = db.json_loads(row.get("config_json"), {})
+    if provider == "deterministic":
+        return {
+            "protocol": "offline",
+            "streaming": True,
+            "tool_calling": False,
+            "online_required": False,
+            "credential_required": False,
+            "context_window": None,
+            "notes": ["离线流程检查模型，不适合复杂内容生成。"],
+        }
+    return {
+        "protocol": "openai_chat_completions",
+        "streaming": True,
+        "tool_calling": True,
+        "online_required": True,
+        "credential_required": True,
+        "context_window": config.get("context_window") or config.get("max_context_tokens"),
+        "notes": [
+            "需要 APP_ALLOW_OUTBOUND_NETWORK 和 APP_MODEL_HOST_ALLOWLIST 允许目标主机。",
+            "逐段实时输出取决于上游是否正确支持 SSE stream=true。",
+            "工具调用取决于上游是否兼容 Chat Completions tools 字段。",
+        ],
+    }
+
+
+def _model_readiness(row: dict[str, Any]) -> dict[str, Any]:
+    provider = str(row.get("provider") or "")
+    enabled = bool(row.get("enabled"))
+    if provider == "deterministic":
+        return {"state": "ready", "label": "内置可用", "detail": "无需密钥和网络，适合检查流程。"}
+    has_direct_key = bool(row.get("api_key_ciphertext"))
+    api_key_env = str(row.get("api_key_env") or "").strip()
+    if not enabled:
+        return {"state": "off", "label": "已停用", "detail": "启用后才会进入模型选择器。"}
+    if not has_direct_key and not api_key_env:
+        return {"state": "needs_config", "label": "缺少密钥", "detail": "请选择环境变量或直接 API Key。"}
+    if not str(row.get("base_url") or "").strip():
+        return {"state": "needs_config", "label": "缺少 Base URL", "detail": "请填写 OpenAI-compatible API 根地址。"}
+    if api_key_env and not os.getenv(api_key_env):
+        return {"state": "needs_config", "label": "环境变量未检测", "detail": f"服务进程当前未检测到 {api_key_env}。"}
+    if not outbound_network_enabled():
+        return {"state": "needs_config", "label": "联网未开启", "detail": "需要开启 APP_ALLOW_OUTBOUND_NETWORK 并配置模型主机白名单。"}
+    return {"state": "ready", "label": "配置完整", "detail": "建议点击测试连接确认供应商接口可用。"}
+
+
 def model_to_api(row: dict[str, Any]) -> dict[str, Any]:
     legacy_key = str(row.get("api_key_env") or "").strip()
     has_direct_key = bool(row.get("api_key_ciphertext")) or bool(legacy_key and not _is_env_name(legacy_key))
     safe = {k: v for k, v in row.items() if k not in {"api_key_ciphertext", "config_json"}}
     safe["api_key_env"] = legacy_key if _is_env_name(legacy_key) else ""
-    return {**safe, "enabled": bool(row.get("enabled")), "config": db.json_loads(row.get("config_json"), {}), "has_api_key": has_direct_key, "api_key_mode": "direct" if has_direct_key else "env"}
+    public = {**safe, "enabled": bool(row.get("enabled")), "config": db.json_loads(row.get("config_json"), {}), "has_api_key": has_direct_key, "api_key_mode": "direct" if has_direct_key else "env"}
+    last_test = {
+        "status": str(row.get("last_test_status") or ""),
+        "message": str(row.get("last_test_message") or ""),
+        "tested_at": str(row.get("last_test_at") or ""),
+    }
+    if not last_test["status"]:
+        last_test = {"status": "untested", "message": "尚未测试连接", "tested_at": ""}
+    return {**public, "last_test": last_test, "capabilities": _model_capabilities(row), "readiness": _model_readiness(row)}
 
 
 @app.get("/api/models")
 def list_models() -> list[dict[str, Any]]:
-    deterministic = {"id": "deterministic", "name": "离线确定性模型", "provider": "deterministic", "model": "deterministic-offline", "base_url": "", "api_key_env": "", "enabled": True, "config": {}, "has_api_key": False, "api_key_mode": "env"}
+    deterministic = {"id": "deterministic", "name": "离线确定性模型", "provider": "deterministic", "model": "deterministic-offline", "base_url": "", "api_key_env": "", "enabled": True, "config": {}, "has_api_key": False, "api_key_mode": "env", "last_test": {"status": "pass", "message": "内置模型无需连接测试", "tested_at": ""}, "capabilities": _model_capabilities({"provider": "deterministic"}), "readiness": _model_readiness({"provider": "deterministic", "enabled": True})}
     return [deterministic] + [model_to_api(r) for r in db.query_all("SELECT * FROM model_configs ORDER BY name")]
+
+
+def _ensure_model_ready(model_id: str | None, *, label: str = "所选模型") -> None:
+    if not model_id or model_id == "deterministic":
+        return
+    row = db.query_one("SELECT * FROM model_configs WHERE id = ?", (model_id,))
+    if not row or not row.get("enabled"):
+        raise HTTPException(status_code=400, detail=f"{label}不存在或未启用")
+    readiness = _model_readiness(row)
+    if readiness.get("state") != "ready":
+        detail = str(readiness.get("detail") or "").strip()
+        suffix = f"：{detail}" if detail else ""
+        raise HTTPException(
+            status_code=400,
+            detail=f"{label}暂不可用（{readiness.get('label', '需要配置')}）{suffix}",
+        )
 
 
 @app.post("/api/models")
@@ -1491,15 +2433,39 @@ def delete_model(model_id: str) -> dict[str, Any]:
 
 @app.post("/api/models/{model_id}/test")
 async def test_model(model_id: str) -> dict[str, Any]:
+    if model_id == "deterministic":
+        return {
+            "ok": True,
+            "model_id": model_id,
+            "response": "内置模型无需连接测试",
+            "model": next(item for item in list_models() if item["id"] == "deterministic"),
+        }
+    if not db.query_one("SELECT id FROM model_configs WHERE id = ?", (model_id,)):
+        raise HTTPException(status_code=404, detail="Model config not found")
     try:
         response = await model_gateway.summarize(
             "这是连接测试。请只回复 OK。",
             {"system_prompt": "你正在执行模型连接测试。"},
             model_config_id=model_id,
         )
-        return {"ok": True, "model_id": model_id, "response": response[:1000]}
+        message = str(response or "OK")[:1000]
+        db.execute(
+            "UPDATE model_configs SET last_test_status = ?, last_test_message = ?, last_test_at = ?, updated_at = ? WHERE id = ?",
+            ("pass", message, db.utc_now(), db.utc_now(), model_id),
+        )
+        return {
+            "ok": True,
+            "model_id": model_id,
+            "response": message,
+            "model": model_to_api(db.query_one("SELECT * FROM model_configs WHERE id = ?", (model_id,)) or {}),
+        }
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        message = str(exc)[:1000]
+        db.execute(
+            "UPDATE model_configs SET last_test_status = ?, last_test_message = ?, last_test_at = ?, updated_at = ? WHERE id = ?",
+            ("fail", message, db.utc_now(), db.utc_now(), model_id),
+        )
+        raise HTTPException(status_code=400, detail=message) from exc
 
 
 @app.post("/api/mcp/{server_id}/tools/{tool_name}/invoke")
@@ -1507,6 +2473,28 @@ async def invoke_mcp_tool(server_id: str, tool_name: str, payload: ToolInvokeReq
     definition = mcp_gateway.get_tool_definition(server_id, tool_name)
     if not definition:
         raise HTTPException(status_code=404, detail="MCP 工具不存在，请先同步工具清单")
+    # Validate required fields before the page-level read-only guard.  A user
+    # who clicked "调用工具" with an incomplete form needs one concise,
+    # actionable parameter hint; the permission message is only useful after
+    # the invocation is otherwise well-formed.  Support both the platform's
+    # snake_case schema and the MCP protocol's camelCase spelling because
+    # imported configurations commonly use ``inputSchema``.
+    schema = definition.get("input_schema") or definition.get("inputSchema") or {}
+    if isinstance(schema, dict):
+        required = schema.get("required")
+        arguments = payload.arguments if isinstance(payload.arguments, dict) else {}
+        if isinstance(required, list):
+            missing = [
+                str(item)
+                for item in required
+                if str(item) not in arguments
+                or arguments.get(str(item)) in (None, "")
+            ]
+            if missing:
+                raise HTTPException(
+                    status_code=400,
+                    detail="工具调用缺少必填参数：" + "、".join(missing),
+                )
     server_kind = str(definition.get("server_kind") or "")
     trusted_read_only = (
         server_kind == "builtin" and definition.get("effect") == "read"
@@ -1632,33 +2620,106 @@ def update_agent(agent_id: str, payload: AgentUpdate) -> dict[str, Any]:
 
 
 @app.get("/api/tasks")
-def list_tasks() -> list[dict[str, Any]]:
-    rows = db.query_all("SELECT * FROM tasks ORDER BY created_at DESC LIMIT 100")
+def list_tasks(workspace_id: str = "", organization_id: str = "", user_id: str = "") -> list[dict[str, Any]]:
+    clauses: list[str] = []
+    params: list[Any] = []
+    for column, value in (
+        ("workspace", workspace_id),
+        ("organization_id", organization_id),
+        ("user_id", user_id),
+    ):
+        if value:
+            clauses.append(f"{column} = ?")
+            params.append(value)
+    where = " WHERE " + " AND ".join(clauses) if clauses else ""
+    rows = db.query_all(
+        f"SELECT * FROM tasks{where} ORDER BY created_at DESC LIMIT 100",  # noqa: S608 - fixed columns
+        tuple(params),
+    )
     return [_public_task(r) for r in rows]
 
 
 def _public_attachment(value: dict[str, Any]) -> dict[str, Any]:
     """Expose attachment metadata without leaking the server storage path."""
     allowed = {"id", "name", "content_type", "size", "created_at"}
-    return {
+    result = {
         key: value.get(key)
         for key in allowed
         if value.get(key) not in (None, "")
+    }
+    result["context_status"] = _attachment_context_status(value)
+    return result
+
+
+def _attachment_context_status(value: dict[str, Any]) -> dict[str, Any]:
+    """Describe whether an upload can be injected into task context without exposing content/path."""
+    name = str(value.get("name") or "")
+    suffix = Path(name).suffix.lower()
+    content_type = str(value.get("content_type") or "application/octet-stream")
+    size = int(value.get("size") or 0)
+    text_suffixes = {
+        ".txt", ".md", ".csv", ".json", ".yaml", ".yml",
+        ".py", ".js", ".ts", ".html", ".css",
+    }
+    document_suffixes = {".docx", ".xlsx", ".pptx", ".pdf"}
+    supported = suffix in text_suffixes or suffix in document_suffixes or content_type.startswith("text/")
+    limit = int(getattr(runtime, "ATTACHMENT_MAX_FILE_BYTES", 2 * 1024 * 1024))
+    if not supported:
+        return {
+            "state": "unsupported",
+            "label": "不支持正文解析",
+            "detail": "文件会保留为附件记录，但不会自动进入模型上下文。",
+            "supported": False,
+            "extractable": False,
+            "max_bytes": limit,
+        }
+    if size > limit:
+        return {
+            "state": "too_large",
+            "label": "超过解析上限",
+            "detail": f"文件超过 {max(1, limit // 1024 // 1024)}MB 正文解析上限，不会自动进入模型上下文。",
+            "supported": True,
+            "extractable": False,
+            "max_bytes": limit,
+        }
+    return {
+        "state": "ready",
+        "label": "可进入上下文",
+        "detail": "发送任务后，平台会尝试提取正文并作为附件上下文使用。",
+        "supported": True,
+        "extractable": True,
+        "max_bytes": limit,
     }
 
 
 def _public_artifact(value: dict[str, Any]) -> dict[str, Any]:
     artifact_id = str(value.get("id") or "")
+    declared_status = str(value.get("delivery_status") or "")
+    authoritative_status = ""
+    if artifact_id:
+        row = db.query_one(
+            "SELECT delivery_status FROM artifacts WHERE id = ?", (artifact_id,)
+        )
+        if row is not None:
+            authoritative_status = str(row.get("delivery_status") or "")
+    # Event payloads and historic task projections are not an authority for
+    # publication.  A usable link is projected only when the current Artifact
+    # row says it was published by the finalization transaction.
+    delivery_status = authoritative_status or (
+        declared_status
+        if declared_status in {"pending_verification", "rejected"}
+        else "unavailable"
+    )
     allowed = {
         "id", "task_id", "run_id", "workspace_id", "name", "kind",
-        "mime_type", "size", "sha256", "version", "created_at", "metadata",
+        "mime_type", "size", "sha256", "version", "created_at",
+        "delivery_status",
     }
     result = {key: value.get(key) for key in allowed if value.get(key) not in (None, "")}
-    if artifact_id:
+    result["delivery_status"] = delivery_status
+    if artifact_id and authoritative_status == "published":
         result["download_url"] = f"/api/artifacts/{artifact_id}/download"
         result["preview_url"] = f"/api/artifacts/{artifact_id}/preview"
-    elif value.get("download_url"):
-        result["download_url"] = value["download_url"]
     return result
 
 
@@ -1681,22 +2742,588 @@ def _sanitize_public_payload(value: Any) -> Any:
     }
 
 
-def _public_event(value: dict[str, Any]) -> dict[str, Any]:
-    """Expose parsed event data and omit its duplicate internal JSON column."""
-    result = {key: item for key, item in value.items() if key != "data_json"}
-    result["data"] = _sanitize_public_payload(
-        db.json_loads(value.get("data_json"), {})
+def _public_goal_ref(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    return {
+        key: value.get(key)
+        for key in ("id", "goal_id", "version", "spec_hash")
+        if isinstance(value.get(key), (str, int)) and value.get(key) not in (None, "")
+    }
+
+
+def _public_goal_summary(value: Any) -> dict[str, Any]:
+    """Re-project a stored GoalSpec summary instead of trusting its JSON shape."""
+
+    if not isinstance(value, dict):
+        return {}
+    objective = value.get("objective") if isinstance(value.get("objective"), dict) else {}
+    capabilities = (
+        value.get("capabilities") if isinstance(value.get("capabilities"), dict) else {}
     )
+    confirmation = (
+        value.get("confirmation") if isinstance(value.get("confirmation"), dict) else {}
+    )
+    return {
+        "schema_version": value.get("schema_version"),
+        "goal_id": value.get("goal_id"),
+        "task_id": value.get("task_id"),
+        "version": value.get("version"),
+        "status": value.get("status"),
+        "objective": {
+            "statement": str(objective.get("statement") or ""),
+            "intent": str(objective.get("intent") or ""),
+            "in_scope": [item for item in objective.get("in_scope", []) if isinstance(item, str)],
+            "out_of_scope": [item for item in objective.get("out_of_scope", []) if isinstance(item, str)],
+            "constraints": [item for item in objective.get("constraints", []) if isinstance(item, str)],
+        },
+        "missing_inputs": [
+            {
+                key: item.get(key)
+                for key in ("key", "label", "ask")
+                if item.get(key) not in (None, "")
+            }
+            for item in value.get("missing_inputs", [])
+            if isinstance(item, dict)
+        ],
+        "deliverables": [
+            {
+                key: item.get(key)
+                for key in (
+                    "id", "kind", "format", "title", "filename", "required",
+                    "download_required",
+                )
+                if item.get(key) not in (None, "")
+            }
+            for item in value.get("deliverables", [])
+            if isinstance(item, dict)
+        ],
+        "capabilities": {
+            "skills": [
+                {
+                    key: item.get(key)
+                    for key in ("skill_id", "name", "version", "purpose")
+                    if item.get(key) not in (None, "")
+                }
+                for item in capabilities.get("skills", [])
+                if isinstance(item, dict)
+            ],
+            "tools": [
+                {
+                    key: item.get(key)
+                    for key in ("server_id", "tool_name", "effect", "purpose")
+                    if item.get(key) not in (None, "")
+                }
+                for item in capabilities.get("tools", [])
+                if isinstance(item, dict)
+            ],
+            "network_access": capabilities.get("network_access"),
+        },
+        "context_ref_count": value.get("context_ref_count", 0),
+        "acceptance": [
+            {
+                key: item.get(key)
+                for key in ("id", "title", "kind", "severity")
+                if item.get(key) not in (None, "")
+            }
+            for item in value.get("acceptance", [])
+            if isinstance(item, dict)
+        ],
+        "confirmation": {
+            **{
+                key: confirmation.get(key)
+                for key in ("status", "mode", "confidence")
+                if isinstance(confirmation.get(key), (str, int, float, bool))
+                and confirmation.get(key) not in (None, "")
+            },
+            "ambiguities": [
+                item
+                for item in confirmation.get("ambiguities", [])
+                if isinstance(item, str)
+            ],
+        },
+        "supersedes": _public_goal_ref(value.get("supersedes")),
+        "spec_hash": value.get("spec_hash"),
+    }
+
+
+def _public_verification_report(value: Any) -> dict[str, Any]:
+    """Keep only the intentionally public verifier contract."""
+
+    if not isinstance(value, dict):
+        return {}
+    semantic = value.get("semantic") if isinstance(value.get("semantic"), dict) else {}
+    return {
+        key: item
+        for key, item in {
+            "schema_version": value.get("schema_version"),
+            "mode": value.get("mode"),
+            "verdict": value.get("verdict"),
+            "passed": value.get("passed"),
+            "coverage": value.get("coverage"),
+            "semantic_attempted": value.get("semantic_attempted"),
+            "semantic_verified": value.get("semantic_verified"),
+            "public_reason": value.get("public_reason"),
+            "rules": [
+                {
+                    field: rule.get(field)
+                    for field in (
+                        "id", "title", "status", "public_reason", "repair_instruction",
+                    )
+                    if isinstance(rule.get(field), (str, int, float, bool))
+                    and rule.get(field) not in (None, "")
+                }
+                for rule in value.get("rules", [])
+                if isinstance(rule, dict)
+            ],
+            "semantic": {
+                **{
+                    field: semantic.get(field)
+                    for field in ("status", "public_reason")
+                    if isinstance(semantic.get(field), (str, int, float, bool))
+                    and semantic.get(field) not in (None, "")
+                },
+                "repair_instructions": [
+                    item
+                    for item in semantic.get("repair_instructions", [])
+                    if isinstance(item, str)
+                ],
+            },
+            "repair_instructions": [
+                item
+                for item in value.get("repair_instructions", [])
+                if isinstance(item, str)
+            ],
+        }.items()
+        if item is not None
+    }
+
+
+def _public_plan_node(value: Any, *, include_children: bool = True) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    node = {
+        key: value.get(key)
+        for key in ("id", "title", "kind", "status")
+        if value.get(key) not in (None, "")
+    }
+    if include_children:
+        node["children"] = [
+            _public_plan_node(item, include_children=False)
+            for item in value.get("children", [])
+            if isinstance(item, dict)
+        ]
+    return node
+
+
+def _public_plan(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    confirmation = (
+        value.get("goal_confirmation")
+        if isinstance(value.get("goal_confirmation"), dict)
+        else {}
+    )
+    return {
+        "goal": value.get("goal"),
+        "goal_confirmation": {
+            key: confirmation.get(key)
+            for key in ("status", "label", "message")
+            if confirmation.get(key) not in (None, "")
+        },
+        "intent": value.get("intent"),
+        "steps": [str(item) for item in value.get("steps", []) if str(item).strip()],
+        "nodes": [
+            _public_plan_node(item)
+            for item in value.get("nodes", [])
+            if isinstance(item, dict)
+        ],
+        "allowed_servers": [
+            str(item) for item in value.get("allowed_servers", []) if str(item).strip()
+        ],
+        "output_format": value.get("output_format"),
+        "output_formats": [
+            str(item) for item in value.get("output_formats", []) if str(item).strip()
+        ],
+        "requested_formats": [
+            str(item) for item in value.get("requested_formats", []) if str(item).strip()
+        ],
+        "unavailable_formats": [
+            str(item) for item in value.get("unavailable_formats", []) if str(item).strip()
+        ],
+        "requires_artifact": bool(value.get("requires_artifact")),
+        "acceptance_criteria": [
+            {
+                key: item.get(key)
+                for key in ("id", "title", "status")
+                if item.get(key) not in (None, "")
+            }
+            for item in value.get("acceptance_criteria", [])
+            if isinstance(item, dict)
+        ],
+    }
+
+
+def _public_event_data(event_type: str, value: Any) -> dict[str, Any]:
+    """Project each public event type; arbitrary nested payloads are never copied."""
+
+    data = value if isinstance(value, dict) else {}
+    scalar_fields: dict[str, tuple[str, ...]] = {
+        "start": ("run_id", "attempt"),
+        "goal_spec_progress": ("status",),
+        "recovery": ("run_id", "checkpoint_id"),
+        "recovery_scheduled": ("run_id", "checkpoint_id", "attempt"),
+        "checkpoint": ("checkpoint_id", "run_id", "node_id"),
+        "clarification": (),
+        "progress": ("status", "percent"),
+        "plan_progress": (
+            "plan_id", "node_id", "status", "child_id", "child_title",
+            "child_kind", "elapsed_seconds",
+        ),
+        "plan_check": ("tool", "passed", "plan_id", "reason", "source"),
+        "tool_call": ("server_id", "tool_name"),
+        "tool_result": ("server_id", "tool_name", "duration_ms"),
+        "tool_error": ("server_id", "tool_name"),
+        "tool_blocked": ("server_id", "tool_name", "reason", "source"),
+        "tool_reused": ("server_id", "tool_name"),
+        "answer_delta": ("draft", "delivery_state", "goal_spec_version"),
+        "answer_reset": ("reason", "verification_id"),
+        "verification_started": ("mode", "delivery_state"),
+        "verification_result": ("verification_id", "delivery_state"),
+        "candidate_verified": ("verification_id", "delivery_state"),
+        "answer": ("verification_id", "delivery_state", "team_run_id"),
+        "done": ("verification_id", "delivery_state"),
+        "output_check": (
+            "passed", "verification_id", "expected_format", "artifact_count",
+        ),
+        "approval_required": ("action",),
+        # Raw exception class names are internal diagnostics.  The public
+        # projector exposes only an intentionally assigned stable error code.
+        "error": ("error_code", "team_run_id"),
+        "steering": ("count",),
+        "resume": ("run_id", "checkpoint_id"),
+        "resume_scheduled": ("run_id", "checkpoint_id", "restore_count"),
+        "retry_scheduled": ("run_id", "attempt"),
+        "command_queued": ("command_id", "run_id", "intake_generation"),
+        "team_queued": ("team_id", "team_run_id", "member_count"),
+        "team_parallel_start": ("team_run_id",),
+        "team_aggregating": ("team_run_id",),
+        "team_completed": ("team_run_id",),
+        "team_member_retry": ("team_run_id", "member_run_id"),
+        "team_partial_failed": ("team_run_id",),
+        "team_acceptance_failed": ("team_run_id",),
+    }
+    result = {
+        key: data.get(key)
+        for key in scalar_fields.get(event_type, ())
+        if isinstance(data.get(key), (str, int, float, bool))
+    }
+    if event_type == "agent" and isinstance(data.get("agent"), dict):
+        result["agent"] = {
+            key: data["agent"].get(key)
+            for key in ("id", "name", "description", "icon")
+            if data["agent"].get(key) not in (None, "")
+        }
+    if event_type in {"skill", "install"}:
+        if isinstance(data.get("skill"), dict):
+            result["skill"] = {
+                key: data["skill"].get(key)
+                for key in ("id", "name", "description", "version", "enabled")
+                if data["skill"].get(key) not in (None, "")
+            }
+        if isinstance(data.get("skills"), list):
+            result["skills"] = [
+                {
+                    key: item.get(key)
+                    for key in ("id", "name", "version", "score")
+                    if item.get(key) not in (None, "")
+                }
+                for item in data["skills"]
+                if isinstance(item, dict)
+            ]
+    if event_type == "install" and isinstance(data.get("mcp_servers"), list):
+        result["mcp_servers"] = [
+            {
+                key: item.get(key)
+                for key in ("id", "name", "transport", "enabled", "status")
+                if item.get(key) not in (None, "")
+            }
+            for item in data["mcp_servers"]
+            if isinstance(item, dict)
+        ]
+    if event_type == "knowledge":
+        result["knowledge_base_ids"] = [
+            str(item) for item in data.get("knowledge_base_ids", []) if str(item).strip()
+        ][:20]
+        result["matches"] = _public_knowledge_matches(data.get("matches"))
+    if event_type == "goal_spec":
+        result["goal_spec"] = _public_goal_summary(data.get("goal_spec"))
+        result["goal_spec_ref"] = _public_goal_ref(data.get("goal_spec_ref"))
+    if event_type in {"plan_check", "tool_blocked", "verification_started", "verification_result"}:
+        goal_ref = _public_goal_ref(data.get("goal_spec_ref"))
+        if goal_ref:
+            result["goal_spec_ref"] = goal_ref
+    if event_type == "plan":
+        result["plan"] = _public_plan(data.get("plan"))
+    if event_type == "tool_result" and isinstance(data.get("artifact"), dict):
+        result["artifact"] = _public_artifact(data["artifact"])
+    if event_type in {"answer", "tool_result"} and isinstance(data.get("artifacts"), list):
+        result["artifacts"] = [
+            _public_artifact(item) for item in data["artifacts"] if isinstance(item, dict)
+        ]
+    if event_type in {"verification_result", "output_check"}:
+        report = _public_verification_report(data.get("report"))
+        if report:
+            result["report"] = report
+        if isinstance(data.get("criteria"), list):
+            result["criteria"] = [
+                {
+                    key: item.get(key)
+                    for key in ("id", "title", "status", "detail", "public_reason")
+                    if item.get(key) not in (None, "")
+                }
+                for item in data["criteria"]
+                if isinstance(item, dict)
+            ]
+    if event_type == "approval_required" and isinstance(data.get("recommendations"), list):
+        result["recommendations"] = [
+            {
+                key: item.get(key)
+                for key in ("id", "name", "description", "source_label")
+                if item.get(key) not in (None, "")
+            }
+            for item in data["recommendations"]
+            if isinstance(item, dict)
+        ]
+    if event_type == "clarification" and isinstance(data.get("missing_information"), list):
+        result["missing_information"] = [
+            str(item) for item in data["missing_information"] if str(item).strip()
+        ]
+    if event_type == "expert_selection":
+        result.update(
+            {
+                key: data.get(key)
+                for key in ("selection_mode", "team_id", "team_name", "reason")
+                if isinstance(data.get(key), (str, int, float, bool))
+            }
+        )
+        result["matched_terms"] = [
+            str(item) for item in data.get("matched_terms", []) if str(item).strip()
+        ][:8]
+        if isinstance(data.get("supervisor"), dict):
+            result["supervisor"] = {
+                key: data["supervisor"].get(key)
+                for key in ("agent_id", "agent_name")
+                if data["supervisor"].get(key) not in (None, "")
+            }
+        result["members"] = [
+            {
+                key: item.get(key)
+                for key in ("agent_id", "agent_name", "role")
+                if item.get(key) not in (None, "")
+            }
+            for item in data.get("members", [])
+            if isinstance(item, dict)
+        ]
     return result
 
 
-_PRIVATE_TASK_EVENT_TYPES = frozenset({"analysis", "reasoning", "thought", "thinking"})
+def _public_error_code(value: Any) -> str:
+    """Map internal exception classes to a small, user-facing error vocabulary."""
+
+    data = value if isinstance(value, dict) else {}
+    message = str(data.get("message") or "").strip().lower()
+    # PPTX is an optional capability. Preserve that distinction at the public
+    # boundary so a missing presentation component is actionable instead of
+    # looking like an unrelated MCP/network failure. Only match known
+    # capability messages; arbitrary provider text stays redacted.
+    pptx_unavailable_markers = (
+        "powerpoint 生成组件尚未安装",
+        "powerpoint 生成需要 node.js",
+        "powerpoint 生成脚本缺失",
+        "powerpoint 生成功能尚未配置",
+        "pptx 生成器尚未配置",
+    )
+    if any(marker in message for marker in pptx_unavailable_markers):
+        return "artifact_pptx_unavailable"
+    error_type = str(data.get("error_type") or "").lower().replace("_", "")
+    if error_type in {
+        "httpstatusexception", "connecterror", "readtimeout", "connecttimeout",
+        "timeoutexception", "remoteprotocolerror", "networkerror",
+    } or "model" in error_type:
+        return "model_unavailable"
+    # Network-policy failures are raised as a generic RuntimeError before an
+    # HTTP client exception exists.  They still belong to the selected model,
+    # not to the generic task-failure bucket; otherwise the conversation only
+    # says “任务未完成” and leaves the user guessing why the run stopped.
+    model_network_markers = (
+        "模型 api",
+        "模型api",
+        "模型主机",
+        "api主机",
+        "联网未开启",
+        "联网访问",
+        "在线模型",
+        "模型供应商",
+        "模型配置不存在",
+    )
+    if any(marker in message for marker in model_network_markers):
+        return "model_unavailable"
+    if "tool" in error_type or "mcp" in error_type:
+        return "tool_unavailable"
+    return "task_execution_failed"
+
+
+_PUBLIC_TASK_EVENT_TYPES = frozenset(
+    {
+        "agent", "answer", "answer_delta", "answer_reset", "approval",
+        "approval_required", "cancelled", "candidate_verified", "checkpoint",
+        "clarification", "command_queued", "conversation_summary", "done", "error",
+        "expert_selection", "goal_spec", "goal_spec_progress", "install", "intent", "knowledge",
+        "interrupted", "memory", "memory_deleted", "memory_saved", "model", "notice",
+        "output_check", "permissions", "plan", "plan_check", "plan_progress", "progress",
+        "recovery", "recovery_scheduled", "resume", "resume_scheduled", "retry_scheduled",
+        "skill", "start", "steering", "team_acceptance_failed", "team_aggregating",
+        "team_completed", "team_member_retry", "team_parallel_start", "team_partial_failed",
+        "team_queued", "tool_blocked", "tool_call", "tool_error", "tool_result",
+        "tool_reused", "verification_result", "verification_started",
+    }
+)
+
+
+def _public_event(value: dict[str, Any]) -> dict[str, Any]:
+    """Expose one known event through a type-specific, default-deny projector."""
+
+    event_type = str(value.get("type") or "").lower()
+    raw_data = db.json_loads(value.get("data_json"), {})
+    error_code = _public_error_code(raw_data) if event_type == "error" else ""
+    if event_type == "error":
+        classification = dict(raw_data)
+        # ``commit_failure`` stores the raw message in the event content and
+        # keeps only a redacted data payload. Use it solely for selecting a
+        # stable public code; never return it directly.
+        if value.get("content") not in (None, ""):
+            classification["message"] = value.get("content")
+        error_code = _public_error_code(classification)
+        error_copy = {
+            "model_unavailable": (
+                "模型暂时不可用或网络访问失败。请检查模型配置、联网开关后重试。"
+            ),
+            "tool_unavailable": (
+                "工具服务调用失败。请检查 MCP 配置、授权或网络白名单后重试。"
+            ),
+            "artifact_pptx_unavailable": (
+                "PowerPoint 生成功能尚未配置。请先配置平台的 PowerPoint 生成组件后重试。"
+            ),
+            "task_execution_failed": (
+                "任务执行未完成。请检查模型、参数或工具配置后重试。"
+            ),
+        }
+        title = {
+            "model_unavailable": "模型暂时不可用",
+            "tool_unavailable": "工具服务调用失败",
+            "artifact_pptx_unavailable": "PowerPoint 生成功能不可用",
+            "task_execution_failed": "任务未完成",
+        }.get(error_code, "任务未完成")
+        content = error_copy.get(error_code, error_copy["task_execution_failed"])
+    elif event_type == "tool_error":
+        title = "工具调用未完成"
+        content = "工具调用未成功。请检查工具配置、授权或网络状态后重试。"
+    elif event_type == "tool_blocked":
+        title = value.get("title") or "工具调用已阻止"
+        content = "该工具调用不符合当前目标、权限或执行计划，平台已停止执行。"
+    elif event_type in {"plan_progress", "progress"} and str(
+        raw_data.get("status") or ""
+    ).lower() == "failed":
+        title = value.get("title") or "执行步骤未完成"
+        content = "该执行步骤未完成。请检查公开错误提示、参数或能力配置后重试。"
+    else:
+        title = value.get("title")
+        content = value.get("content")
+    result = {
+        key: value.get(key)
+        for key in ("id", "task_id", "ts", "type")
+        if value.get(key) is not None
+    }
+    if title is not None:
+        result["title"] = title
+    if content is not None:
+        result["content"] = content
+    result["data"] = _public_event_data(event_type, raw_data)
+    if error_code:
+        result["data"]["error_code"] = error_code
+    return result
+
+
 _TASK_STREAM_TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
 
 
+def _public_knowledge_matches(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    matches: list[dict[str, Any]] = []
+    for item in value[:20]:
+        if not isinstance(item, dict):
+            continue
+        public: dict[str, Any] = {}
+        for key in ("chunk_id", "document_id", "knowledge_base_id", "document_name"):
+            raw = item.get(key)
+            if raw not in (None, ""):
+                public[key] = str(raw)[:240]
+        ordinal = item.get("ordinal")
+        if isinstance(ordinal, int):
+            public["ordinal"] = ordinal
+        elif isinstance(ordinal, str) and ordinal.isdigit():
+            public["ordinal"] = int(ordinal)
+        if public:
+            matches.append(public)
+    return matches
+
+
+def _task_knowledge_summary(task_id: str) -> dict[str, Any]:
+    rows = db.query_all(
+        "SELECT data_json FROM task_events WHERE task_id = ? AND type = 'knowledge' ORDER BY id",
+        (task_id,),
+    )
+    by_chunk: dict[str, dict[str, Any]] = {}
+    knowledge_base_ids: set[str] = set()
+    documents: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        data = db.json_loads(row.get("data_json"), {})
+        for base_id in data.get("knowledge_base_ids", []) if isinstance(data, dict) else []:
+            if str(base_id).strip():
+                knowledge_base_ids.add(str(base_id))
+        for match in _public_knowledge_matches(data.get("matches") if isinstance(data, dict) else None):
+            chunk_key = str(match.get("chunk_id") or f"{match.get('document_id')}:{match.get('ordinal')}")
+            by_chunk[chunk_key] = match
+            doc_key = str(match.get("document_id") or match.get("document_name") or chunk_key)
+            doc = documents.setdefault(
+                doc_key,
+                {
+                    "document_id": match.get("document_id", ""),
+                    "document_name": match.get("document_name", ""),
+                    "match_count": 0,
+                },
+            )
+            doc["match_count"] = int(doc.get("match_count") or 0) + 1
+            if match.get("document_name"):
+                doc["document_name"] = match["document_name"]
+    matches = list(by_chunk.values())
+    return {
+        "match_count": len(matches),
+        "knowledge_base_ids": sorted(knowledge_base_ids),
+        "documents": sorted(
+            documents.values(),
+            key=lambda item: (str(item.get("document_name") or item.get("document_id") or ""), -int(item.get("match_count") or 0)),
+        )[:20],
+        "matches": matches[:20],
+    }
+
+
 def _is_public_task_event(value: dict[str, Any]) -> bool:
-    """Keep private model-working events out of every browser-facing event feed."""
-    return str(value.get("type") or "").lower() not in _PRIVATE_TASK_EVENT_TYPES
+    """Unknown event types are private until an explicit projector is added."""
+
+    return str(value.get("type") or "").lower() in _PUBLIC_TASK_EVENT_TYPES
 
 
 def _task_event_cursor(
@@ -1731,6 +3358,296 @@ def _public_runtime_record(value: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _public_task_run(value: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: value.get(key)
+        for key in (
+            "id", "task_id", "attempt", "status", "current_node_id",
+            "resumed_from_checkpoint_id", "started_at", "finished_at",
+            "created_at", "updated_at",
+        )
+        if value.get(key) not in (None, "")
+    }
+
+
+def _public_task_node(value: dict[str, Any], *, attempt: int = 1) -> dict[str, Any]:
+    has_error = bool(value.get("error"))
+    metadata = value.get("metadata") if isinstance(value.get("metadata"), dict) else {}
+    kind = str(value.get("kind") or "step").lower()
+    logical_id = str(metadata.get("logical_id") or "")
+    capability: dict[str, str] | None = None
+    if kind in {"skill", "mcp", "tool", "model", "agent", "knowledge", "memory"}:
+        capability_id = logical_id
+        for prefix in ("skill:", "tool:", "model:", "agent:", "knowledge:", "memory:"):
+            if capability_id.startswith(prefix):
+                capability_id = capability_id[len(prefix):]
+                break
+        if re.fullmatch(r"[A-Za-z0-9_.:@/-]{1,160}", capability_id):
+            capability = {
+                "type": "mcp" if kind == "tool" else kind,
+                "id": capability_id,
+                "label": str(value.get("title") or capability_id)[:160],
+            }
+    status_message = ""
+    if not has_error:
+        status_message = str(metadata.get("last_message") or "")[:300]
+    return {
+        **{
+            key: value.get(key)
+            for key in (
+                "id", "run_id", "task_id", "node_key", "parent_node_id",
+                "title", "kind", "sequence", "status", "started_at",
+                "finished_at", "created_at", "updated_at",
+            )
+            if value.get(key) not in (None, "")
+        },
+        "output_summary": str((value.get("output") or {}).get("summary") or "")[:500],
+        "status_message": status_message,
+        "error_summary": (
+            "该执行步骤未完成。请检查公开错误提示、参数或能力配置后重试。"
+            if has_error
+            else ""
+        ),
+        "capability": capability,
+        "attempt": attempt,
+    }
+
+
+def _public_checkpoint(value: dict[str, Any], *, attempt: int = 1) -> dict[str, Any]:
+    return {
+        **{
+            key: value.get(key)
+            for key in (
+                "id", "task_id", "run_id", "node_id", "sequence", "reason",
+                "restored_at", "restore_count", "created_at",
+            )
+            if value.get(key) not in (None, "")
+        },
+        "label": value.get("reason") or f"检查点 {value.get('sequence', '')}",
+        "restorable": True,
+        "attempt": attempt,
+    }
+
+
+def _public_task_command(value: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: value.get(key)
+        for key in (
+            "id", "task_id", "run_id", "type", "status", "priority",
+            "available_at", "created_at", "claimed_at", "completed_at", "updated_at",
+        )
+        if value.get(key) not in (None, "")
+    }
+
+
+def _two_level_node_tree(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Build exactly roots plus one child layer; never expose nested node internals."""
+
+    by_id = {str(item.get("id") or ""): item for item in nodes if item.get("id")}
+    roots = [
+        item
+        for item in nodes
+        if not item.get("parent_node_id")
+        or str(item.get("parent_node_id")) not in by_id
+    ]
+    result: list[dict[str, Any]] = []
+    for root in roots:
+        root_id = str(root.get("id") or "")
+        result.append(
+            {
+                **root,
+                "children": [
+                    {**child, "children": []}
+                    for child in nodes
+                    if str(child.get("parent_node_id") or "") == root_id
+                ],
+            }
+        )
+    return result
+
+
+def _active_goal_projection(task_id: str, run_id: str = "") -> dict[str, Any] | None:
+    goal = task_state.latest_goal_spec(run_id=run_id) if run_id else None
+    if not goal:
+        goal = task_state.latest_goal_spec(task_id=task_id)
+    if not goal:
+        return None
+    summary = _public_goal_summary(goal.get("public_summary"))
+    return {
+        "id": goal.get("id"),
+        "goal_id": summary.get("goal_id"),
+        "version": goal.get("version"),
+        "status": goal.get("status"),
+        "spec_hash": goal.get("spec_hash"),
+        "summary": summary,
+    }
+
+
+def _verification_projection(
+    *,
+    task_status: str,
+    run_id: str,
+    active_goal: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if active_goal:
+        reports = task_state.list_verifications(
+            run_id=run_id or None,
+            goal_spec_id=str(active_goal.get("id") or "") or None,
+            limit=1,
+        )
+    else:
+        reports = []
+    if reports:
+        report = reports[0]
+        public_report = _public_verification_report(report.get("public_report"))
+        if public_report.get("passed") is True:
+            state = "passed"
+        elif public_report.get("verdict") == "failed" or report.get("status") == "failed":
+            state = "failed"
+        else:
+            state = "inconclusive"
+        return {
+            "state": state,
+            **{
+                key: report.get(key)
+                for key in (
+                    "id", "goal_spec_id", "attempt", "mode", "status",
+                    "started_at", "finished_at", "created_at",
+                )
+                if report.get(key) not in (None, "")
+            },
+            "public_report": public_report,
+        }
+    terminal = task_status in _TASK_STREAM_TERMINAL_STATUSES
+    if active_goal:
+        return {"state": "verification_missing" if terminal else "pending"}
+    return {"state": "legacy_unverified" if terminal else "not_started"}
+
+
+def _runtime_trace_summary(
+    *,
+    task: dict[str, Any],
+    runs: list[dict[str, Any]],
+    nodes: list[dict[str, Any]],
+    active_run: dict[str, Any] | None,
+    current_node: dict[str, Any] | None,
+    active_goal: dict[str, Any] | None,
+    verification: dict[str, Any],
+) -> dict[str, Any]:
+    capabilities: dict[str, dict[str, str]] = {}
+    capability_calls: list[dict[str, Any]] = []
+    for node in nodes:
+        capability = node.get("capability")
+        if not isinstance(capability, dict):
+            continue
+        capability_type = str(capability.get("type") or "node")
+        capability_id = str(capability.get("id") or "").strip()
+        if not capability_id:
+            continue
+        key = f"{capability_type}:{capability_id}"
+        capabilities[key] = {
+            "type": capability_type,
+            "id": capability_id,
+            "label": str(capability.get("label") or capability_id)[:160],
+            "status": str(node.get("status") or ""),
+        }
+        capability_calls.append(
+            {
+                key: value
+                for key, value in {
+                    "node_id": node.get("id"),
+                    "parent_node_id": node.get("parent_node_id"),
+                    "title": node.get("title"),
+                    "type": capability_type,
+                    "id": capability_id,
+                    "label": str(capability.get("label") or capability_id)[:160],
+                    "status": node.get("status"),
+                    "status_message": node.get("status_message"),
+                    "output_summary": node.get("output_summary"),
+                    "error_summary": node.get("error_summary"),
+                    "started_at": node.get("started_at"),
+                    "finished_at": node.get("finished_at"),
+                    "attempt": node.get("attempt"),
+                }.items()
+                if value not in (None, "")
+            }
+        )
+
+    node_status_counts: dict[str, int] = {}
+    for node in nodes:
+        status = str(node.get("status") or "unknown")
+        node_status_counts[status] = node_status_counts.get(status, 0) + 1
+
+    goal_summary = (
+        active_goal.get("summary")
+        if active_goal and isinstance(active_goal.get("summary"), dict)
+        else {}
+    )
+    objective = goal_summary.get("objective") if isinstance(goal_summary, dict) else {}
+    if isinstance(objective, dict):
+        objective_text = str(objective.get("statement") or "")
+    else:
+        objective_text = str(objective or "")
+    deliverables = (
+        goal_summary.get("deliverables")
+        if isinstance(goal_summary.get("deliverables"), list)
+        else []
+    )
+    artifacts = [
+        item
+        for item in db.json_loads(task.get("artifacts_json"), [])
+        if isinstance(item, dict)
+    ]
+    public_artifacts = [_public_artifact(item) for item in artifacts]
+    published_artifacts = [
+        item for item in public_artifacts if str(item.get("delivery_status") or "") == "published"
+    ]
+    return {
+        "task_status": str(task.get("status") or ""),
+        "active_run_status": str((active_run or {}).get("status") or ""),
+        "attempts": len(runs),
+        "current_node": (
+            {
+                key: current_node.get(key)
+                for key in ("id", "title", "kind", "status", "status_message", "capability")
+                if current_node.get(key) not in (None, "")
+            }
+            if current_node
+            else None
+        ),
+        "goal": {
+            "status": str((active_goal or {}).get("status") or ""),
+            "version": (active_goal or {}).get("version"),
+            "objective": objective_text[:300],
+            "deliverable_count": len(deliverables),
+        },
+        "capabilities": sorted(capabilities.values(), key=lambda item: (item["type"], item["id"])),
+        "capability_calls": sorted(
+            capability_calls,
+            key=lambda item: (
+                int(item.get("attempt") or 0),
+                str(item.get("started_at") or item.get("finished_at") or ""),
+                str(item.get("node_id") or ""),
+            ),
+        )[:50],
+        "node_status_counts": node_status_counts,
+        "verification_state": str(verification.get("state") or ""),
+        "knowledge": _task_knowledge_summary(str(task.get("id") or "")),
+        "artifacts": {
+            "total": len(artifacts),
+            "published": len(published_artifacts),
+            "formats": sorted(
+                {
+                    str(item.get("kind") or item.get("format") or "").lower()
+                    for item in artifacts
+                    if str(item.get("kind") or item.get("format") or "").strip()
+                }
+            ),
+            "items": public_artifacts[:12],
+        },
+    }
+
+
 def _public_task(
     value: dict[str, Any],
     *,
@@ -1741,9 +3658,18 @@ def _public_task(
     internal_fields = {"result_json", "artifacts_json", "attachments_json"}
     result = {key: item for key, item in value.items() if key not in internal_fields}
     if include_result:
-        result["result"] = _sanitize_public_payload(
-            db.json_loads(value.get("result_json"), {})
-        )
+        stored_result = db.json_loads(value.get("result_json"), {})
+        if str(value.get("status") or "") == "failed":
+            code = str(stored_result.get("error_code") or "")
+            result["result"] = {
+                "error_code": (
+                    code
+                    if re.fullmatch(r"[a-z0-9_.-]{1,80}", code)
+                    else "task_execution_failed"
+                )
+            }
+        else:
+            result["result"] = _sanitize_public_payload(stored_result)
     result["artifacts"] = [
         _public_artifact(item)
         for item in db.json_loads(value.get("artifacts_json"), [])
@@ -1766,63 +3692,24 @@ def _task_or_404(task_id: str) -> dict[str, Any]:
 
 
 def _runtime_projection(task_id: str) -> dict[str, Any]:
-    _task_or_404(task_id)
+    task = _task_or_404(task_id)
     raw_runs = task_state.list_runs(task_id=task_id, limit=100)
-    runs = [
-        {
-            key: item.get(key)
-            for key in (
-                "id", "task_id", "attempt", "status", "current_node_id",
-                "resumed_from_checkpoint_id", "started_at", "finished_at",
-                "created_at", "updated_at", "metadata",
-            )
-        }
-        for item in raw_runs
-    ]
+    runs = [_public_task_run(item) for item in raw_runs]
     attempts = {item["id"]: item["attempt"] for item in runs}
     nodes: list[dict[str, Any]] = []
     for run in sorted(runs, key=lambda item: item["attempt"]):
         nodes.extend(
-            {
-                **{
-                    key: node.get(key)
-                    for key in (
-                        "id", "run_id", "task_id", "node_key", "parent_node_id",
-                        "title", "kind", "sequence", "status", "started_at",
-                        "finished_at", "created_at", "updated_at", "metadata",
-                    )
-                },
-                "output_summary": str((node.get("output") or {}).get("summary") or "")[:500],
-                "error_summary": str((node.get("error") or {}).get("message") or "")[:500],
-                "attempt": attempts.get(run["id"], 1),
-            }
+            _public_task_node(node, attempt=attempts.get(run["id"], 1))
             for node in task_state.list_nodes(run["id"])
         )
     checkpoints = [
-        {
-            **{
-                key: item.get(key)
-                for key in (
-                    "id", "task_id", "run_id", "node_id", "sequence", "reason",
-                    "restored_at", "restore_count", "created_at", "metadata",
-                    "last_restore_metadata",
-                )
-            },
-            "label": item.get("reason") or f"检查点 {item.get('sequence', '')}",
-            "restorable": True,
-            "attempt": attempts.get(item.get("run_id", ""), 1),
-        }
+        _public_checkpoint(
+            item, attempt=attempts.get(item.get("run_id", ""), 1)
+        )
         for item in task_state.list_checkpoints(task_id=task_id, include_state=False, limit=200)
     ]
     commands = [
-        {
-            key: item.get(key)
-            for key in (
-                "id", "task_id", "run_id", "type", "payload", "status", "priority",
-                "worker_id", "result", "error", "available_at", "created_at",
-                "claimed_at", "completed_at", "updated_at",
-            )
-        }
+        _public_task_command(item)
         for item in task_state.list_commands(task_id=task_id, limit=200)
     ]
     active_run = next(
@@ -1833,12 +3720,60 @@ def _runtime_projection(task_id: str) -> dict[str, Any]:
         ),
         None,
     )
+    active_run_id = str((active_run or {}).get("id") or "")
+    current_node: dict[str, Any] | None = None
+    if active_run_id:
+        current_node_id = str((active_run or {}).get("current_node_id") or "")
+        current_node = next(
+            (
+                item for item in nodes
+                if str(item.get("run_id") or "") == active_run_id
+                and str(item.get("id") or "") == current_node_id
+            ),
+            None,
+        )
+        if current_node is None:
+            running_nodes = [
+                item for item in nodes
+                if str(item.get("run_id") or "") == active_run_id
+                and item.get("status") == "running"
+            ]
+            if running_nodes:
+                current_node = max(
+                    running_nodes,
+                    key=lambda item: (
+                        bool(item.get("parent_node_id")),
+                        str(item.get("updated_at") or item.get("started_at") or ""),
+                        int(item.get("sequence") or 0),
+                    ),
+                )
+    focused_run = active_run or (runs[0] if runs else None)
+    focused_run_id = str((focused_run or {}).get("id") or "")
+    active_goal = _active_goal_projection(task_id, focused_run_id)
+    verification = _verification_projection(
+        task_status=str(task.get("status") or ""),
+        run_id=focused_run_id,
+        active_goal=active_goal,
+    )
     return {
         "runs": runs,
         "nodes": nodes,
+        "node_tree": _two_level_node_tree(nodes),
         "checkpoints": checkpoints,
         "commands": commands,
         "active_run": active_run,
+        "current_node": current_node,
+        "active_goal": active_goal,
+        "verification": verification,
+        "trace_summary": _runtime_trace_summary(
+            task=task,
+            runs=runs,
+            nodes=nodes,
+            active_run=active_run,
+            current_node=current_node,
+            active_goal=active_goal,
+            verification=verification,
+        ),
     }
 
 
@@ -1898,7 +3833,8 @@ async def _retry_task(task_id: str) -> dict[str, Any]:
         result={"run_id": run["id"]},
     )
     db.execute(
-        "UPDATE tasks SET status = 'queued', result_json = '{}', updated_at = ? WHERE id = ?",
+        "UPDATE tasks SET status = 'queued', result_json = '{}', artifacts_json = '[]', "
+        "updated_at = ? WHERE id = ?",
         (db.utc_now(), task_id),
     )
     db.insert_event(
@@ -1909,7 +3845,11 @@ async def _retry_task(task_id: str) -> dict[str, Any]:
         {"run_id": run["id"], "attempt": run["attempt"]},
     )
     _schedule_runtime(task_id, run["id"])
-    return {"ok": True, "run": run, "command": command}
+    return {
+        "ok": True,
+        "run": _public_task_run(run),
+        "command": _public_task_command(command),
+    }
 
 
 async def _resume_task_from_checkpoint(
@@ -1946,7 +3886,8 @@ async def _resume_task_from_checkpoint(
         result={"run_id": run["id"], "checkpoint_id": checkpoint["id"]},
     )
     db.execute(
-        "UPDATE tasks SET status = 'queued', result_json = '{}', updated_at = ? WHERE id = ?",
+        "UPDATE tasks SET status = 'queued', result_json = '{}', artifacts_json = '[]', "
+        "updated_at = ? WHERE id = ?",
         (db.utc_now(), task_id),
     )
     db.insert_event(
@@ -1957,7 +3898,14 @@ async def _resume_task_from_checkpoint(
         {"run_id": run["id"], "checkpoint_id": checkpoint["id"], "restore_count": restored["restore_count"]},
     )
     _schedule_runtime(task_id, run["id"])
-    return {"ok": True, "run": run, "checkpoint": restored, "command": command}
+    return {
+        "ok": True,
+        "run": _public_task_run(run),
+        "checkpoint": _public_checkpoint(
+            restored, attempt=int(run.get("attempt") or 1)
+        ),
+        "command": _public_task_command(command),
+    }
 
 
 @app.get("/api/tasks/{task_id}/runtime")
@@ -1981,44 +3929,95 @@ async def send_task_command(task_id: str, payload: TaskCommandRequest) -> dict[s
         )
     active = _active_run_or_409(task_id)
     if command_type == "cancel":
-        command = task_state.request_cancel(
-            task_id,
-            run_id=active["id"],
-            reason=str(payload.payload.get("reason") or "用户请求取消"),
-            requested_by="user",
-        )
-        return {"ok": True, "command": command, "run": active}
+        try:
+            command = task_state.request_cancel(
+                task_id,
+                run_id=active["id"],
+                reason=str(payload.payload.get("reason") or "用户请求取消"),
+                requested_by="user",
+            )
+        except RunIntakeClosed as exc:
+            raise HTTPException(
+                status_code=409,
+                detail="当前运行已经结束，取消请求未加入旧运行。",
+            ) from exc
+        # Approval pauses do not have a worker loop left to claim the queued
+        # cancel command.  Close that run immediately so the UI's Stop action
+        # is deterministic even while a Skill/MCP approval card is visible.
+        if active.get("status") in {"waiting_approval", "paused"}:
+            try:
+                task_state.commit_cancellation(
+                    task_id=task_id,
+                    run_id=active["id"],
+                    result={"cancelled": True, "reason": "用户请求取消"},
+                )
+            except PublicationConflict as exc:
+                raise HTTPException(status_code=409, detail="任务状态已变化，请刷新后重试") from exc
+            command = task_state.get_command(command["id"]) or command
+            active = task_state.get_run(active["id"]) or active
+        return {
+            "ok": True,
+            "command": _public_task_command(command),
+            "run": _public_task_run(active),
+        }
     message = str(payload.payload.get("message") or "").strip()
     if not message:
         raise HTTPException(status_code=400, detail="追加指令不能为空")
-    command = task_state.enqueue_command(
-        task_id,
-        "message",
-        run_id=active["id"],
-        payload={"message": message},
-        priority=20,
-    )
-    db.insert_event(
-        task_id,
-        "command_queued",
-        "已加入运行中指令",
-        message,
-        {"command_id": command["id"], "run_id": active["id"]},
-    )
-    return {"ok": True, "command": command, "run": active}
+    try:
+        command = task_state.enqueue_command(
+            task_id,
+            "message",
+            run_id=active["id"],
+            payload={"message": message},
+            priority=20,
+        )
+    except RunIntakeClosed as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "当前运行已经完成最终交付，这条追加要求未加入旧任务。"
+                "请将其作为下一条消息发送。"
+            ),
+        ) from exc
+    return {
+        "ok": True,
+        "command": _public_task_command(command),
+        "run": _public_task_run(active),
+    }
 
 
 @app.post("/api/tasks/{task_id}/cancel", status_code=202)
 async def cancel_task(task_id: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
     active = _active_run_or_409(task_id)
     values = payload or {}
-    command = task_state.request_cancel(
-        task_id,
-        run_id=active["id"],
-        reason=str(values.get("reason") or "用户请求取消"),
-        requested_by="user",
-    )
-    return {"ok": True, "command": command, "run": active}
+    try:
+        command = task_state.request_cancel(
+            task_id,
+            run_id=active["id"],
+            reason=str(values.get("reason") or "用户请求取消"),
+            requested_by="user",
+        )
+    except RunIntakeClosed as exc:
+        raise HTTPException(
+            status_code=409,
+            detail="当前运行已经结束，取消请求未加入旧运行。",
+        ) from exc
+    if active.get("status") in {"waiting_approval", "paused"}:
+        try:
+            task_state.commit_cancellation(
+                task_id=task_id,
+                run_id=active["id"],
+                result={"cancelled": True, "reason": str(values.get("reason") or "用户请求取消")},
+            )
+        except PublicationConflict as exc:
+            raise HTTPException(status_code=409, detail="任务状态已变化，请刷新后重试") from exc
+        command = task_state.get_command(command["id"]) or command
+        active = task_state.get_run(active["id"]) or active
+    return {
+        "ok": True,
+        "command": _public_task_command(command),
+        "run": _public_task_run(active),
+    }
 
 
 @app.post("/api/tasks/{task_id}/retry", status_code=202)
@@ -2052,8 +4051,7 @@ async def restore_task_checkpoint(
 def _validate_loop_bindings(agent_id: str, model_id: str) -> None:
     if not db.query_one("SELECT id FROM agents WHERE id = ?", (agent_id,)):
         raise HTTPException(status_code=400, detail="所选智能体不存在")
-    if model_id != "deterministic" and not db.query_one("SELECT id FROM model_configs WHERE id = ? AND enabled = 1", (model_id,)):
-        raise HTTPException(status_code=400, detail="所选模型不存在或未启用")
+    _ensure_model_ready(model_id, label="所选模型")
 
 
 def _validate_loop_trigger(config: dict[str, Any], webhook_secret_ciphertext: str) -> None:
@@ -2372,10 +4370,6 @@ async def create_task(payload: TaskCreate) -> dict[str, Any]:
         upload = db.query_one("SELECT * FROM uploads WHERE id = ?", (upload_id,))
         if upload:
             attachments.append(upload)
-    if payload.model_id and payload.model_id != "deterministic":
-        model = db.query_one("SELECT id FROM model_configs WHERE id = ? AND enabled = 1", (payload.model_id,))
-        if not model:
-            raise HTTPException(status_code=400, detail="所选模型不存在或未启用")
     if payload.executor_type == "agent" and not db.query_one(
         "SELECT id FROM agents WHERE id = ?", (payload.agent_id,)
     ):
@@ -2404,6 +4398,44 @@ async def create_task(payload: TaskCreate) -> dict[str, Any]:
             automatic=not bool(payload.executor_id),
             recommendation=recommendation,
         )
+    selected_agent = db.query_one("SELECT * FROM agents WHERE id = ?", (selected_agent_id,))
+    fallback_model_id = str((selected_agent or {}).get("model") or "")
+    _ensure_model_ready(payload.model_id or fallback_model_id or "deterministic", label="所选模型")
+    if payload.executor_type == "team":
+        try:
+            task, run, team_run = expert_team_service.create_task_and_run(
+                executor_id,
+                scope,
+                message=payload.message,
+                model_id=payload.model_id,
+                conversation_id=payload.conversation_id,
+                attachments=attachments,
+                parent_task_id=payload.parent_task_id or "",
+            )
+        except (ExpertNotFoundError, ExpertConflictError, ExpertValidationError) as exc:
+            raise _expert_http_error(exc) from exc
+        if expert_selection:
+            emit(
+                task["id"],
+                "expert_selection",
+                "已选择参与专家",
+                (
+                    f"已自动匹配“{expert_selection['team_name']}”，"
+                    if expert_selection["selection_mode"] == "automatic"
+                    else f"使用已指定的“{expert_selection['team_name']}”，"
+                )
+                + f"由 {len(expert_selection['members'])} 位专家并行分析，再由主管汇总。",
+                expert_selection,
+            )
+        _schedule_team_run(team_run["id"])
+        return {
+            **_public_task(task),
+            "result": {},
+            "artifacts": [],
+            "run": _public_runtime_record(run),
+            "team_run": _public_runtime_record(team_run),
+            "expert_selection": expert_selection,
+        }
     task = create_task_record(
         payload.message,
         selected_agent_id,
@@ -2429,35 +4461,6 @@ async def create_task(payload: TaskCreate) -> dict[str, Any]:
             "executor_id": executor_id,
         },
     )
-    if payload.executor_type == "team":
-        if expert_selection:
-            emit(
-                task["id"],
-                "expert_selection",
-                "已选择参与专家",
-                (
-                    f"已自动匹配“{expert_selection['team_name']}”，"
-                    if expert_selection["selection_mode"] == "automatic"
-                    else f"使用已指定的“{expert_selection['team_name']}”，"
-                )
-                + f"由 {len(expert_selection['members'])} 位专家并行分析，再由主管汇总。",
-                expert_selection,
-            )
-        try:
-            team_run = expert_team_service.create_run_for_task(
-                executor_id, task["id"], scope, parent_run_id=run["id"]
-            )
-        except (ExpertNotFoundError, ExpertConflictError, ExpertValidationError) as exc:
-            raise _expert_http_error(exc) from exc
-        _schedule_team_run(team_run["id"])
-        return {
-            **_public_task(task),
-            "result": {},
-            "artifacts": [],
-            "run": _public_runtime_record(run),
-            "team_run": _public_runtime_record(team_run),
-            "expert_selection": expert_selection,
-        }
     _schedule_runtime(task["id"], run["id"])
     return {
         **_public_task(task),
@@ -2490,11 +4493,30 @@ def get_conversation_messages(conversation_id: str) -> dict[str, Any]:
     for task in rows:
         messages.append({"role": "user", "content": task["message"], "task_id": task["id"]})
         answer = db.query_one(
-            "SELECT id, content FROM task_events WHERE task_id = ? AND type IN ('answer', 'error') ORDER BY id DESC LIMIT 1",
+            "SELECT id, content FROM task_events WHERE task_id = ? AND type = 'answer' ORDER BY id DESC LIMIT 1",
             (task["id"],),
         )
         if answer:
             messages.append({"role": "assistant", "content": answer["content"], "task_id": task["id"], "event_id": answer["id"]})
+            continue
+        # Keep failures visible after a page refresh without presenting them
+        # as a successful assistant answer.  The frontend renders this
+        # structured message as the same error card used by the live stream.
+        error = db.query_one(
+            "SELECT * FROM task_events WHERE task_id = ? AND type = 'error' ORDER BY id DESC LIMIT 1",
+            (task["id"],),
+        )
+        if error:
+            public_error = _public_event(error)
+            messages.append({
+                "role": "system",
+                "message_type": "error",
+                "content": public_error.get("content") or "任务执行未完成，请检查模型、参数或工具配置后重试。",
+                "title": public_error.get("title") or "任务未完成",
+                "data": public_error.get("data") or {},
+                "task_id": task["id"],
+                "event_id": public_error.get("id"),
+            })
     return {"conversation_id": conversation_id, "messages": messages}
 
 
@@ -2512,7 +4534,7 @@ async def upload_file(file: UploadFile = File(...)) -> dict[str, Any]:
     path.write_bytes(raw)
     record = {"id": upload_id, "name": original, "content_type": file.content_type or "application/octet-stream", "size": len(raw), "path": str(path), "created_at": db.utc_now()}
     db.execute("INSERT INTO uploads(id, name, content_type, size, path, created_at) VALUES (?, ?, ?, ?, ?, ?)", tuple(record.values()))
-    return {k: v for k, v in record.items() if k != "path"}
+    return _public_attachment(record)
 
 
 @app.get("/api/tasks/{task_id}/events")
@@ -2574,27 +4596,278 @@ async def stream_task_events(
     )
 
 
+async def _resume_after_approval_safely(
+    task_id: str,
+    approved: bool,
+    note: str,
+    command_id: str,
+) -> None:
+    try:
+        await runtime.resume_after_approval(
+            task_id,
+            approved,
+            note,
+            command_id=command_id,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        message = "审批后续处理失败，任务已安全终止。"
+        task = db.query_one("SELECT * FROM tasks WHERE id = ?", (task_id,)) or {}
+        if not task:
+            return
+        result = db.json_loads(task.get("result_json"), {})
+        failure_result = {
+            **result,
+            "error": "approval_continuation_failed",
+            "error_type": exc.__class__.__name__,
+            "summary": message,
+        }
+        active = next(
+            (
+                item
+                for item in task_state.list_runs(task_id=task_id)
+                if item["status"] in {"running", "paused", "waiting_approval"}
+            ),
+            None,
+        )
+        if task.get("status") not in {"completed", "failed", "cancelled"} and active:
+            try:
+                task_state.commit_failure(
+                    task_id=task_id,
+                    run_id=active["id"],
+                    error={
+                        "message": message,
+                        "error_type": exc.__class__.__name__,
+                    },
+                    result=failure_result,
+                )
+                return
+            except Exception:
+                pass
+        emit(
+            task_id,
+            "error",
+            "审批后续处理失败",
+            message,
+            {"error_type": exc.__class__.__name__},
+        )
+        if task.get("status") not in {"completed", "failed", "cancelled"}:
+            db.update_task_status(task_id, "failed", result=failure_result)
+
+
+def _latest_approval_command(
+    task_id: str,
+    *,
+    run_id: str = "",
+    approval_id: str = "",
+) -> dict[str, Any] | None:
+    params: list[Any] = [task_id]
+    sql = (
+        "SELECT id FROM task_commands "
+        "WHERE task_id = ? AND command_type = 'approval'"
+    )
+    if run_id:
+        sql += " AND (run_id = ? OR run_id IS NULL)"
+        params.append(run_id)
+    sql += " ORDER BY created_at DESC, id DESC LIMIT 100"
+    for row in db.query_all(sql, tuple(params)):
+        command = task_state.get_command(str(row["id"]))
+        if command is None:
+            continue
+        command_approval_id = str(
+            (command.get("payload") or {}).get("approval_id") or ""
+        )
+        if approval_id and command_approval_id != approval_id:
+            continue
+        return command
+    return None
+
+
+def _assert_same_approval_decision(
+    command: Mapping[str, Any], payload: ApprovalRequest
+) -> None:
+    stored_payload = command.get("payload") or {}
+    stored_approved = stored_payload.get("approved")
+    stored_note = str(stored_payload.get("note") or "")
+    if not isinstance(stored_approved, bool):
+        raise HTTPException(
+            status_code=409,
+            detail="已有审批决定格式异常，无法覆盖。",
+        )
+    if stored_approved != payload.approved:
+        raise HTTPException(
+            status_code=409,
+            detail="已有相反的审批决定，不能重复修改。",
+        )
+    if stored_note != payload.note:
+        raise HTTPException(
+            status_code=409,
+            detail="审批决定已存在，不能修改原审批备注。",
+        )
+
+
+def _schedule_approval_continuation(
+    task_id: str,
+    payload: ApprovalRequest,
+    command_id: str,
+) -> None:
+    background = asyncio.create_task(
+        _resume_after_approval_safely(
+            task_id,
+            payload.approved,
+            payload.note,
+            command_id,
+        )
+    )
+    _runtime_tasks.add(background)
+    background.add_done_callback(_runtime_tasks.discard)
+
+
 @app.post("/api/tasks/{task_id}/approve")
 async def approve_task(task_id: str, payload: ApprovalRequest) -> dict[str, Any]:
     task = _task_or_404(task_id)
     if task.get("status") != "waiting_approval":
+        previous = _latest_approval_command(task_id)
+        if previous and previous.get("status") == "completed":
+            _assert_same_approval_decision(previous, payload)
+            return {"ok": True, "duplicate": True, "command": previous}
         raise HTTPException(status_code=409, detail="当前任务不处于等待审批状态")
+    active = _active_run_or_409(task_id)
     result = db.json_loads(task.get("result_json"), {})
-    if result.get("pending_action") == "policy_approval":
-        active = _active_run_or_409(task_id)
+    active_metadata = active.get("metadata") or {}
+    recommendation_decision = result.get("skill_recommendation_decision")
+    generic_decision = result.get("approval_resolution_proof")
+    pending_policy = active_metadata.get("pending_policy_approval")
+    pending_recommendation = active_metadata.get("pending_skill_recommendation")
+    durable_approval_id = str(
+        result.get("policy_approval_id")
+        or result.get("skill_recommendation_approval_id")
+        or (
+            recommendation_decision.get("approval_id")
+            if isinstance(recommendation_decision, Mapping)
+            else ""
+        )
+        or (
+            generic_decision.get("approval_id")
+            if isinstance(generic_decision, Mapping)
+            else ""
+        )
+        or (
+            pending_policy.get("approval_id")
+            if isinstance(pending_policy, Mapping)
+            else ""
+        )
+        or (
+            pending_recommendation.get("approval_id")
+            if isinstance(pending_recommendation, Mapping)
+            else ""
+        )
+        or ""
+    )
+    existing = _latest_approval_command(
+        task_id,
+        run_id=str(active["id"]),
+        approval_id=durable_approval_id,
+    )
+    if existing is not None:
+        existing_result = existing.get("result") or {}
+        current_generic_command = str(
+            (generic_decision or {}).get("command_id")
+            if isinstance(generic_decision, Mapping)
+            else ""
+        )
+        belongs_to_current_wait = bool(
+            durable_approval_id
+            or existing.get("status") in {"queued", "claimed"}
+            or current_generic_command == str(existing.get("id") or "")
+            or (
+                isinstance(existing_result, Mapping)
+                and bool(existing_result.get("superseded"))
+            )
+        )
+        if belongs_to_current_wait:
+            _assert_same_approval_decision(existing, payload)
+            if (
+                existing.get("status") == "completed"
+                and result.get("pending_action") != "policy_approval"
+            ):
+                # The decision transaction committed but its in-process
+                # continuation may have been interrupted.  Re-dispatching is
+                # safe because the durable command proof is idempotent.
+                _schedule_approval_continuation(
+                    task_id, payload, str(existing["id"])
+                )
+            return {"ok": True, "duplicate": True, "command": existing}
+    approval_event = db.query_one(
+        "SELECT id FROM task_events WHERE task_id = ? AND type = 'approval_required' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    )
+    approval_scope = (
+        f"approval:{durable_approval_id}"
+        if durable_approval_id
+        else f"event:{approval_event['id']}"
+        if approval_event
+        else "state:"
+        + str(task.get("updated_at") or "")
+        + ":"
+        + json.dumps(result, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    )
+    decision_payload = {
+        "approved": payload.approved,
+        "note": payload.note,
+    }
+    request_token = uuid.uuid4().hex
+    command_id = (
+        "tcmd_approval_"
+        + hashlib.sha256(
+            f"{task_id}\x1f{active['id']}\x1f{approval_scope}".encode("utf-8")
+        ).hexdigest()[:24]
+    )
+    persisted_payload = {
+        **decision_payload,
+        "decision_request_id": request_token,
+    }
+    if durable_approval_id:
+        persisted_payload["approval_id"] = durable_approval_id
+    try:
         command = task_state.enqueue_command(
             task_id,
             "approval",
             run_id=active["id"],
-            payload={"approved": payload.approved, "note": payload.note},
+            payload=persisted_payload,
             priority=90,
+            command_id=command_id,
             deduplicate=True,
         )
-        return {"ok": True, "command": command}
-    background = asyncio.create_task(runtime.resume_after_approval(task_id, payload.approved, payload.note))
-    _runtime_tasks.add(background)
-    background.add_done_callback(_runtime_tasks.discard)
-    return {"ok": True}
+    except sqlite3.IntegrityError:
+        # A completed decision is outside enqueue_command's active-command
+        # deduplication window, but its stable primary key remains the durable
+        # single-decision fence.
+        command = task_state.get_command(command_id)
+        if command is None:
+            raise
+    except RunIntakeClosed as exc:
+        raise HTTPException(
+            status_code=409,
+            detail="当前审批运行已经结束，未接受新的审批决定。",
+        ) from exc
+    except PublicationConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    _assert_same_approval_decision(command, payload)
+    stored_payload = command.get("payload") or {}
+
+    first_decision = stored_payload.get("decision_request_id") == request_token
+    if not first_decision:
+        return {"ok": True, "duplicate": True, "command": command}
+
+    if result.get("pending_action") == "policy_approval":
+        return {"ok": True, "duplicate": False, "command": command}
+
+    _schedule_approval_continuation(task_id, payload, str(command["id"]))
+    return {"ok": True, "duplicate": False, "command": command}
 
 
 def _artifact_row_to_public(row: dict[str, Any]) -> dict[str, Any]:
@@ -2619,6 +4892,11 @@ def _artifact_or_404(artifact_id: str) -> dict[str, Any]:
     artifact = db.query_one("SELECT * FROM artifacts WHERE id = ?", (artifact_id,))
     if not artifact:
         raise HTTPException(status_code=404, detail="Artifact not found")
+    if str(artifact.get("delivery_status") or "") != "published":
+        raise HTTPException(
+            status_code=409,
+            detail="产物尚未通过最终验收，暂不可访问。",
+        )
     return artifact
 
 
@@ -2631,7 +4909,7 @@ def list_artifacts(
     limit: int = 200,
 ) -> list[dict[str, Any]]:
     limit = max(1, min(int(limit), 1000))
-    clauses: list[str] = []
+    clauses: list[str] = ["delivery_status = 'published'"]
     params: list[Any] = []
     for column, value in (
         ("task_id", task_id),
@@ -2746,8 +5024,12 @@ def preview_artifact(artifact_id: str) -> dict[str, Any]:
             return {"artifact": public, "preview_kind": "pdf", "url": public["download_url"] + "?inline=true"}
         if kind in {"txt", "text", "json", "yaml", "yml"}:
             return {"artifact": public, "preview_kind": "text", "content": path.read_text(encoding="utf-8", errors="replace")[:500_000]}
-    except Exception as exc:
-        return {"artifact": public, "preview_kind": "error", "message": f"预览生成失败：{exc}"}
+    except Exception:
+        return {
+            "artifact": public,
+            "preview_kind": "error",
+            "message": "平台暂时无法生成该文件的预览，请下载后使用对应应用打开。",
+        }
     return {"artifact": public, "preview_kind": "unavailable", "message": "该格式暂不支持平台内预览，可下载原文件。"}
 
 

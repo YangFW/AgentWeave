@@ -39,7 +39,6 @@ name: 产品需求文档 PRD Skill
 description: 将产品想法整理为目标、用户故事、功能范围、验收标准和风险清单。
 category: recommended
 version: 1.0.0
-required_mcps: report
 ---
 # 产品需求文档 PRD
 

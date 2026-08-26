@@ -11,7 +11,7 @@ AgentNexus（中文名“智枢”）是一个通过浏览器使用的智能体�
 - 模型管理：支持 OpenAI 和 OpenAI-compatible 接口，密钥可以来自环境变量，也可以在页面直接填写。
 - Skill 管理：创建、编辑、导入、导出和通过 HTTPS 下载链接安装 Skill 包。
 - 工具接入：支持本地 stdio MCP、远程 Streamable HTTP MCP 和普通 HTTP 工具。
-- 文件处理：可读取常见文本、Office 文档和 PDF 的可提取正文，并生成可下载的 Word、PDF、Excel、Markdown 或 HTML 文件；PowerPoint 仅在 Node.js 和生成组件配置完成后可用。
+- 文件处理：可读取常见文本、Office 文档和 PDF 的可提取正文，并生成可下载的 Word、PDF、Excel、Markdown、HTML 或 PPTX 文件；PPTX 默认推荐平台内置 Python 生成器。
 - 任务过程：通过事件流显示计划、Skill、模型、工具调用、文件生成和最终校验状态。
 - 记忆与自动化：保存明确的长期偏好，或按时间和 Webhook 触发重复任务。
 
@@ -20,7 +20,7 @@ AgentNexus（中文名“智枢”）是一个通过浏览器使用的智能体�
 ## 运行环境
 
 - Python 3.12
-- Node.js 与 Artifact Tool（仅生成 PPTX 时需要）
+- Node.js 22 或兼容版本（用于前端脚本检查；仅选择外部 Artifact Tool 生成 PPTX 时需要 Node.js）
 - SQLite（由 Python 自带，无需单独安装）
 
 ## 本地启动
@@ -29,8 +29,13 @@ AgentNexus（中文名“智枢”）是一个通过浏览器使用的智能体�
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-uvicorn app.main:app --host 127.0.0.1 --port 8000
+cp .env.example .env.local
+./start-local.sh
 ```
+
+`.env.local` 保存当前机器的网络开关、主机白名单和可选的环境变量密钥，已被 Git 忽略，不会上传到仓库。在线模型至少需要把 `APP_ALLOW_OUTBOUND_NETWORK` 设为 `true`，并把模型 Base URL 的主机名加入 `APP_MODEL_HOST_ALLOWLIST`。如果在页面直接填写 API Key，`.env.local` 中不需要再填写同一密钥。
+
+只使用内置离线模型时，可以不创建 `.env.local`，直接运行 `./start-local.sh`；平台会采用关闭外部网络的安全默认配置。
 
 Windows PowerShell：
 
@@ -38,7 +43,8 @@ Windows PowerShell：
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
-uvicorn app.main:app --host 127.0.0.1 --port 8000
+Copy-Item .env.example .env.local
+uvicorn app.main:app --env-file .env.local --host 127.0.0.1 --port 8000
 ```
 
 浏览器打开 [http://127.0.0.1:8000/](http://127.0.0.1:8000/)。健康检查地址是 [http://127.0.0.1:8000/api/health](http://127.0.0.1:8000/api/health)。
@@ -51,9 +57,24 @@ uvicorn app.main:app --host 127.0.0.1 --port 8000
 docker compose up --build
 ```
 
-当前 Dockerfile 只包含 Python 环境，因此容器内默认不能生成 PPTX。需要 PowerPoint 输出时，请在自定义镜像中安装 Node.js 和相应生成组件，或在本地 Python 环境运行。
+当前 Dockerfile 以 Python 环境为主；使用内置 Python 生成器时无需 Docker、Node.js 或 npm。若选择外部 Artifact Tool，才需要在自定义镜像中安装 Node.js 和相应生成组件。
 
 Compose 默认只把服务绑定到宿主机 `127.0.0.1:8000`，并关闭应用级出站网络。需要在线模型或外部工具时，先设置 `APP_ALLOW_OUTBOUND_NETWORK=true`，再开启对应的细分能力；修改后重新创建容器。
+
+## 测试
+
+安装运行依赖后，可在仓库根目录执行完整回归测试：
+
+```bash
+node --check web/diagnostics-routing.js
+node --check web/app.js
+python -m compileall -q app
+python -m unittest discover -s tests -p 'test_*.py' -v
+```
+
+测试默认使用临时数据库和 Mock 服务，不需要模型 API Key，也不会访问外部模型、MCP 或联网搜索服务。前端测试会通过 FastAPI 静态服务读取首页和脚本，验证诊断路由模块加载顺序、缓存版本一致性，以及“联网与远程”不会误定位到天气或本地文件系统 MCP。DOCX、PDF、XLSX、CSV、Markdown、HTML 和内置 Python PPTX 生成器均有格式与下载验收；外部 Node/Artifact Tool 集成在未配置时按预期跳过，并验证平台明确报告缺失能力且不会生成损坏文件。
+
+GitHub Actions 在 Python 3.12 和 3.13 上执行同一套前端脚本检查、应用编译与回归命令，并显式关闭所有应用级出站网络、远程安装和外部工具开关。
 
 ## 配置模型
 
@@ -65,10 +86,12 @@ Compose 默认只把服务绑定到宿主机 `127.0.0.1:8000`，并关闭应用�
 使用环境变量时，先在启动平台的进程环境中设置 Key：
 
 ```bash
-export OPENAI_API_KEY='your-api-key'
-export APP_ALLOW_OUTBOUND_NETWORK=true
-export APP_MODEL_HOST_ALLOWLIST='api.openai.com'
-uvicorn app.main:app --host 127.0.0.1 --port 8000
+cp .env.example .env.local
+# 编辑 .env.local：
+# OPENAI_API_KEY=your-api-key
+# APP_ALLOW_OUTBOUND_NETWORK=true
+# APP_MODEL_HOST_ALLOWLIST=api.openai.com
+./start-local.sh
 ```
 
 然后在页面选择“环境变量”，填写 `OPENAI_API_KEY`。Base URL 应填写供应商的 OpenAI-compatible API 根地址，例如 `https://api.openai.com/v1`；平台会在其后请求 `/chat/completions`。`APP_MODEL_HOST_ALLOWLIST` 填写允许访问的模型主机名，多个主机用逗号分隔，不含协议和路径。
@@ -114,14 +137,20 @@ MCP 页面会隐藏常见密钥字段，但服务配置仍以 JSON 保存在 SQL
 
 附件上传默认可用。TXT、Markdown、CSV、JSON、YAML、常见代码文件、DOCX、XLSX、PPTX 和 PDF 的可提取正文可以进入任务上下文。扫描版 PDF 没有 OCR，旧版 Office 文件也不在默认解析范围内。
 
-平台内置 DOCX、PDF、XLSX、Markdown 和 HTML 生成能力。PPTX 只有在 Node.js 和 Artifact Tool 均已安装，并且入口文件配置有效时才可用：
+平台内置 DOCX、PDF、XLSX、Markdown 和 HTML 生成能力。PPTX 推荐使用平台内置的 Python 生成器：在模型设置页的“文档交付”能力卡片中打开“PPTX 配置向导”，选择“平台内置 Python 生成器”，确认后立即生效：
+
+```bash
+export APP_PPTX_GENERATOR='python'
+```
+
+如果部署环境已有受支持的 Artifact Tool，也可以在同一向导中选择外部组件，填写 Node.js 和入口文件路径：
 
 ```bash
 export APP_NODE_BINARY='node'
 export APP_ARTIFACT_TOOL_ENTRYPOINT='/absolute/path/to/artifact_tool.mjs'
 ```
 
-项目不会自动安装 Artifact Tool。未配置或路径无效时，PPTX 任务会明确报错，不影响其他文档格式。
+项目不会从任意网址自动安装或执行 Artifact Tool。未配置或路径无效时，PPTX 任务会在对话中明确说明原因并提供配置向导，不影响其他文档格式。
 
 文件保存在 `data/` 下的运行目录中，并通过受控的预览和下载接口访问。数据库、上传文件、生成文件以及本机密钥都属于运行数据，不应提交到版本库。
 

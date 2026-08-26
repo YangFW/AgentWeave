@@ -25,7 +25,15 @@ const state = {
   tasks: [],
   models: [],
   loops: [],
+  workspaces: [],
   memories: [],
+  knowledgeBases: [],
+  knowledgeDocuments: [],
+  knowledgeSearchResults: [],
+  diagnostics: null,
+  diagnosticSelfTestFilter: readPreference('diagnostics-self-test-filter') || 'all',
+  diagnosticSelfTestCategory: readPreference('diagnostics-self-test-category') || 'all',
+  diagnosticSelfTestArtifact: readPreference('diagnostics-self-test-artifact') || 'all',
   conversationSummaries: [],
   artifacts: [],
   expertTemplates: [],
@@ -37,6 +45,9 @@ const state = {
   loopEditorDirty: false,
   loopStateDirty: false,
   capabilities: {},
+  marketplace: { skills: [], mcp_servers: [] },
+  marketplaceFocusId: '',
+  modelTestResults: {},
   uploads: [],
   selectedSkill: null,
   selectedSkillFile: null,
@@ -44,8 +55,10 @@ const state = {
   selectedMcp: null,
   selectedAgent: null,
   selectedModel: null,
+  selectedWorkspace: null,
   selectedLoop: null,
   selectedMemory: null,
+  selectedKnowledgeBase: null,
   selectedConversationSummary: null,
   selectedArtifact: null,
   selectedExpertTemplate: null,
@@ -67,8 +80,32 @@ const state = {
   streamRetryTimer: null,
   streamRetryCount: 0,
   seenEventIds: new Set(),
+  taskUiRunning: false,
+  taskUiCancelRequested: false,
+  taskUiTaskId: null,
+  taskUiStatusNode: null,
+  // Public, user-facing execution summaries shown inside the conversation.
+  // These are structured runtime events only; model reasoning is never
+  // copied into this state.
+  agentThinkingCards: new Map(),
+  pptxConfiguration: null,
   conversationId: readPreference('conversation') || createConversationId(),
+  workspaceId: readPreference('workspace') || 'default',
 };
+
+const DIAGNOSTIC_CAPABILITY_ENTRIES = [
+  { label: '模型配置', checkId: 'models.capability', entry: '模型设置', tab: 'models' },
+  { label: '文件上传', checkId: 'file.upload_context', entry: '工作台 → 添加附件', tab: 'chat' },
+  { label: '文档输出', checkId: 'document.output_formats', entry: '工作台或产物页', tab: 'artifacts' },
+  { label: 'Skill/MCP', checkId: 'skill_mcp.capability', entry: '技能中心 / 工具接入 / 市场', tab: 'marketplace' },
+  { label: '知识库', checkId: 'knowledge.capability', entry: '知识库', tab: 'knowledge' },
+  { label: '联网与远程', checkId: 'network.capability', entry: '工具接入 / 环境变量开关', tab: 'mcp' },
+  { label: '上下文记忆', checkId: 'memory.capability', entry: '记忆', tab: 'memory' },
+  { label: '专家模式', checkId: 'expert.capability', entry: '专家团 / 工作台模式切换', tab: 'experts' },
+  { label: '自动化', checkId: 'automation.capability', entry: '自动化', tab: 'loops' },
+  { label: '执行闭环', checkId: 'runtime.contract_capability', entry: '工作台运行控制', tab: 'chat' },
+  { label: '权限安全', checkId: 'security.permissions', entry: '自检 / 模型设置 / 工具接入', tab: 'diagnostics' },
+];
 
 const $ = (id) => document.getElementById(id);
 
@@ -127,6 +164,22 @@ function formatJson(value) {
   return JSON.stringify(value, null, 2);
 }
 
+function currentWorkspaceId() {
+  return state.workspaceId || 'default';
+}
+
+function platformScopeValues() {
+  return {
+    organization_id: 'local-org',
+    workspace_id: currentWorkspaceId(),
+    user_id: 'local-user',
+  };
+}
+
+function workspaceQuery(extra = {}) {
+  return new URLSearchParams({ organization_id: 'local-org', user_id: 'local-user', ...extra }).toString();
+}
+
 let toastTimer;
 function notify(message, type = 'success') {
   const toast = $('toast');
@@ -134,6 +187,634 @@ function notify(message, type = 'success') {
   toast.className = `toast ${type} show`;
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => { toast.className = 'toast'; }, 3200);
+}
+
+function setSendButtonState(mode = 'idle') {
+  const button = $('sendBtn');
+  if (!button) return;
+  button.classList.toggle('stop-action', mode !== 'idle');
+  button.disabled = mode === 'cancel_requested';
+  if (mode === 'running') {
+    button.innerHTML = '<span class="action-label">停止</span><span class="action-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><rect x="7" y="7" width="10" height="10" rx="1.5"/></svg></span>';
+    button.setAttribute('aria-label', '停止当前任务');
+    button.title = '停止当前任务';
+  } else if (mode === 'cancel_requested') {
+    button.innerHTML = '<span class="action-label">停止中…</span><span class="action-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="7"/></svg></span>';
+    button.setAttribute('aria-label', '正在停止当前任务');
+    button.title = '正在停止当前任务';
+  } else {
+    button.innerHTML = '发送 <span class="action-icon"><svg viewBox="0 0 24 24"><path d="m6 12 6-6 6 6M12 6v12"/></svg></span>';
+    button.setAttribute('aria-label', '发送消息');
+    button.title = '发送消息';
+  }
+}
+
+function clearTaskUiStatus() {
+  if (state.taskUiStatusNode?.isConnected) state.taskUiStatusNode.remove();
+  state.taskUiStatusNode = null;
+  state.taskUiTaskId = null;
+}
+
+function setTaskUiStatus(taskId, label, kind = 'thinking') {
+  if (!taskId || (taskId !== '__pending__' && state.currentTask?.id !== taskId)) return;
+  let node = state.taskUiStatusNode;
+  if (!node || !node.isConnected || state.taskUiTaskId !== taskId) {
+    clearTaskUiStatus();
+    node = document.createElement('div');
+    node.className = 'conversation-status';
+    node.dataset.taskStatus = String(taskId);
+    $('conversation').appendChild(node);
+    state.taskUiStatusNode = node;
+    state.taskUiTaskId = taskId;
+  }
+  node.className = `conversation-status ${escapeHtml(kind)}`;
+  node.innerHTML = `<span class="status-pulse" aria-hidden="true"></span><span>${escapeHtml(label)}</span>`;
+  const thinking = agentThinkingCard(taskId);
+  if (thinking) {
+    node.classList.add('agent-thinking-legacy-status');
+    setAgentThinkingCurrent(taskId, label, thinking.current?.detail || '', 'progress', kind === 'verifying' ? 'verification' : kind === 'outputting' ? 'output' : kind === 'error' ? 'error' : 'process');
+  } else {
+    node.classList.remove('agent-thinking-legacy-status');
+  }
+  $('conversation').appendChild(node);
+  $('conversation').scrollTop = $('conversation').scrollHeight;
+}
+
+function finishTaskUi(taskId, status = 'completed') {
+  if (taskId && state.taskUiTaskId && state.taskUiTaskId !== taskId) return;
+  state.taskUiRunning = false;
+  state.taskUiCancelRequested = false;
+  setSendButtonState('idle');
+  finishAgentThinkingCard(taskId, status);
+  const labels = {
+    completed: ['已完成', 'done'], succeeded: ['已完成', 'done'],
+    cancelled: ['已停止', 'done'], failed: ['执行失败', 'error'],
+    submission_failed: ['发送失败', 'error'],
+    waiting_approval: ['等待你的确认', 'verifying'], waiting_input: ['等待补充信息', 'verifying'],
+  };
+  const [label, kind] = labels[status] || ['已结束', 'done'];
+  if (state.taskUiTaskId && state.currentTask?.id === state.taskUiTaskId) {
+    setTaskUiStatus(state.taskUiTaskId, label, kind);
+  } else if (state.taskUiStatusNode?.isConnected) {
+    state.taskUiStatusNode.className = `conversation-status ${kind}`;
+    state.taskUiStatusNode.innerHTML = `<span class="status-pulse" aria-hidden="true"></span><span>${escapeHtml(label)}</span>`;
+  }
+  if (status === 'failed') {
+    if ($('taskOverviewSection')) $('taskOverviewSection').open = true;
+    if ($('runtimeInspectorSection')) $('runtimeInspectorSection').open = true;
+    if ($('timelineSection')) $('timelineSection').open = true;
+    if ($('timelineStatus')) $('timelineStatus').textContent = '执行失败 · 点击追踪';
+  } else if (['completed', 'succeeded'].includes(status)) {
+    // 成功交付后恢复为简洁视图；用户仍可点击“查看”展开完整追踪。
+    if ($('taskOverviewSection')) $('taskOverviewSection').open = false;
+    if ($('runtimeInspectorSection')) $('runtimeInspectorSection').open = false;
+    if ($('timelineSection')) $('timelineSection').open = false;
+    if ($('taskOverviewStatus')) $('taskOverviewStatus').textContent = '已完成 · 点击查看';
+    if ($('runtimeInspectorStatus')) $('runtimeInspectorStatus').textContent = '已完成 · 点击追踪';
+    if ($('timelineStatus')) $('timelineStatus').textContent = '执行完成 · 点击追踪';
+  }
+}
+
+function finishSubmissionFailure(message, { notifyUser = true } = {}) {
+  const detail = String(message || '模型配置不可用，请检查模型设置后重试。').trim();
+  const statusNodePresent = Boolean(state.taskUiStatusNode?.isConnected);
+  const taskId = state.taskUiTaskId || '__pending__';
+  finishTaskUi(taskId, 'submission_failed');
+  // A stale page can have lost the temporary status node while the POST is
+  // still in flight.  Always create a terminal status in that case so the UI
+  // can never remain visually stuck at “正在提交任务…”.
+  if (!statusNodePresent) setTaskUiStatus('__pending__', '发送失败', 'error');
+  addMessage('agent', `发送失败：${detail}`);
+  if (notifyUser) notify(`发送失败：${detail}`, 'error');
+}
+
+const agentThinkingStatusLabels = {
+  pending: '等待中', running: '执行中', completed: '已完成', succeeded: '已完成',
+  failed: '未完成', cancelled: '已停止', waiting_approval: '等待确认',
+  waiting_input: '等待补充信息',
+};
+
+function thinkingIconSvg(kind = 'process') {
+  const icons = {
+    goal: '<circle cx="12" cy="12" r="7.2"/><circle cx="12" cy="12" r="2.4"/><path d="M12 2.8v2M12 19.2v2M2.8 12h2M19.2 12h2"/>',
+    plan: '<path d="M5 5h5M5 12h8M5 19h11"/><circle cx="17.5" cy="5" r="2"/><circle cx="19.5" cy="12" r="2"/><circle cx="21" cy="19" r="2"/>',
+    skill: '<path d="m8.5 4.5 3.5 3.5-4 4-3.5-3.5 4-4Z"/><path d="m14.8 11.4 4.7 4.7a2 2 0 0 1-2.8 2.8L12 14.2"/><path d="M5 19h5"/>',
+    mcp: '<path d="m14.5 5.5 4 4M13 4l2-2 5 5-2 2M4 20l4.8-1 9.3-9.3-4-4L4.8 15 4 20Z"/><path d="m3 21 4-4"/>',
+    tool: '<path d="m14.8 5.2 4-2.2 2.2 2.2-2.2 4-2.5-1.5-5.7 5.7"/><path d="m9.5 14.5-5.8 5.8a1.5 1.5 0 0 1-2.1-2.1l5.8-5.8"/><path d="m14 10 3 3"/>',
+    model: '<rect x="5" y="5" width="14" height="14" rx="3"/><path d="M9 9h6v6H9zM9 2v3M15 2v3M9 19v3M15 19v3M2 9h3M2 15h3M19 9h3M19 15h3"/>',
+    agent: '<circle cx="8" cy="8" r="2.6"/><circle cx="17" cy="9" r="2.2"/><path d="M3.8 18.5c.5-2.8 1.9-4.4 4.2-4.4s3.7 1.6 4.2 4.4M13.3 18c.4-2.2 1.6-3.6 3.7-3.6s3.3 1.4 3.7 3.6"/>',
+    expert: '<circle cx="8" cy="8" r="2.6"/><circle cx="17" cy="8" r="2.2"/><path d="M3.8 18.5c.5-2.8 1.9-4.4 4.2-4.4s3.7 1.6 4.2 4.4M13.3 18c.4-2.2 1.6-3.6 3.7-3.6s3.3 1.4 3.7 3.6"/><path d="m12 4 .8 1.7 1.7.8-1.7.8L12 9l-.8-1.7-1.7-.8 1.7-.8Z"/>',
+    knowledge: '<path d="M5 4.5A2.5 2.5 0 0 1 7.5 2H19v17H7.5A2.5 2.5 0 0 0 5 21.5v-17Z"/><path d="M5 4.5v17M9 6h6M9 9h7"/>',
+    verification: '<path d="M12 3 19 6v5c0 4.2-2.8 7.6-7 9-4.2-1.4-7-4.8-7-9V6l7-3Z"/><path d="m8.5 12 2.2 2.2 4.8-5"/>',
+    output: '<path d="M5 3.5h9l5 5V20H5z"/><path d="M14 3.5V9h5M8 13h8M8 16h6"/>',
+    error: '<circle cx="12" cy="12" r="8.5"/><path d="M12 7v6M12 16.5v.2"/>',
+    process: '<path d="M12 3.5 19 7v10l-7 3.5L5 17V7l7-3.5Z"/><circle cx="12" cy="12" r="2.4"/><path d="M12 9.6V7M9.9 13.2l-2.1 1.2M14.1 13.2l2.1 1.2"/>',
+  };
+  return `<svg viewBox="0 0 24 24" aria-hidden="true">${icons[kind] || icons.process}</svg>`;
+}
+
+function agentThinkingStatusLabel(status) {
+  return agentThinkingStatusLabels[status] || '处理中';
+}
+
+function agentThinkingCard(taskId) {
+  return state.agentThinkingCards?.get(String(taskId)) || null;
+}
+
+function thinkingStatusFromEvent(type) {
+  if (['error', 'tool_error'].includes(type)) return 'failed';
+  if (['approval_required'].includes(type)) return 'waiting_approval';
+  if (['clarification'].includes(type)) return 'waiting_input';
+  if (['done'].includes(type)) return 'completed';
+  if (['cancelled'].includes(type)) return 'cancelled';
+  return 'running';
+}
+
+function thinkingIconForEvent(type, kind = '') {
+  if (kind) return kind;
+  const mapping = {
+    intent: 'goal', goal_spec: 'goal', goal_spec_progress: 'goal', plan: 'plan', plan_progress: 'plan',
+    skill: 'skill', model: 'model', tool_call: 'mcp', tool_result: 'mcp', tool_error: 'mcp',
+    tool_blocked: 'tool', agent: 'agent', expert_selection: 'expert', knowledge: 'knowledge',
+    memory: 'knowledge', verification_started: 'verification', verification_result: 'verification',
+    output_check: 'verification', answer: 'output', error: 'error', clarification: 'goal',
+  };
+  return mapping[type] || 'process';
+}
+
+function formatThinkingDuration(startedAt, finishedAt = Date.now()) {
+  if (!startedAt) return '';
+  const seconds = Math.max(0, (finishedAt - startedAt) / 1000);
+  if (seconds < 1) return '不到 1 秒';
+  if (seconds < 60) return `${seconds.toFixed(1)} 秒`;
+  return `${Math.floor(seconds / 60)} 分 ${Math.round(seconds % 60)} 秒`;
+}
+
+function ensureThinkingStep(item, id, title, kind = 'process', status = 'pending') {
+  const key = String(id || `step-${item.steps.size + 1}`);
+  let step = item.steps.get(key);
+  if (!step) {
+    step = { id: key, title: String(title || key), kind, status, detail: '', children: new Map() };
+    item.steps.set(key, step);
+  } else {
+    if (title) step.title = String(title);
+    if (kind) step.kind = kind;
+  }
+  if (status) step.status = status;
+  return step;
+}
+
+function ensureThinkingChild(step, id, title, kind = 'detail', status = 'pending') {
+  const key = String(id || `child-${step.children.size + 1}`);
+  let child = step.children.get(key);
+  if (!child) {
+    child = { id: key, title: String(title || key), kind, status, detail: '' };
+    step.children.set(key, child);
+  } else {
+    if (title) child.title = String(title);
+    if (kind) child.kind = kind;
+  }
+  if (status) child.status = status;
+  return child;
+}
+
+function addThinkingRole(item, key, kind, label, detail = '') {
+  const roleKey = String(key || `${kind}:${label}`);
+  const existing = item.roles.get(roleKey);
+  if (existing) {
+    if (detail) existing.detail = String(detail);
+    return existing;
+  }
+  const role = { key: roleKey, kind: kind || 'process', label: String(label || '执行角色'), detail: String(detail || '') };
+  item.roles.set(roleKey, role);
+  return role;
+}
+
+function thinkingRoleMarkup(role) {
+  const detail = role.detail ? ` · ${escapeHtml(role.detail)}` : '';
+  return `<span class="agent-thinking-role ${escapeHtml(role.kind)}"><span class="agent-thinking-role-icon">${thinkingIconSvg(role.kind)}</span><span><strong>${escapeHtml(role.label)}</strong>${detail ? `<small>${detail}</small>` : ''}</span></span>`;
+}
+
+function thinkingActivityMarkup(activity) {
+  const detail = activity.detail ? `<small>${escapeHtml(activity.detail)}</small>` : '';
+  const statusIcon = activity.status === 'completed' ? '✓' : activity.status === 'failed' ? '!' : activity.status === 'waiting' ? '…' : '·';
+  return `<div class="agent-thinking-activity ${escapeHtml(activity.status)}" data-depth="${activity.depth || 0}" data-thinking-activity="${escapeHtml(activity.id)}">
+    <span class="agent-thinking-activity-icon">${thinkingIconSvg(activity.kind || 'process')}</span>
+    <span class="agent-thinking-activity-copy"><strong>${escapeHtml(activity.label)}</strong>${detail}</span>
+    <span class="agent-thinking-activity-status" aria-label="${escapeHtml(agentThinkingStatusLabel(activity.status))}">${statusIcon}</span>
+  </div>`;
+}
+
+function thinkingActivityText(value, fallback = '') {
+  const text = String(value || fallback || '').replace(/\s+/g, ' ').trim();
+  if (/^(prepare|understand|execute|validate|start|done)$/i.test(text)) return '';
+  return text.length > 140 ? `${text.slice(0, 137)}…` : text;
+}
+
+function addThinkingActivity(item, { key = '', type = 'progress', kind = 'process', label = '', detail = '', status = 'running', depth = 0 } = {}) {
+  if (!item) return;
+  const activityId = String(key || `${type}:${item.activities.length + 1}`);
+  const safeLabel = thinkingActivityText(label, '正在处理…');
+  const safeDetail = thinkingActivityText(detail);
+  let activity = item.activityIndex.get(activityId);
+  if (!activity) {
+    activity = { id: activityId, type, kind, label: safeLabel, detail: safeDetail, status, depth };
+    item.activityIndex.set(activityId, activity);
+    item.activities.push(activity);
+  } else {
+    activity.type = type || activity.type;
+    activity.kind = kind || activity.kind;
+    activity.label = safeLabel || activity.label;
+    activity.detail = safeDetail || activity.detail;
+    activity.status = status || activity.status;
+    activity.depth = depth;
+  }
+  // Keep a generous history for an expanded card, while preventing a noisy
+  // stream (answer_delta and repeated progress events are coalesced by key).
+  if (item.activities.length > 80) {
+    const removed = item.activities.splice(0, item.activities.length - 80);
+    removed.forEach((entry) => item.activityIndex.delete(entry.id));
+  }
+}
+
+function recordThinkingActivity(item, type, event = {}, data = {}) {
+  // These events are useful to the runtime inspector, but are bookkeeping
+  // noise in the conversation. Keep the feed focused on user-relevant work.
+  if (new Set(['checkpoint', 'permissions', 'notice', 'recovery', 'recovery_scheduled', 'resume', 'resume_scheduled', 'retry_scheduled', 'command_queued']).has(type)) return;
+  const content = event.content || '';
+  const toolName = data.tool_name || data.name || '';
+  const server = data.server_id || data.server || '';
+  const toolLabel = `${server ? `${server}.` : ''}${toolName || '工具'}`;
+  const childLabel = data.child_title || data.child_id || data.node_id || '';
+  const friendlyChildLabel = childLabel && !/^[a-z0-9_-]+$/i.test(String(childLabel)) ? childLabel : '';
+  const status = String(data.status || '').toLowerCase();
+  const isFailed = ['error', 'tool_error', 'tool_blocked'].includes(type) || status === 'failed';
+  const isDone = ['tool_result', 'tool_reused', 'verification_result', 'output_check', 'answer', 'done'].includes(type) || ['completed', 'succeeded'].includes(status);
+  const defaultStatus = isFailed ? 'failed' : isDone ? 'completed' : type === 'approval_required' || type === 'clarification' ? 'waiting' : 'running';
+  const eventKey = type === 'plan_progress' || type === 'progress'
+    ? `${type}:${data.node_id || 'node'}:${data.child_id || ''}:${status || 'running'}`
+    : event.id ? `${type}:${event.id}` : `${type}:${data.call_id || toolLabel || childLabel || item.activities.length}`;
+  let activity;
+  switch (type) {
+    case 'start':
+      activity = { key: eventKey, kind: 'process', label: '开始处理任务', detail: content, status: 'running' };
+      break;
+    case 'intent': case 'goal_spec': case 'goal_spec_progress':
+      activity = { key: eventKey, kind: 'goal', label: '正在确认任务目标', detail: content || item.goal, status: status === 'resolving' ? 'running' : 'completed' };
+      break;
+    case 'plan':
+      activity = { key: eventKey, kind: 'plan', label: '已生成执行计划', detail: `${Array.isArray(data.plan?.nodes) ? data.plan.nodes.length : 0} 个执行节点`, status: 'completed' };
+      break;
+    case 'plan_progress': case 'progress':
+      {
+        const progressLabel = thinkingActivityText(content) || (status === 'failed' ? `执行未完成${friendlyChildLabel ? ` · ${friendlyChildLabel}` : ''}` : status === 'completed' || status === 'succeeded' ? `已完成${friendlyChildLabel ? ` · ${friendlyChildLabel}` : '当前步骤'}` : `正在执行${friendlyChildLabel ? ` · ${friendlyChildLabel}` : '当前步骤'}`);
+        activity = { key: eventKey, kind: 'plan', label: progressLabel, detail: friendlyChildLabel && progressLabel !== friendlyChildLabel ? friendlyChildLabel : '', status: defaultStatus };
+      }
+      break;
+    case 'expert_selection':
+      activity = { key: eventKey, kind: 'expert', label: `已匹配专家团 · ${data.team_name || data.team_id || '专家团'}`, detail: data.reason || content, status: 'completed' };
+      break;
+    case 'agent':
+      activity = { key: eventKey, kind: 'agent', label: `已选择智能体 · ${data.agent?.name || data.agent?.id || content || '智能体'}`, detail: content, status: 'completed' };
+      break;
+    case 'skill':
+      activity = { key: eventKey, kind: 'skill', label: '已匹配 Skill', detail: (data.skills || []).map((skill) => skill.name || skill.id).filter(Boolean).join('、') || content, status: 'completed' };
+      break;
+    case 'model':
+      activity = { key: eventKey, kind: 'model', label: `正在调用模型 · ${data.model_name || data.model_id || content || '当前模型'}`, detail: content, status: defaultStatus };
+      break;
+    case 'tool_call': case 'tool_reused':
+      activity = { key: eventKey, kind: 'mcp', label: `正在调用 · ${toolLabel}`, detail: content, status: 'running', depth: 1 };
+      break;
+    case 'tool_result':
+      activity = { key: eventKey, kind: 'mcp', label: `已返回 · ${toolLabel}`, detail: content, status: 'completed', depth: 1 };
+      break;
+    case 'tool_error': case 'tool_blocked':
+      activity = { key: eventKey, kind: 'tool', label: `${type === 'tool_blocked' ? '已阻止' : '调用未完成'} · ${toolLabel}`, detail: content, status: 'failed', depth: 1 };
+      break;
+    case 'knowledge': case 'memory':
+      activity = { key: eventKey, kind: 'knowledge', label: type === 'knowledge' ? '已检索项目资料' : '已应用上下文记忆', detail: content, status: 'completed' };
+      break;
+    case 'verification_started':
+      activity = { key: eventKey, kind: 'verification', label: '正在检查结果', detail: content, status: 'running' };
+      break;
+    case 'verification_result': case 'output_check':
+      activity = { key: eventKey, kind: 'verification', label: '结果检查完成', detail: content, status: 'completed' };
+      break;
+    case 'answer_delta':
+      activity = { key: 'answer:stream', kind: 'output', label: '正在输出结果…', detail: `${item.answerChars} 字`, status: 'running' };
+      break;
+    case 'answer':
+      activity = { key: eventKey, kind: 'output', label: '已生成最终答复', detail: content, status: 'completed' };
+      break;
+    case 'approval_required': case 'clarification':
+      activity = { key: eventKey, kind: 'goal', label: type === 'approval_required' ? '等待你的确认' : '需要补充信息', detail: content || '补充后将继续当前任务', status: 'waiting' };
+      break;
+    case 'error':
+      activity = { key: eventKey, kind: 'error', label: event.title || '任务执行失败', detail: content, status: 'failed' };
+      break;
+    case 'done':
+      activity = { key: eventKey, kind: 'output', label: '任务已完成', detail: content || '结果已发布', status: 'completed' };
+      break;
+    default:
+      activity = { key: eventKey, kind: thinkingIconForEvent(type), label: event.title || content || '正在处理…', detail: content, status: defaultStatus };
+  }
+  addThinkingActivity(item, activity);
+}
+
+function renderAgentThinkingCard(item, { full = true } = {}) {
+  if (!item?.node?.isConnected) return;
+  const node = item.node;
+  node.className = `agent-thinking-card ${escapeHtml(item.status)}${item.historical ? ' historical' : ''}`;
+  const title = item.historical && item.status === 'pending' ? '查看处理过程' : item.status === 'running' ? '正在处理' : item.status === 'waiting_approval' ? '等待你的确认' : item.status === 'waiting_input' ? '需要补充信息' : item.status === 'failed' ? '处理未完成' : item.status === 'cancelled' ? '任务已停止' : '处理完成';
+  const currentLabel = item.current?.label || (item.status === 'running' ? '正在准备任务…' : agentThinkingStatusLabel(item.status));
+  const currentDetail = thinkingActivityText(item.current?.detail) || '公开执行过程会在这里实时更新';
+  const badge = item.historical && item.status === 'pending' ? '按需查看' : item.status === 'running' ? '实时' : item.status === 'completed' || item.status === 'succeeded' ? '已完成' : agentThinkingStatusLabel(item.status);
+  const steps = [...item.steps.values()];
+  const completed = steps.filter((step) => ['completed', 'succeeded'].includes(step.status)).length;
+  const capabilityCount = [...item.roles.values()].filter((role) => ['skill', 'mcp', 'tool', 'model'].includes(role.kind)).length;
+  const duration = item.finishedAt ? formatThinkingDuration(item.startedAt, item.finishedAt) : formatThinkingDuration(item.startedAt);
+  const stats = `${item.activities.length || completed}/${item.activities.length || steps.length || 0} 条活动${capabilityCount ? ` · ${capabilityCount} 项能力` : ''}${duration ? ` · ${duration}` : ''}`;
+  const summaryIcon = thinkingIconForEvent(item.current?.type || '', item.current?.kind || 'process');
+  const currentIcon = thinkingIconForEvent(item.current?.type || '', item.current?.kind || 'process');
+  const roles = [...item.roles.values()].filter((role, index, all) => all.findIndex((candidate) => `${candidate.kind}:${candidate.label}` === `${role.kind}:${role.label}`) === index);
+  const rolesMarkup = roles.slice(0, 10).map(thinkingRoleMarkup).join('');
+  const activitiesMarkup = item.activities.length ? item.activities.map(thinkingActivityMarkup).join('') : '<div class="agent-thinking-empty">活动记录会随任务推进显示</div>';
+  const runtimeId = item.taskId && item.taskId !== '__pending__' ? item.taskId : '';
+  const body = node.querySelector('.agent-thinking-body');
+  const summaryTitle = node.querySelector('[data-thinking-title]');
+  const summaryCopy = node.querySelector('[data-thinking-summary]');
+  const summaryStatus = node.querySelector('[data-thinking-status]');
+  const summaryIconNode = node.querySelector('[data-thinking-summary-icon]');
+  if (summaryTitle) summaryTitle.textContent = title;
+  if (summaryCopy) summaryCopy.textContent = `${currentLabel}${duration ? ` · ${duration}` : ''}`;
+  if (summaryStatus) summaryStatus.textContent = badge;
+  if (summaryIconNode) summaryIconNode.innerHTML = thinkingIconSvg(summaryIcon);
+  if (!body) return;
+  if (full) {
+    const current = body.querySelector('[data-thinking-current]');
+    if (current) current.innerHTML = `<span class="agent-thinking-current-icon ${escapeHtml(item.status)}">${thinkingIconSvg(currentIcon)}</span><span><strong>${escapeHtml(currentLabel)}</strong><small>${escapeHtml(currentDetail)}</small></span>`;
+    const goal = body.querySelector('[data-thinking-goal]');
+    if (goal) goal.innerHTML = item.goal ? `<span>目标</span><strong>${escapeHtml(item.goal)}</strong>` : '';
+    const roleStrip = body.querySelector('[data-thinking-roles]');
+    if (roleStrip) roleStrip.innerHTML = rolesMarkup ? `<div class="agent-thinking-role-strip">${rolesMarkup}</div>` : '';
+    const activityList = body.querySelector('[data-thinking-activities]');
+    if (activityList) activityList.innerHTML = activitiesMarkup;
+    const statNode = body.querySelector('[data-thinking-stats]');
+    if (statNode) statNode.textContent = stats;
+    const runtimeButton = body.querySelector('[data-open-thinking-runtime]');
+    if (runtimeButton) {
+      runtimeButton.disabled = !runtimeId;
+      runtimeButton.textContent = runtimeId ? '跳转到运行控制' : '任务建立后可查看运行控制';
+    }
+  }
+}
+
+function createAgentThinkingCard(taskId = '__pending__', { historical = false, open = !historical } = {}) {
+  const key = String(taskId || '__pending__');
+  const existing = agentThinkingCard(key);
+  if (existing) {
+    existing.historical = existing.historical && historical;
+    if (open) existing.node.open = true;
+    return existing;
+  }
+  const node = document.createElement('details');
+  node.className = `agent-thinking-card ${historical ? 'historical' : 'running'}`;
+  node.dataset.thinkingTask = key;
+  node.open = open;
+  node.innerHTML = `
+    <summary class="agent-thinking-summary">
+      <span class="agent-thinking-summary-icon" data-thinking-summary-icon>${thinkingIconSvg('process')}</span>
+      <span class="agent-thinking-summary-copy"><strong data-thinking-title>${historical ? '查看智能体处理过程' : '智能体正在处理'}</strong><small data-thinking-summary>${historical ? '点击展开加载目标、计划和能力调用记录' : '正在确认目标与匹配能力…'}</small></span>
+      <span class="agent-thinking-status" data-thinking-status>${historical ? '按需查看' : '实时'}</span>
+      <span class="agent-thinking-chevron" aria-hidden="true">⌄</span>
+    </summary>
+    <div class="agent-thinking-body">
+      <div class="agent-thinking-current" data-thinking-current><span class="agent-thinking-current-icon">${thinkingIconSvg('process')}</span><span><strong>正在准备任务…</strong><small>公开执行过程会在这里实时更新</small></span></div>
+      <div class="agent-thinking-goal" data-thinking-goal></div>
+      <div class="agent-thinking-roles" data-thinking-roles></div>
+      <div class="agent-thinking-activities" data-thinking-activities><div class="agent-thinking-empty">活动记录会随任务推进显示</div></div>
+      <div class="agent-thinking-footer"><span data-thinking-stats>实时同步中</span><button class="text-button" type="button" data-open-thinking-runtime ${key === '__pending__' ? 'disabled' : ''}>${key === '__pending__' ? '任务建立后可查看运行控制' : '跳转到运行控制'}</button></div>
+    </div>`;
+  $('conversation').appendChild(node);
+  const item = { taskId: key, node, historical, loaded: !historical, loading: false, status: historical ? 'pending' : 'running', startedAt: Date.now(), finishedAt: 0, goal: '', current: { type: 'start', kind: 'process', label: historical ? '点击展开查看执行过程' : '正在确认目标与匹配能力…', detail: historical ? '执行记录按需加载，不展示模型内部思考' : '目标、计划、Skill、MCP 与验收状态会实时同步' }, steps: new Map(), roles: new Map(), activities: [], activityIndex: new Map(), seenEvents: new Set(), eventCount: 0, answerChars: 0 };
+  state.agentThinkingCards.set(key, item);
+  node.querySelector('[data-open-thinking-runtime]').onclick = (event) => {
+    event.preventDefault(); event.stopPropagation(); openRuntimeFromThinking(item.taskId);
+  };
+  node.addEventListener('toggle', () => {
+    if (node.open && item.historical && !item.loaded && !item.loading) loadHistoricalThinking(item.taskId);
+  });
+  renderAgentThinkingCard(item);
+  return item;
+}
+
+function bindAgentThinkingCard(pendingTaskId, taskId) {
+  const pending = agentThinkingCard(pendingTaskId);
+  if (!pending || !taskId || String(pendingTaskId) === String(taskId)) return pending;
+  state.agentThinkingCards.delete(String(pendingTaskId));
+  pending.taskId = String(taskId);
+  pending.node.dataset.thinkingTask = String(taskId);
+  pending.historical = false;
+  pending.loaded = true;
+  state.agentThinkingCards.set(String(taskId), pending);
+  renderAgentThinkingCard(pending);
+  return pending;
+}
+
+function setAgentThinkingCurrent(taskId, label, detail = '', type = 'progress', kind = '') {
+  const item = agentThinkingCard(taskId);
+  if (!item) return;
+  item.current = { label: String(label || '正在处理…'), detail: String(detail || ''), type, kind: thinkingIconForEvent(type, kind) };
+  renderAgentThinkingCard(item, { full: true });
+}
+
+function updateAgentThinkingPlan(item, plan = {}) {
+  const nodes = Array.isArray(plan.nodes) ? plan.nodes : [];
+  nodes.forEach((raw, index) => {
+    const step = ensureThinkingStep(item, raw.id || `plan-${index + 1}`, raw.title || `执行节点 ${index + 1}`, 'plan', raw.status || 'pending');
+    step.detail = raw.detail || step.detail || '';
+    (Array.isArray(raw.children) ? raw.children : []).forEach((child) => {
+      const childItem = ensureThinkingChild(step, child.id, child.title || child.id, child.kind || 'detail', child.status || 'pending');
+      childItem.detail = child.detail || childItem.detail || '';
+      if (child.kind) addThinkingRole(item, `${child.kind}:${child.id}`, child.kind === 'mcp' ? 'mcp' : child.kind === 'tool' ? 'tool' : child.kind, child.title || child.id);
+    });
+  });
+}
+
+function updateAgentThinkingEvent(taskId, event = {}) {
+  const item = agentThinkingCard(taskId);
+  if (!item || !event || privateTaskEventTypes.has(String(event.type || '').toLowerCase())) return;
+  const type = String(event.type || '').toLowerCase();
+  const id = Number(event.id || 0);
+  if (id && item.seenEvents.has(id)) return;
+  if (id) item.seenEvents.add(id);
+  item.eventCount += 1;
+  const data = event.data && typeof event.data === 'object' ? event.data : {};
+  const status = thinkingStatusFromEvent(type);
+  if (type === 'plan') {
+    item.goal = String((data.plan || {}).goal || item.goal || '');
+    updateAgentThinkingPlan(item, data.plan || {});
+    setAgentThinkingCurrent(taskId, '执行计划已生成', '目标、节点与验收标准已固化', type, 'plan');
+  } else if (type === 'intent' || type === 'goal_spec' || type === 'goal_spec_progress') {
+    const goalSpec = data.goal_spec || {};
+    item.goal = String(goalSpec.objective?.statement || data.objective || event.content || item.goal || '');
+    const step = ensureThinkingStep(item, 'understand', '确认当前目标与约束', 'goal', type === 'goal_spec_progress' && data.status === 'resolving' ? 'running' : 'completed');
+    step.detail = event.content || step.detail;
+    setAgentThinkingCurrent(taskId, '正在确认目标', item.goal || event.content || '结合当前对话确认任务范围', type, 'goal');
+  } else if (type === 'plan_progress') {
+    const nodeId = data.node_id || 'execute';
+    const step = ensureThinkingStep(item, nodeId, data.node_title || data.title || nodeId, 'plan', data.status || 'running');
+    step.detail = event.content || step.detail;
+    if (data.child_id) {
+      const child = ensureThinkingChild(step, data.child_id, data.child_title || data.child_id, data.child_kind || 'detail', data.status || 'running');
+      child.detail = event.content || child.detail;
+      if (data.child_kind) addThinkingRole(item, `${data.child_kind}:${data.child_id}`, data.child_kind === 'mcp' ? 'mcp' : data.child_kind === 'tool' ? 'tool' : data.child_kind, data.child_title || data.child_id);
+    }
+    setAgentThinkingCurrent(taskId, event.content || '正在执行计划…', data.child_title || data.node_title || nodeId, type, 'plan');
+  } else if (type === 'expert_selection') {
+    const team = data.team_name || data.team_id || '专家团';
+    addThinkingRole(item, `expert-team:${data.team_id || team}`, 'expert', team, data.selection_mode === 'automatic' ? '自动匹配' : '已指定');
+    if (data.supervisor) addThinkingRole(item, `expert:${data.supervisor.agent_id || data.supervisor.agent_name}`, 'expert', data.supervisor.agent_name || data.supervisor.agent_id, '主管');
+    (Array.isArray(data.members) ? data.members : []).forEach((member) => addThinkingRole(item, `expert:${member.agent_id || member.agent_name}`, 'expert', member.agent_name || member.agent_id || '专家', member.role || '成员'));
+    setAgentThinkingCurrent(taskId, '已选择参与专家', event.content || `${team} 将协作处理当前任务`, type, 'expert');
+  } else if (type === 'agent') {
+    const agent = data.agent || {};
+    addThinkingRole(item, `agent:${agent.id || event.content}`, 'agent', agent.name || event.content || '智能体');
+    setAgentThinkingCurrent(taskId, '已选择智能体', agent.name || event.content || '正在执行', type, 'agent');
+  } else if (type === 'skill') {
+    const skills = Array.isArray(data.skills) ? data.skills : [];
+    skills.forEach((skill) => { addThinkingRole(item, `skill:${skill.id || skill.name}`, 'skill', skill.name || skill.id || 'Skill'); const step = ensureThinkingStep(item, 'understand', '目标与能力匹配', 'goal', 'running'); const child = ensureThinkingChild(step, `skill:${skill.id || skill.name}`, skill.name || skill.id || 'Skill', 'skill', 'completed'); child.detail = '已匹配'; });
+    setAgentThinkingCurrent(taskId, '已匹配 Skill', event.content || '正在准备执行能力', type, 'skill');
+  } else if (['model', 'tool_call', 'tool_result', 'tool_error', 'tool_blocked'].includes(type)) {
+    const server = data.server_id || data.server || '';
+    const tool = data.tool_name || data.name || '';
+    const capabilityKind = type === 'model' ? 'model' : type === 'tool_blocked' ? 'tool' : 'mcp';
+    const label = type === 'model' ? (data.model_name || data.model_id || event.content || '模型') : `${server ? `${server}.` : ''}${tool || '工具调用'}`;
+    const key = `${capabilityKind}:${data.call_id || server + ':' + tool || event.content}`;
+    addThinkingRole(item, key, capabilityKind, label, type === 'tool_result' ? '已返回' : type === 'tool_error' || type === 'tool_blocked' ? '调用未完成' : '执行中');
+    const parentId = data.node_id || 'execute';
+    const step = ensureThinkingStep(item, parentId, data.node_title || (parentId === 'execute' ? '执行任务' : parentId), 'process', type === 'tool_error' || type === 'tool_blocked' ? 'failed' : type === 'tool_result' ? 'completed' : 'running');
+    const child = ensureThinkingChild(step, data.child_id || key, label, capabilityKind, type === 'tool_error' || type === 'tool_blocked' ? 'failed' : type === 'tool_result' ? 'completed' : 'running');
+    child.detail = event.content || child.detail;
+    setAgentThinkingCurrent(taskId, type === 'model' ? '正在调用模型…' : type === 'tool_result' ? '工具已返回，正在整理结果…' : type === 'tool_error' || type === 'tool_blocked' ? '工具调用未完成' : '正在调用工具…', label, type, capabilityKind);
+  } else if (type === 'knowledge' || type === 'memory') {
+    addThinkingRole(item, `${type}:${event.id || event.content}`, 'knowledge', type === 'knowledge' ? '项目知识库' : '平台记忆', '已应用');
+    const step = ensureThinkingStep(item, 'prepare', '整理上下文与授权能力', 'knowledge', 'running');
+    const child = ensureThinkingChild(step, `${type}:${event.id || 'context'}`, type === 'knowledge' ? '检索知识库' : '应用平台记忆', 'knowledge', 'completed');
+    child.detail = event.content || child.detail;
+    step.status = 'completed';
+    setAgentThinkingCurrent(taskId, type === 'knowledge' ? '已检索相关资料' : '已应用平台记忆', event.content || '', type, 'knowledge');
+  } else if (['verification_started', 'verification_result', 'output_check'].includes(type)) {
+    const step = ensureThinkingStep(item, 'validate', '结果验收', 'verification', type === 'verification_result' || type === 'output_check' ? 'completed' : 'running');
+    step.detail = event.content || step.detail;
+    addThinkingRole(item, 'verification:final', 'verification', '结果验收', type === 'verification_result' || type === 'output_check' ? '已检查' : '进行中');
+    setAgentThinkingCurrent(taskId, type === 'verification_started' ? '正在验收生成结果…' : '结果验收已更新', event.content || '核对结果与当前目标', type, 'verification');
+  } else if (type === 'answer_delta') {
+    item.answerChars += String(event.content || '').length;
+    setAgentThinkingCurrent(taskId, '正在输出结果…', `${item.answerChars} 字 · 通过验收后发布`, type, 'output');
+  } else if (type === 'answer') {
+    setAgentThinkingCurrent(taskId, '最终答复已生成', '正在完成交付', type, 'output');
+  } else if (type === 'approval_required' || type === 'clarification') {
+    item.status = status;
+    setAgentThinkingCurrent(taskId, type === 'approval_required' ? '等待你的确认' : '需要补充信息', event.content || '补充后将继续当前任务', type, 'goal');
+  } else if (type === 'error') {
+    item.status = 'failed';
+    setAgentThinkingCurrent(taskId, event.title || '任务执行失败', event.content || '请检查模型、参数或工具配置后重试', type, 'error');
+  } else if (type === 'done') {
+    setAgentThinkingCurrent(taskId, '任务已完成', event.content || '结果已发布', type, 'output');
+  } else {
+    setAgentThinkingCurrent(taskId, event.title || event.content || '正在执行任务…', event.content || '', type, thinkingIconForEvent(type));
+  }
+  // The conversation view is an activity feed, not a second runtime panel.
+  // Record only public, typed events; private reasoning is filtered above.
+  recordThinkingActivity(item, type, event, data);
+  if (type !== 'error' && type !== 'approval_required' && type !== 'clarification' && type !== 'done') item.status = 'running';
+  renderAgentThinkingCard(item);
+  if (['done', 'error', 'cancelled'].includes(type)) finishAgentThinkingCard(taskId, type === 'done' ? 'completed' : type);
+}
+
+function finishAgentThinkingCard(taskId, status = 'completed') {
+  const item = agentThinkingCard(taskId);
+  if (!item) return;
+  item.status = status === 'succeeded' ? 'completed' : status === 'submission_failed' ? 'failed' : status;
+  if (status === 'submission_failed') {
+    item.current = { type: 'error', kind: 'error', label: '发送失败', detail: '所选模型不可用，任务尚未开始执行' };
+  }
+  item.finishedAt = item.finishedAt || Date.now();
+  // Historical cards stay open when the user explicitly expanded them; live
+  // cards collapse after delivery so the conversation returns to a concise
+  // result view.
+  if (item.status === 'completed' || item.status === 'cancelled') item.node.open = item.historical ? item.node.open : false;
+  else item.node.open = true;
+  renderAgentThinkingCard(item);
+}
+
+async function loadHistoricalThinking(taskId) {
+  const item = agentThinkingCard(taskId);
+  if (!item || item.loading || item.loaded || !taskId || taskId === '__pending__') return;
+  item.loading = true;
+  item.current = { type: 'start', kind: 'process', label: '正在加载执行记录…', detail: '读取目标、计划、Skill/MCP 与验收节点' };
+  renderAgentThinkingCard(item);
+  try {
+    const task = await api(`/api/tasks/${encodeURIComponent(taskId)}`);
+    item.task = task;
+    item.loaded = true;
+    if (runtimeIsActive(task.status)) {
+      item.status = 'running';
+      item.node.open = true;
+    }
+    if (task.expert_selection) updateAgentThinkingEvent(taskId, { type: 'expert_selection', data: task.expert_selection, content: task.expert_selection.reason || '' });
+    (task.events || []).forEach((event) => updateAgentThinkingEvent(taskId, event));
+    if (['completed', 'succeeded', 'failed', 'cancelled'].includes(task.status)) finishAgentThinkingCard(taskId, task.status);
+  } catch (err) {
+    item.status = 'failed';
+    setAgentThinkingCurrent(taskId, '执行记录读取失败', err.message || '请打开运行记录查看完整信息', 'error', 'error');
+    renderAgentThinkingCard(item);
+  } finally {
+    item.loading = false;
+  }
+}
+
+function openRuntimeFromThinking(taskId) {
+  const id = String(taskId || '');
+  if (!id || id === '__pending__') return notify('任务建立后才能查看运行控制', 'error');
+  const reveal = () => {
+    const target = $('timelineSection') || $('runtimeInspectorSection');
+    if (!target) return;
+    if ($('runtimeInspectorSection')) $('runtimeInspectorSection').open = true;
+    target.open = true;
+    target.classList.remove('runtime-jump-highlight');
+    // Force the highlight animation to restart when the user clicks again.
+    void target.offsetWidth;
+    target.classList.add('runtime-jump-highlight');
+    target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    window.setTimeout(() => target.classList.remove('runtime-jump-highlight'), 1800);
+    notify('已跳转到执行过程', 'success');
+  };
+  if (state.currentTask?.id === id) {
+    switchTab('chat');
+    ['taskOverviewSection', 'runtimeInspectorSection', 'timelineSection'].forEach((sectionId) => { if ($(sectionId)) $(sectionId).open = true; });
+    loadTaskRuntime(id, { silent: true }).finally(reveal);
+    return;
+  }
+  openTask(id).then(reveal).catch((err) => notify(`打开运行控制失败：${err.message || err}`, 'error'));
+}
+
+async function stopActiveTask() {
+  const taskId = state.currentTask?.id;
+  if (!taskId) {
+    notify('任务正在提交，请稍候再停止', 'error');
+    return;
+  }
+  state.taskUiCancelRequested = true;
+  setSendButtonState('cancel_requested');
+  setTaskUiStatus(taskId, '正在停止任务…', 'verifying');
+  const accepted = await sendTaskRuntimeCommand('cancel', { reason: '用户点击停止' }, null);
+  if (!accepted) {
+    state.taskUiCancelRequested = false;
+    if (runtimeIsActive(currentRuntimeStatus())) setSendButtonState('running');
+  }
 }
 
 function setBusy(button, busy, label = '保存中…') {
@@ -150,10 +831,22 @@ function switchTab(tab) {
     clearTimeout(state.loopPollTimer);
     state.loopPollTimer = null;
   }
-  if (tab === 'skills') {
+  if (tab === 'workspaces') {
+    loadWorkspacesOnly({ preserveSelection: true }).catch((err) => notify(`项目刷新失败：${err.message || err}`, 'error'));
+  } else if (tab === 'skills') {
     loadSkillsOnly().catch((err) => notify(`技能刷新失败：${err.message || err}`, 'error'));
+  } else if (tab === 'mcp') {
+    loadMcpOnly().catch((err) => notify(`工具服务刷新失败：${err.message || err}`, 'error'));
+  } else if (tab === 'marketplace') {
+    loadMarketplaceOnly().catch((err) => notify(`市场刷新失败：${err.message || err}`, 'error'));
+  } else if (tab === 'experts') {
+    loadExpertWorkspace({ preserveSelection: true }).catch((err) => notify(`专家团刷新失败：${err.message || err}`, 'error'));
   } else if (tab === 'memory') {
     loadMemoriesOnly({ preserveSelection: true }).catch((err) => notify(`记忆刷新失败：${err.message || err}`, 'error'));
+  } else if (tab === 'knowledge') {
+    loadKnowledgeBasesOnly({ preserveSelection: true }).catch((err) => notify(`知识库刷新失败：${err.message || err}`, 'error'));
+  } else if (tab === 'diagnostics') {
+    loadDiagnosticsOnly().catch((err) => notify(`自检失败：${err.message || err}`, 'error'));
   } else if (tab === 'artifacts') {
     loadArtifactsOnly({ preserveSelection: true }).catch((err) => notify(`产物刷新失败：${err.message || err}`, 'error'));
   } else if (tab === 'loops') {
@@ -167,15 +860,55 @@ async function loadSkillsOnly() {
   return state.skills;
 }
 
+async function loadMcpOnly() {
+  state.mcp = await api('/api/mcp');
+  renderMcp();
+  return state.mcp;
+}
+
+function ensureSelectedWorkspace() {
+  const enabled = state.workspaces.filter((item) => item.enabled);
+  const preferred = state.workspaceId || readPreference('workspace') || 'default';
+  const selected = enabled.find((item) => item.id === preferred)
+    || enabled.find((item) => item.id === 'default')
+    || state.workspaces.find((item) => item.id === 'default')
+    || enabled[0]
+    || state.workspaces[0]
+    || null;
+  state.selectedWorkspace = selected;
+  state.workspaceId = selected?.id || 'default';
+  writePreference('workspace', state.workspaceId);
+}
+
+async function loadWorkspacesOnly({ preserveSelection = false } = {}) {
+  const previous = preserveSelection ? state.selectedWorkspace?.id || state.workspaceId : state.workspaceId;
+  state.workspaces = await api(`/api/workspaces?${workspaceQuery({ include_disabled: 'true' })}`);
+  state.workspaceId = previous || readPreference('workspace') || 'default';
+  ensureSelectedWorkspace();
+  renderWorkspaceSelect();
+  renderWorkspaces();
+  if (state.selectedWorkspace) selectWorkspaceEditor(state.selectedWorkspace.id, { activate: false });
+}
+
+function renderWorkspaceSelect() {
+  const select = $('workspaceSelect');
+  if (!select) return;
+  const enabled = state.workspaces.filter((item) => item.enabled);
+  select.innerHTML = enabled.map((item) => `<option value="${escapeHtml(item.id)}">${escapeHtml(item.name)}</option>`).join('');
+  if (enabled.some((item) => item.id === currentWorkspaceId())) select.value = currentWorkspaceId();
+}
+
 async function loadAll() {
-  const [skills, mcp, agents, tasks, models, loops, capabilities] = await Promise.all([
+  const [skills, mcp, agents, tasks, models, loops, workspaces, capabilities, marketplace] = await Promise.all([
     api('/api/skills'),
     api('/api/mcp'),
     api('/api/agents'),
-    api('/api/tasks'),
+    api(`/api/tasks?${new URLSearchParams(platformScopeValues()).toString()}`),
     api('/api/models'),
-    api('/api/loops'),
+    api(`/api/loops?${new URLSearchParams(platformScopeValues()).toString()}`),
+    api(`/api/workspaces?${workspaceQuery()}`),
     api('/api/capabilities'),
+    api('/api/marketplace'),
   ]);
   state.skills = skills;
   state.mcp = mcp;
@@ -183,7 +916,12 @@ async function loadAll() {
   state.tasks = tasks;
   state.models = models;
   state.loops = loops;
+  state.workspaces = workspaces;
   state.capabilities = capabilities;
+  state.marketplace = marketplace;
+  ensureSelectedWorkspace();
+  renderWorkspaceSelect();
+  renderWorkspaces();
   renderAgentsSelect();
   renderTaskModelSelect();
   renderSkills();
@@ -193,8 +931,10 @@ async function loadAll() {
   renderModels();
   renderLoops();
   renderCapabilities();
-  const [memoryLoad, artifactLoad, expertLoad] = await Promise.allSettled([
+  renderMarketplace();
+  const [memoryLoad, knowledgeLoad, artifactLoad, expertLoad] = await Promise.allSettled([
     loadMemoriesOnly({ preserveSelection: true }),
+    loadKnowledgeBasesOnly({ preserveSelection: true }),
     loadArtifactsOnly({ preserveSelection: true }),
     loadExpertWorkspace({ preserveSelection: true }),
   ]);
@@ -202,6 +942,16 @@ async function loadAll() {
     console.warn('记忆模块初始化失败', memoryLoad.reason);
     $('memoryEffectiveMeta').textContent = '记忆服务暂不可用，可稍后重新计算';
     $('memoryEffectiveContext').textContent = '平台其他功能仍可正常使用。';
+  }
+  if (knowledgeLoad.status === 'rejected') {
+    console.warn('知识库模块初始化失败', knowledgeLoad.reason);
+    state.knowledgeBases = [];
+    state.knowledgeDocuments = [];
+    state.knowledgeSearchResults = [];
+    state.selectedKnowledgeBase = null;
+    renderKnowledgeBases();
+    renderKnowledgeDocuments();
+    renderKnowledgeSearchResults();
   }
   if (artifactLoad.status === 'rejected') {
     console.warn('产物工作区初始化失败', artifactLoad.reason);
@@ -286,9 +1036,37 @@ function setWorkbenchMode(mode, { persist = true } = {}) {
 function renderTaskModelSelect() {
   const select = $('taskModelSelect');
   const enabled = state.models.filter((m) => m.enabled);
-  const preferred = select.value || readPreference('model') || enabled.find((m) => m.id !== 'deterministic')?.id || 'deterministic';
-  select.innerHTML = enabled.map((m) => `<option value="${escapeHtml(m.id)}">模型：${escapeHtml(m.name)}</option>`).join('');
-  if (enabled.some((m) => m.id === preferred)) select.value = preferred;
+  const ready = enabled.filter((m) => (m.readiness?.state || 'ready') === 'ready');
+  const explicit = readPreference('model-explicit') === '1';
+  const workspacePreferred = state.selectedWorkspace?.default_model_id;
+  const remembered = select.value || readPreference('model');
+  const preferred = explicit
+    ? remembered || workspacePreferred || ready.find((m) => m.id !== 'deterministic')?.id || 'deterministic'
+    : workspacePreferred && ready.some((m) => m.id === workspacePreferred)
+      ? workspacePreferred
+      : ready.find((m) => m.id !== 'deterministic')?.id || workspacePreferred || remembered || 'deterministic';
+  select.innerHTML = enabled.map((m) => {
+    const readyState = m.readiness?.state || 'ready';
+    const label = m.readiness?.label || (m.enabled ? '可用' : '停用');
+    return `<option value="${escapeHtml(m.id)}" ${readyState !== 'ready' ? 'disabled' : ''}>模型：${escapeHtml(m.name)} · ${escapeHtml(label)}</option>`;
+  }).join('');
+  if (ready.some((m) => m.id === preferred)) select.value = preferred;
+  else if (ready.length) select.value = ready[0].id;
+  renderWorkbenchModelStatus();
+}
+
+function currentWorkbenchModel() {
+  return state.models.find((m) => m.id === $('taskModelSelect')?.value) || null;
+}
+
+function renderWorkbenchModelStatus() {
+  const pill = $('modelStatusPill');
+  if (!pill) return;
+  const model = currentWorkbenchModel();
+  const stateValue = model?.readiness?.state || (model?.enabled ? 'ready' : 'off');
+  pill.className = `model-status-pill ${escapeHtml(modelReadinessClass(model))}`;
+  pill.textContent = model ? modelReadinessLabel(model) : '未选择模型';
+  pill.title = model?.readiness?.detail || (model ? '打开模型设置' : '请先配置模型');
 }
 
 function addMessage(role, content, eventId = null) {
@@ -298,6 +1076,7 @@ function addMessage(role, content, eventId = null) {
   renderMessageContent(div, content);
   $('conversation').appendChild(div);
   $('conversation').scrollTop = $('conversation').scrollHeight;
+  return div;
 }
 
 function renderMessageContent(element, content) {
@@ -305,7 +1084,71 @@ function renderMessageContent(element, content) {
     element.textContent = content;
     return;
   }
-  element.innerHTML = renderMarkdown(content);
+  element.innerHTML = element.classList.contains('agent')
+    ? renderAssistantContent(content)
+    : renderMarkdown(content);
+}
+
+function stripInternalAnswerMarkers(content) {
+  return String(content ?? '')
+    .replace(/^\s*(?:[-*+]\s*)?(?:本次)?验收代号\s*[:：][^\n]*(?:\n|$)/gim, '')
+    .replace(/(?:本次)?验收代号\s*[:：]\s*[\u4e00-\u9fffA-Za-z0-9_-]+/g, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+// Some older/custom agents still return a fixed “任务理解 / 执行过程 / 结果”
+// checklist. Keep those responses readable without hiding information: show the
+// useful result first and move the process notes into a collapsed disclosure.
+function assistantSectionKind(label) {
+  const value = String(label || '').replace(/[*_]/g, '').trim();
+  if (/^(任务理解|目标理解|理解)$/.test(value)) return 'understand';
+  if (/^(执行过程|执行步骤|处理过程|过程)$/.test(value)) return 'process';
+  if (/^(结果|最终结果|结论|答案)$/.test(value)) return 'result';
+  if (/^(后续计划|后续建议|建议|下一步|可沉淀(?:为)?\s*Skill(?:\s*的建议)?)$/.test(value)) return 'next';
+  return '';
+}
+
+function renderAssistantContent(content) {
+  const source = stripInternalAnswerMarkers(content).replace(/\r\n?/g, '\n');
+  const lines = source.split('\n');
+  const sectionPattern = /^\s*(?:[-*+]\s+)?(?:\*\*)?([^：:]{1,28})(?:\*\*)?\s*[:：]\s*(.*)$/;
+  const sections = [];
+  const intro = [];
+  let current = null;
+
+  lines.forEach((line) => {
+    const match = line.match(sectionPattern);
+    const kind = match ? assistantSectionKind(match[1]) : '';
+    if (kind) {
+      current = { kind, label: String(match[1]).replace(/[*_]/g, '').trim(), body: match[2] || '' };
+      sections.push(current);
+      return;
+    }
+    if (current && line.trim()) {
+      current.body = `${current.body}${current.body ? '\n' : ''}${line}`;
+    } else if (current && !line.trim()) {
+      current.body = `${current.body}\n`;
+    } else {
+      intro.push(line);
+    }
+  });
+
+  // Only reshape a recognizable multi-part template. Normal Markdown remains
+  // untouched, including user-requested headings and lists.
+  if (sections.length < 2) return renderMarkdown(source);
+
+  const resultSections = sections.filter((item) => item.kind === 'result');
+  const leadSections = resultSections.length ? resultSections : sections.slice(0, 1);
+  const detailSections = sections.filter((item) => !leadSections.includes(item));
+  const introMarkup = intro.join('\n').trim() ? `<div class="assistant-lead">${renderMarkdown(intro.join('\n'))}</div>` : '';
+  const resultMarkup = `<div class="assistant-result"><div class="assistant-result-label"><span>结果</span><small>${resultSections.length ? '已整理' : '答复'}</small></div><div class="assistant-result-body">${leadSections.map((item) => renderMarkdown(item.body)).join('')}</div></div>`;
+  const detailMarkup = detailSections.length ? `
+    <details class="assistant-details">
+      <summary><span>查看处理详情</span><small>${detailSections.length} 项</small></summary>
+      <div class="assistant-detail-list">${detailSections.map((item) => `<div class="assistant-detail-row"><span class="assistant-detail-label">${escapeHtml(item.label)}</span><div>${renderMarkdown(item.body)}</div></div>`).join('')}</div>
+    </details>` : '';
+  return `<div class="assistant-response">${introMarkup}${resultMarkup}${detailMarkup}</div>`;
 }
 
 function renderMarkdown(content) {
@@ -314,6 +1157,32 @@ function renderMarkdown(content) {
   let paragraph = [];
   let listType = '';
   let code = null;
+  const codeLanguageLabels = {
+    json: 'JSON',
+    python: 'Python',
+    py: 'Python',
+    bash: 'Shell',
+    sh: 'Shell',
+    shell: 'Shell',
+    zsh: 'Shell',
+    javascript: 'JavaScript',
+    js: 'JavaScript',
+    typescript: 'TypeScript',
+    ts: 'TypeScript',
+    sql: 'SQL',
+    yaml: 'YAML',
+    yml: 'YAML',
+    html: 'HTML',
+    css: 'CSS',
+    markdown: 'Markdown',
+    md: 'Markdown',
+  };
+  const renderCodeBlock = (block) => {
+    const language = String(block.language || '').toLowerCase();
+    const label = codeLanguageLabels[language] || (language ? language.toUpperCase() : '代码');
+    const languageClass = block.language ? ` class="language-${block.language}"` : '';
+    return `<div class="code-block" data-code-language="${escapeHtml(block.language || '')}"><div class="code-block-toolbar"><span>${escapeHtml(label)}</span><button type="button" class="code-copy-button" data-copy-code aria-label="复制${escapeHtml(label)}代码">复制</button></div><pre><code${languageClass}>${block.lines.join('\n')}</code></pre></div>`;
+  };
 
   const inline = (value) => value
     .replace(/`([^`]+)`/g, '<code>$1</code>')
@@ -343,7 +1212,7 @@ function renderMarkdown(content) {
     if (fence) {
       closeParagraph(); closeList();
       if (code) {
-        output.push(`<pre><code${code.language ? ` class="language-${code.language}"` : ''}>${code.lines.join('\n')}</code></pre>`);
+        output.push(renderCodeBlock(code));
         code = null;
       } else {
         code = { language: fence[1], lines: [] };
@@ -388,28 +1257,54 @@ function renderMarkdown(content) {
     closeList();
     paragraph.push(line);
   }
-  if (code) output.push(`<pre><code${code.language ? ` class="language-${code.language}"` : ''}>${code.lines.join('\n')}</code></pre>`);
+  if (code) output.push(renderCodeBlock(code));
   closeParagraph(); closeList();
   return output.join('');
 }
 
 async function sendTask() {
+  if (state.taskUiRunning) {
+    await stopActiveTask();
+    return;
+  }
   const message = $('messageInput').value.trim();
   if (!message) return;
+  const nonContextUploads = state.uploads.filter((item) => item.context_status && item.context_status.extractable === false);
+  if (nonContextUploads.length) {
+    const names = nonContextUploads.map((item) => `- ${item.name || item.id}：${uploadContextStateLabel(item)}`).join('\n');
+    if (!confirm(`以下附件不会自动进入模型上下文：\n${names}\n\n仍然继续发送吗？`)) return;
+  }
   const expertMode = state.workbenchMode === 'expert';
   if (expertMode && !enabledWorkbenchTeams().length) {
     notify('还没有可用的专家团，请先在“专家团”中创建并启用团队', 'error');
     return;
   }
   const button = $('sendBtn');
-  setBusy(button, true, '处理中…');
+  state.taskUiRunning = true;
+  state.taskUiCancelRequested = false;
+  setSendButtonState('running');
   stopTaskStream();
+  clearTaskUiStatus();
   addMessage('user', message);
-  $('messageInput').value = '';
+  createAgentThinkingCard('__pending__', { historical: false, open: true });
+  setTaskUiStatus('__pending__', '正在提交任务…', 'thinking');
   $('timeline').innerHTML = '';
   state.currentExpertSelection = null;
   $('artifacts').innerHTML = '暂无产物';
   $('artifacts').classList.add('empty');
+  const selectedModel = state.models.find((m) => m.id === $('taskModelSelect').value);
+  if (selectedModel && (selectedModel.readiness?.state || 'ready') !== 'ready') {
+    // Keep the message in the composer so the user can correct the model and
+    // retry without retyping it.  The conversation still records the failed
+    // attempt and its human-readable reason.
+    finishSubmissionFailure(
+      `所选模型暂不可用（${selectedModel.readiness?.label || '需要配置'}）：${selectedModel.readiness?.detail || '请到模型设置检查配置。'}`,
+    );
+    switchTab('models');
+    selectModel(selectedModel.id);
+    return;
+  }
+  $('messageInput').value = '';
   try {
     const task = await api('/api/tasks', {
       method: 'POST',
@@ -418,7 +1313,7 @@ async function sendTask() {
         agent_id: $('agentSelect').value,
         model_id: $('taskModelSelect').value,
         conversation_id: state.conversationId,
-        workspace: 'default',
+        workspace: currentWorkspaceId(),
         organization_id: 'local-org',
         user_id: 'local-user',
         executor_type: expertMode ? 'team' : 'agent',
@@ -429,8 +1324,21 @@ async function sendTask() {
     state.uploads = [];
     renderUploads();
     state.currentTask = task;
+    state.taskUiTaskId = task.id;
+    bindAgentThinkingCard('__pending__', task.id);
+    if (state.taskUiStatusNode) {
+      state.taskUiStatusNode.dataset.taskStatus = String(task.id);
+      state.taskUiTaskId = task.id;
+    }
+    setTaskUiStatus(task.id, '正在理解任务并制定执行计划…', 'thinking');
     renderTaskMeta(task);
     if (task.expert_selection) {
+      updateAgentThinkingEvent(task.id, {
+        type: 'expert_selection',
+        title: '已选择参与专家',
+        content: task.expert_selection.reason || '',
+        data: task.expert_selection,
+      });
       renderExpertSelectionEvent({
         type: 'expert_selection',
         title: '已选择参与专家',
@@ -441,28 +1349,64 @@ async function sendTask() {
     watchTaskRuntime(task.id);
     startTaskStream(task.id);
   } catch (err) {
-    addMessage('agent', `发送失败：${err.message || err}`);
-    notify(`发送失败：${err.message || err}`, 'error');
-  } finally {
-    setBusy(button, false);
+    // The API can reject before a task id exists (for example when the
+    // selected model became unavailable after the page was loaded).  Keep the
+    // temporary “正在提交” status from trapping the send button in running
+    // mode, and distinguish this from a failure inside an existing task.
+    finishSubmissionFailure(err.message || err);
   }
 }
 
 function renderTaskMeta(task) {
+  const overview = $('taskOverviewSection');
+  const overviewStatus = $('taskOverviewStatus');
   $('taskMeta').classList.remove('empty');
   const model = state.models.find((m) => m.id === task.model_id);
   const expert = task.executor_type === 'team';
+  const needsClarification = taskNeedsClarification(task);
   const executor = expert
     ? state.expertTeams.find((team) => team.id === task.executor_id)?.name || task.executor_id || '自动匹配'
     : state.agents.find((agent) => agent.id === task.agent_id)?.name || task.agent_id;
-  $('taskMeta').innerHTML = `<strong>${escapeHtml(task.title || task.id)}</strong>\n状态：${escapeHtml(task.status)}\nID：${escapeHtml(task.id)}\n会话：${escapeHtml(task.conversation_id || state.conversationId)}\n模式：${expert ? '专家协作' : '普通任务'}\n${expert ? '专家团' : '智能体'}：${escapeHtml(executor)}\n模型：${escapeHtml(model?.name || task.model_id || '跟随智能体')}`;
+  const missing = taskMissingInputs(task);
+  const status = needsClarification ? '等待补充信息' : runtimeStatusLabel(task.status);
+  if (overviewStatus) overviewStatus.textContent = `${status} · ${task.title || task.id}`;
+  if (overview) overview.open = runtimeIsActive(task.status) || ['failed', 'cancelled', 'waiting_input', 'waiting_approval'].includes(task.status) || needsClarification;
+  $('taskMeta').innerHTML = `<strong>${escapeHtml(task.title || task.id)}</strong>\n状态：${escapeHtml(status)}${needsClarification && missing.length ? `\n还差：${escapeHtml(missing.join('、'))}` : ''}\nID：${escapeHtml(task.id)}\n会话：${escapeHtml(task.conversation_id || state.conversationId)}\n模式：${expert ? '专家协作' : '普通任务'}\n${expert ? '专家团' : '智能体'}：${escapeHtml(executor)}\n模型：${escapeHtml(model?.name || task.model_id || '跟随智能体')}`;
+}
+
+function taskMissingInputs(task) {
+  const values = task?.result?.missing_information || task?.result?.missing_inputs || [];
+  return runtimeArray(values).map((item) => {
+    if (item && typeof item === 'object') return friendlyInputLabel(item.label || item.key || item.name || '');
+    return friendlyInputLabel(item);
+  }).filter(Boolean);
+}
+
+function friendlyInputLabel(value) {
+  const key = String(value || '').trim();
+  const normalized = key.toLowerCase().replace(/[_./-]+/g, ' ').replace(/\s+/g, ' ').trim();
+  const labels = {
+    city: '城市或地区', location: '城市或地区', date: '日期', time: '时间',
+    topic: '主题', audience: '受众', source: '资料来源', format: '输出格式',
+    'product description': '产品描述', 'product details': '产品描述',
+    description: '描述', 'programming language': '编程语言',
+    'selected language': '编程语言', 'preferred language': '编程语言',
+    language: '编程语言', 'tech stack': '技术栈',
+  };
+  return labels[normalized] || key;
+}
+
+function taskNeedsClarification(task, runtime = null) {
+  return task?.result?.needs_clarification === true
+    || runtime?.active_goal?.status === 'needs_input'
+    || runtime?.trace_summary?.goal?.status === 'needs_input';
 }
 
 const runtimeStatusLabels = {
   pending: '等待中', queued: '已排队', running: '执行中', processing: '处理中',
   completed: '已完成', succeeded: '已完成', failed: '失败', cancelled: '已取消',
   cancel_requested: '取消中', paused: '已暂停', interrupted: '已中断',
-  waiting: '等待中', waiting_approval: '等待审批', restored: '已恢复', rejected: '已拒绝',
+  waiting: '等待中', waiting_input: '等待补充信息', waiting_approval: '等待审批', restored: '已恢复', rejected: '已拒绝',
 };
 
 const runtimeCommandLabels = {
@@ -505,18 +1449,246 @@ function runtimeIsActive(status) {
   return ['pending', 'queued', 'running', 'processing', 'cancel_requested', 'waiting', 'waiting_approval'].includes(status);
 }
 
+function taskUiGeneratingStatus(status) {
+  return ['pending', 'queued', 'running', 'processing', 'cancel_requested', 'waiting'].includes(String(status || ''));
+}
+
 function setRuntimeCount(id, count) {
   $(id).textContent = String(count);
 }
 
-function runtimeItem(title, status, detail = '', meta = '') {
+function runtimeItem(title, status, detail = '', meta = '', options = {}) {
+  const classes = ['runtime-item'];
+  if (options.active) classes.push('current');
+  if (options.child) classes.push('child-node');
   return `
-    <div class="runtime-item">
+    <div class="${classes.join(' ')}">
       <span class="runtime-dot ${escapeHtml(runtimeStatusClass(status))}"></span>
-      <div class="runtime-item-copy"><strong>${escapeHtml(title)}</strong>${detail ? `<small>${escapeHtml(detail)}</small>` : ''}</div>
+      <div class="runtime-item-copy"><strong>${escapeHtml(title)}${options.active ? '<span class="runtime-current-tag">当前</span>' : ''}</strong>${detail ? `<small>${escapeHtml(detail)}</small>` : ''}${options.capability ? `<span class="runtime-capability ${escapeHtml(runtimeStatusClass(options.capability.type))}">${escapeHtml(options.capability.label)}</span>` : ''}</div>
       <span class="runtime-item-meta">${escapeHtml(meta || runtimeStatusLabel(status))}</span>
     </div>
   `;
+}
+
+const verificationStateLabels = {
+  not_started: '尚未验收', pending: '正在验收', verifying: '正在验收',
+  verification_missing: '缺少验收记录', legacy_unverified: '历史任务未验收',
+  passed: '验收通过', failed: '验收未通过', inconclusive: '验收未得出结论',
+};
+
+function verificationStateLabel(stateValue) {
+  return verificationStateLabels[stateValue] || stateValue || '尚未验收';
+}
+
+function verificationStateClass(stateValue) {
+  const value = String(stateValue || 'not_started').toLowerCase();
+  if (value === 'passed') return 'passed';
+  if (value === 'failed') return 'failed';
+  if (['pending', 'verifying'].includes(value)) return 'pending';
+  if (['verification_missing', 'legacy_unverified', 'inconclusive'].includes(value)) return 'warning';
+  return 'idle';
+}
+
+function publicVerificationReport(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const report = value.public_report || value.report || value;
+  return report && typeof report === 'object' && !Array.isArray(report) ? report : null;
+}
+
+function verificationSummaryMarkup(reportValue, stateValue = '', { compact = false } = {}) {
+  const report = publicVerificationReport(reportValue) || {};
+  const rules = runtimeArray(report.rules);
+  const passedRules = rules.filter((item) => item?.status === 'passed').length;
+  const failedRules = rules.filter((item) => item?.status === 'failed').length;
+  const semantic = report.semantic && typeof report.semantic === 'object' ? report.semantic : {};
+  const semanticLabels = { passed: '语义复核通过', failed: '语义复核未通过', skipped: '未执行语义复核', error: '语义复核异常' };
+  const coverageLabels = { rules_only: '规则校验', rules_and_semantic: '规则 + 语义复核' };
+  const repairs = runtimeArray(report.repair_instructions).filter((item) => typeof item === 'string' && item.trim()).slice(0, 3);
+  const inferredState = stateValue || (report.passed === true ? 'passed' : report.passed === false ? 'failed' : 'not_started');
+  const reason = report.public_reason || '';
+  return `
+    <div class="verification-summary ${escapeHtml(verificationStateClass(inferredState))} ${compact ? 'compact' : ''}">
+      <div class="verification-summary-head">
+        <strong>${escapeHtml(verificationStateLabel(inferredState))}</strong>
+        ${report.coverage ? `<span>${escapeHtml(coverageLabels[report.coverage] || report.coverage)}</span>` : ''}
+      </div>
+      ${reason ? `<p>${escapeHtml(reason)}</p>` : ''}
+      ${(rules.length || semantic.status) ? `<div class="verification-facts">
+        ${rules.length ? `<span>规则 ${passedRules}/${rules.length} 通过${failedRules ? ` · ${failedRules} 项未通过` : ''}</span>` : ''}
+        ${semantic.status ? `<span>${escapeHtml(semanticLabels[semantic.status] || semantic.status)}</span>` : ''}
+      </div>` : ''}
+      ${repairs.length ? `<div class="verification-repairs"><strong>建议修复</strong>${repairs.map((item) => `<span>${escapeHtml(item)}</span>`).join('')}</div>` : ''}
+    </div>`;
+}
+
+function renderRuntimeAssurance(runtime) {
+  const box = $('runtimeAssurance');
+  if (!box) return;
+  const goal = runtime?.active_goal && typeof runtime.active_goal === 'object' ? runtime.active_goal : null;
+  const verification = runtime?.verification && typeof runtime.verification === 'object' ? runtime.verification : null;
+  const trace = runtime?.trace_summary && typeof runtime.trace_summary === 'object' ? runtime.trace_summary : null;
+  if (!goal && !verification && !trace) {
+    box.classList.add('hidden');
+    box.innerHTML = '';
+    return;
+  }
+  const summary = goal?.summary && typeof goal.summary === 'object' ? goal.summary : {};
+  const objective = summary.objective?.statement || summary.objective || goal?.objective || '目标合同已建立';
+  const deliverables = runtimeArray(summary.deliverables);
+  const skills = runtimeArray(summary.capabilities?.skills);
+  const tools = runtimeArray(summary.capabilities?.tools);
+  const goalStatus = goal?.status || summary.status || '';
+  const goalStatusLabels = { draft: '草拟中', needs_input: '待补充信息', confirmed: '已确认', superseded: '已更新' };
+  const needsInput = taskNeedsClarification(state.currentTask, runtime) || goalStatus === 'needs_input';
+  const missingInputs = runtimeArray(summary.missing_inputs).map((item) => {
+    if (item && typeof item === 'object') return friendlyInputLabel(item.label || item.key || item.name || '');
+    return friendlyInputLabel(item);
+  }).filter(Boolean);
+  const verificationState = verification?.state || verification?.status || 'not_started';
+  const nodeCounts = trace?.node_status_counts && typeof trace.node_status_counts === 'object' ? trace.node_status_counts : {};
+  const capabilities = runtimeArray(trace?.capabilities);
+  const artifacts = trace?.artifacts && typeof trace.artifacts === 'object' ? trace.artifacts : {};
+  const knowledge = trace?.knowledge && typeof trace.knowledge === 'object' ? trace.knowledge : {};
+  const artifactItems = runtimeArray(artifacts.items).filter((item) => item && item.download_url).slice(0, 4);
+  const current = trace?.current_node && typeof trace.current_node === 'object' ? trace.current_node : null;
+  const capabilityPreview = capabilities.slice(0, 5);
+  const nodeFacts = Object.entries(nodeCounts).filter(([, count]) => Number(count) > 0).map(([key, count]) => `${runtimeStatusLabel(key)} ${count}`);
+  const knowledgeDocs = runtimeArray(knowledge.documents).slice(0, 3);
+  box.innerHTML = `
+    ${goal ? `<div class="runtime-contract-card">
+      <div class="runtime-contract-head"><strong>${needsInput ? '需要补充信息' : '任务要求'}</strong><span>${escapeHtml(goalStatusLabels[goalStatus] || goalStatus || '已建立')}</span></div>
+      <p>${escapeHtml(objective)}</p>
+      ${needsInput && missingInputs.length ? `<small>还差：${escapeHtml(missingInputs.join('、'))}</small>` : `<small>${deliverables.length} 项交付物 · ${skills.length} 个技能 · ${tools.length} 个工具</small>`}
+    </div>` : ''}
+    ${verification && !needsInput ? verificationSummaryMarkup(verification.public_report, verificationState, { compact: true }) : ''}`;
+  if (trace && !needsInput) {
+    box.innerHTML += `<div class="runtime-trace-card">
+      <div class="runtime-trace-head"><strong>执行证据</strong><span>${escapeHtml(runtimeStatusLabel(trace.active_run_status || trace.task_status || 'unknown'))}</span></div>
+      <div class="runtime-trace-grid">
+        <div><span>当前节点</span><strong>${escapeHtml(current?.title || current?.id || '暂无活动节点')}</strong></div>
+        <div><span>运行尝试</span><strong>${Number(trace.attempts || 0)}</strong></div>
+        <div><span>产物交付</span><strong>${Number(artifacts.published || 0)}/${Number(artifacts.total || 0)}</strong></div>
+        <div><span>验收状态</span><strong>${escapeHtml(verificationStateLabel(trace.verification_state || verificationState))}</strong></div>
+        <div><span>知识引用</span><strong>${Number(knowledge.match_count || 0)}</strong></div>
+      </div>
+      ${nodeFacts.length ? `<div class="runtime-trace-tags">${nodeFacts.map((item) => `<span>${escapeHtml(item)}</span>`).join('')}</div>` : ''}
+      ${capabilityPreview.length ? `<div class="runtime-trace-capabilities">${capabilityPreview.map((item) => `<span class="${escapeHtml(runtimeStatusClass(item.type))}">${escapeHtml(runtimeNodeKindLabel(item.type))} · ${escapeHtml(item.id || item.label || '')}</span>`).join('')}${capabilities.length > capabilityPreview.length ? `<small>+${capabilities.length - capabilityPreview.length}</small>` : ''}</div>` : '<p>本次运行尚未记录 Skill/MCP/模型等子能力。</p>'}
+      ${knowledgeDocs.length ? `<div class="runtime-trace-knowledge">${knowledgeDocs.map((item) => `<span>${escapeHtml(item.document_name || item.document_id || '知识文档')} · ${Number(item.match_count || 0)} 片段</span>`).join('')}</div>` : ''}
+      ${artifactItems.length ? `<div class="runtime-trace-artifacts">${artifactItems.map((item) => {
+        const downloadUrl = safeArtifactDownloadUrl(item.download_url);
+        return `<a href="${escapeHtml(downloadUrl)}" download><span>${escapeHtml(item.name || item.id || '文件')}</span><small>${escapeHtml(String(item.kind || '').toUpperCase() || 'FILE')}</small></a>`;
+      }).join('')}</div>` : ''}
+      ${Array.isArray(artifacts.formats) && artifacts.formats.length ? `<p>文件格式：${escapeHtml(artifacts.formats.join('、'))}</p>` : ''}
+    </div>`;
+  }
+  box.classList.remove('hidden');
+}
+
+function normalizeRuntimeNode(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const wrapped = value.node && typeof value.node === 'object' && !Array.isArray(value.node) ? value.node : value;
+  const childSource = value.children ?? wrapped.children;
+  return {
+    ...wrapped,
+    children: runtimeArray(childSource).map(normalizeRuntimeNode).filter(Boolean),
+  };
+}
+
+function buildRuntimeNodeTree(runtime) {
+  const projection = runtime?.node_tree;
+  let projectedRoots = [];
+  if (Array.isArray(projection)) projectedRoots = projection;
+  else if (projection && typeof projection === 'object') {
+    if (Array.isArray(projection.roots)) projectedRoots = projection.roots;
+    else if (Array.isArray(projection.nodes)) projectedRoots = projection.nodes;
+    else projectedRoots = [projection];
+  }
+  if (projectedRoots.length) return projectedRoots.map(normalizeRuntimeNode).filter(Boolean);
+
+  const flat = runtimeArray(runtime?.nodes).map(normalizeRuntimeNode).filter(Boolean);
+  const byKey = new Map();
+  flat.forEach((node, index) => {
+    const id = node.id || node.node_id || node.node_key || `node-${index}`;
+    byKey.set(`${node.run_id || ''}:${id}`, { ...node, children: [] });
+  });
+  const roots = [];
+  byKey.forEach((node) => {
+    const parentId = node.parent_node_id || node.parent_id;
+    const parent = parentId ? byKey.get(`${node.run_id || ''}:${parentId}`) : null;
+    if (parent && parent !== node) parent.children.push(node);
+    else roots.push(node);
+  });
+  return roots;
+}
+
+function runtimeNodeCount(nodes) {
+  return nodes.reduce((count, node) => count + 1 + runtimeNodeCount(runtimeArray(node.children)), 0);
+}
+
+function runtimeNodeCopy(node, index = 0) {
+  const name = node.title || node.name || node.node_id || node.node_key || node.id || `节点 ${index + 1}`;
+  const kind = node.kind || node.type || '执行节点';
+  const attemptText = node.attempt || node.run_number ? `第 ${node.attempt || node.run_number} 次 · ` : '';
+  const summary = node.error_summary || node.status_message || node.output_summary || '';
+  const detail = summary || `${attemptText}${kind}`;
+  const timeText = node.finished_at || node.started_at ? runtimeTime(node.finished_at || node.started_at) : '';
+  const capability = node.capability && typeof node.capability === 'object'
+    ? { type: node.capability.type || kind, label: `${runtimeNodeKindLabel(node.capability.type || kind)} · ${node.capability.id || node.capability.label || name}` }
+    : null;
+  return { name, detail, meta: timeText || runtimeStatusLabel(node.status), status: node.status || 'pending', capability };
+}
+
+function runtimeNodeKindLabel(kind) {
+  return { phase: '阶段', skill: 'Skill', mcp: 'MCP', tool: '工具', model: '模型', agent: '专家', knowledge: '知识库', memory: '上下文' }[String(kind || '').toLowerCase()] || '节点';
+}
+
+function runtimeNodeContains(node, nodeId) {
+  if (!nodeId) return false;
+  if (String(node.id || node.node_id || '') === String(nodeId)) return true;
+  return runtimeArray(node.children).some((child) => runtimeNodeContains(child, nodeId));
+}
+
+function renderRuntimeNodeTree(nodes, currentNodeId = '') {
+  return nodes.map((node, index) => {
+    const copy = runtimeNodeCopy(node, index);
+    const children = runtimeArray(node.children);
+    return `<div class="runtime-tree-root">
+      ${runtimeItem(copy.name, copy.status, copy.detail, copy.meta, { active: String(node.id || '') === String(currentNodeId), capability: copy.capability })}
+      ${children.length ? `<div class="runtime-tree-children">${children.map((child, childIndex) => {
+        const childCopy = runtimeNodeCopy(child, childIndex);
+        const nestedCount = runtimeNodeCount(runtimeArray(child.children));
+        const detail = `${childCopy.detail}${nestedCount ? ` · 另含 ${nestedCount} 个明细` : ''}`;
+        return runtimeItem(childCopy.name, childCopy.status, detail, childCopy.meta, { active: String(child.id || '') === String(currentNodeId), child: true, capability: childCopy.capability });
+      }).join('')}</div>` : ''}
+    </div>`;
+  }).join('');
+}
+
+function runtimeCapabilityCallDetail(call) {
+  const parts = [
+    call.status_message,
+    call.output_summary,
+    call.error_summary,
+  ].filter((item) => String(item || '').trim());
+  return parts[0] || `${runtimeNodeKindLabel(call.type)} 调用记录`;
+}
+
+function renderRuntimeCapabilityCalls(runtime) {
+  const trace = runtime?.trace_summary && typeof runtime.trace_summary === 'object' ? runtime.trace_summary : {};
+  const calls = runtimeArray(trace.capability_calls);
+  setRuntimeCount('runtimeCapabilityCallCount', calls.length);
+  const box = $('runtimeCapabilityCalls');
+  if (!box) return;
+  box.innerHTML = calls.length ? calls.map((call, index) => {
+    const title = call.label || call.title || call.id || `调用 ${index + 1}`;
+    const kind = runtimeNodeKindLabel(call.type);
+    const detail = `${kind} · ${call.id || '未记录标识'} · ${runtimeCapabilityCallDetail(call)}`;
+    const meta = call.finished_at || call.started_at ? runtimeTime(call.finished_at || call.started_at) : runtimeStatusLabel(call.status);
+    return runtimeItem(title, call.status || 'pending', detail, meta, {
+      active: String(call.node_id || '') === String(runtime?.current_node?.id || ''),
+      capability: { type: call.type || 'tool', label: `${kind} · ${call.id || title}` },
+    });
+  }).join('') : '<div class="runtime-empty">暂无 Skill/MCP/工具调用记录</div>';
 }
 
 function resetTaskRuntime() {
@@ -525,30 +1697,56 @@ function resetTaskRuntime() {
   state.runtimeTaskId = null;
   state.taskRuntime = null;
   $('taskRuntime').classList.add('empty');
+  $('taskRuntime').classList.remove('compact-task');
+  ['runtimeRunsSection', 'runtimeNodesSection', 'runtimeCapabilitySection'].forEach((id) => { if ($(id)) $(id).open = false; });
   $('runtimeSummary').innerHTML = '<div><strong>尚未选择任务</strong><span>创建或打开任务后，可在这里控制运行并恢复现场。</span></div><span id="runtimeLiveStatus" class="runtime-live-status idle">未运行</span>';
+  renderRuntimeAssurance(null);
   ['cancelTaskBtn', 'retryTaskBtn', 'resumeTaskBtn', 'runtimeMessageBtn'].forEach((id) => { $(id).disabled = true; });
   $('runtimeMessage').disabled = true;
   $('runtimeMessage').value = '';
-  [['runtimeRuns', '暂无运行记录'], ['runtimeNodes', '暂无节点记录'], ['runtimeCommands', '暂无排队指令'], ['runtimeCheckpoints', '暂无可恢复检查点']].forEach(([id, label]) => {
+  [['runtimeRuns', '暂无运行记录'], ['runtimeNodes', '暂无节点记录'], ['runtimeCapabilityCalls', '暂无 Skill/MCP/工具调用记录'], ['runtimeCommands', '暂无排队指令'], ['runtimeCheckpoints', '暂无可恢复检查点']].forEach(([id, label]) => {
     $(id).innerHTML = `<div class="runtime-empty">${label}</div>`;
   });
-  ['runtimeRunCount', 'runtimeNodeCount', 'runtimeCommandCount', 'runtimeCheckpointCount'].forEach((id) => setRuntimeCount(id, 0));
+  ['runtimeRunCount', 'runtimeNodeCount', 'runtimeCapabilityCallCount', 'runtimeCommandCount', 'runtimeCheckpointCount'].forEach((id) => setRuntimeCount(id, 0));
+  if ($('runtimeInspectorStatus')) $('runtimeInspectorStatus').textContent = '未运行';
 }
 
 function renderTaskRuntime(runtime) {
   if (!state.currentTask) return resetTaskRuntime();
   state.taskRuntime = runtime || {};
   const runs = runtimeArray(runtime?.runs);
-  const nodes = runtimeArray(runtime?.nodes);
+  const nodeTree = buildRuntimeNodeTree(runtime);
+  const nodeCount = runtimeNodeCount(nodeTree);
   const checkpoints = runtimeArray(runtime?.checkpoints);
   const commands = runtimeArray(runtime?.commands);
   const active = runtimeActiveRun(runtime);
-  const status = active?.status || state.currentTask.status || 'pending';
+  const currentNode = runtime?.current_node && typeof runtime.current_node === 'object' ? runtime.current_node : null;
+  const currentNodeId = currentNode?.id || active?.current_node_id || '';
+  const rawStatus = active?.status || state.currentTask.status || 'pending';
+  const status = taskNeedsClarification(state.currentTask, runtime) && ['completed', 'succeeded'].includes(rawStatus)
+    ? 'waiting_input'
+    : rawStatus;
   const attempt = active?.attempt ?? active?.run_number ?? active?.number;
   const summaryTitle = active ? `${attempt ? `第 ${attempt} 次运行 · ` : ''}${runtimeStatusLabel(status)}` : `任务${runtimeStatusLabel(status)}`;
-  const summaryDetail = `${runs.length} 次尝试 · ${nodes.length} 个节点 · ${checkpoints.length} 个检查点`;
+  const currentLabel = currentNode ? ` · 当前：${currentNode.title || currentNode.node_key || currentNode.id}` : '';
+  const summaryDetail = `${runs.length} 次尝试 · ${nodeCount} 个节点 · ${checkpoints.length} 个检查点${currentLabel}`;
   $('taskRuntime').classList.remove('empty');
+  const compactClarification = taskNeedsClarification(state.currentTask, runtime)
+    && nodeCount <= 1
+    && !runtimeArray(runtime?.capability_calls).length
+    && !runtimeArray(runtime?.trace_summary?.capabilities).length
+    && !runtimeArray(runtime?.trace_summary?.artifacts?.items).length;
+  $('taskRuntime').classList.toggle('compact-task', compactClarification);
   $('runtimeSummary').innerHTML = `<div><strong>${escapeHtml(summaryTitle)}</strong><span>${escapeHtml(summaryDetail)}</span></div><span id="runtimeLiveStatus" class="runtime-live-status ${escapeHtml(runtimeStatusClass(status))}">${escapeHtml(runtimeStatusLabel(status))}</span>`;
+  if ($('runtimeInspectorStatus')) $('runtimeInspectorStatus').textContent = `${runtimeStatusLabel(status)} · ${nodeCount} 个节点`;
+  if (runtimeIsActive(status) || ['failed', 'cancelled', 'waiting_input', 'waiting_approval'].includes(status)) {
+    const runtimeSection = $('runtimeInspectorSection');
+    if (runtimeSection) runtimeSection.open = true;
+    if (runtimeIsActive(status) || status === 'failed') {
+      ['runtimeNodesSection', 'runtimeCapabilitySection'].forEach((id) => { if ($(id)) $(id).open = true; });
+    }
+  }
+  renderRuntimeAssurance(runtime);
 
   $('cancelTaskBtn').disabled = !runtimeIsActive(status);
   $('retryTaskBtn').disabled = runtimeIsActive(status) || (!runs.length && !['failed', 'cancelled', 'interrupted', 'completed', 'succeeded'].includes(status));
@@ -563,14 +1761,11 @@ function renderTaskRuntime(runtime) {
     return runtimeItem(`第 ${number} 次运行`, run.status, times, runtimeStatusLabel(run.status));
   }).join('') : '<div class="runtime-empty">暂无运行记录</div>';
 
-  setRuntimeCount('runtimeNodeCount', nodes.length);
-  $('runtimeNodes').innerHTML = nodes.length ? nodes.map((node, index) => {
-    const name = node.title || node.name || node.node_id || node.id || `节点 ${index + 1}`;
-    const kind = node.kind || node.type || '执行节点';
-    const attemptText = node.attempt || node.run_number ? `第 ${node.attempt || node.run_number} 次 · ` : '';
-    const timeText = node.finished_at || node.started_at ? runtimeTime(node.finished_at || node.started_at) : '';
-    return runtimeItem(name, node.status, `${attemptText}${kind}`, timeText || runtimeStatusLabel(node.status));
-  }).join('') : '<div class="runtime-empty">暂无节点记录</div>';
+  setRuntimeCount('runtimeNodeCount', nodeCount);
+  const currentCopy = currentNode ? runtimeNodeCopy(currentNode) : null;
+  const currentMarkup = currentCopy ? `<div class="runtime-current-activity"><span>正在执行</span><strong>${escapeHtml(currentCopy.name)}</strong><small>${escapeHtml(currentCopy.detail)}</small></div>` : '';
+  $('runtimeNodes').innerHTML = nodeTree.length ? `${currentMarkup}${renderRuntimeNodeTree(nodeTree, currentNodeId)}` : '<div class="runtime-empty">暂无节点记录</div>';
+  renderRuntimeCapabilityCalls(runtime);
 
   setRuntimeCount('runtimeCommandCount', commands.length);
   $('runtimeCommands').innerHTML = commands.length ? commands.map((command) => {
@@ -597,25 +1792,32 @@ function renderTaskRuntime(runtime) {
 function renderRuntimeUnavailable(message) {
   if (!state.currentTask) return;
   $('taskRuntime').classList.remove('empty');
+  $('taskRuntime').classList.remove('compact-task');
   $('runtimeSummary').innerHTML = `<div><strong>运行信息暂不可用</strong><span>${escapeHtml(message || '请稍后刷新任务')}</span></div><span id="runtimeLiveStatus" class="runtime-live-status unknown">未连接</span>`;
+  if ($('runtimeInspectorStatus')) $('runtimeInspectorStatus').textContent = '读取失败 · 点击追踪';
+  if ($('runtimeInspectorSection')) $('runtimeInspectorSection').open = true;
+  renderRuntimeAssurance(null);
   ['cancelTaskBtn', 'retryTaskBtn', 'resumeTaskBtn', 'runtimeMessageBtn'].forEach((id) => { $(id).disabled = true; });
   $('runtimeMessage').disabled = true;
-  [['runtimeRuns', '暂无运行记录'], ['runtimeNodes', '暂无节点记录'], ['runtimeCommands', '暂无排队指令'], ['runtimeCheckpoints', '暂无可恢复检查点']].forEach(([id, label]) => {
+  [['runtimeRuns', '暂无运行记录'], ['runtimeNodes', '暂无节点记录'], ['runtimeCapabilityCalls', '暂无 Skill/MCP/工具调用记录'], ['runtimeCommands', '暂无排队指令'], ['runtimeCheckpoints', '暂无可恢复检查点']].forEach(([id, label]) => {
     $(id).innerHTML = `<div class="runtime-empty">${label}</div>`;
   });
-  ['runtimeRunCount', 'runtimeNodeCount', 'runtimeCommandCount', 'runtimeCheckpointCount'].forEach((id) => setRuntimeCount(id, 0));
+  ['runtimeRunCount', 'runtimeNodeCount', 'runtimeCapabilityCallCount', 'runtimeCommandCount', 'runtimeCheckpointCount'].forEach((id) => setRuntimeCount(id, 0));
 }
 
 function renderRuntimeLoading() {
   $('taskRuntime').classList.remove('empty');
   $('runtimeSummary').innerHTML = '<div><strong>正在读取运行现场</strong><span>同步运行尝试、节点、指令和检查点…</span></div><span id="runtimeLiveStatus" class="runtime-live-status running">同步中</span>';
+  if ($('runtimeInspectorStatus')) $('runtimeInspectorStatus').textContent = '同步中';
+  if ($('runtimeInspectorSection')) $('runtimeInspectorSection').open = true;
+  renderRuntimeAssurance(null);
   ['cancelTaskBtn', 'retryTaskBtn', 'resumeTaskBtn', 'runtimeMessageBtn'].forEach((id) => { $(id).disabled = true; });
   $('runtimeMessage').disabled = true;
   $('runtimeMessage').value = '';
-  [['runtimeRuns', '正在读取运行记录'], ['runtimeNodes', '正在读取节点状态'], ['runtimeCommands', '正在读取指令队列'], ['runtimeCheckpoints', '正在读取检查点']].forEach(([id, label]) => {
+  [['runtimeRuns', '正在读取运行记录'], ['runtimeNodes', '正在读取节点状态'], ['runtimeCapabilityCalls', '正在读取调用明细'], ['runtimeCommands', '正在读取指令队列'], ['runtimeCheckpoints', '正在读取检查点']].forEach(([id, label]) => {
     $(id).innerHTML = `<div class="runtime-empty">${label}</div>`;
   });
-  ['runtimeRunCount', 'runtimeNodeCount', 'runtimeCommandCount', 'runtimeCheckpointCount'].forEach((id) => setRuntimeCount(id, 0));
+  ['runtimeRunCount', 'runtimeNodeCount', 'runtimeCapabilityCallCount', 'runtimeCommandCount', 'runtimeCheckpointCount'].forEach((id) => setRuntimeCount(id, 0));
 }
 
 function scheduleTaskRuntimeRefresh(taskId, delay = 1400) {
@@ -726,6 +1928,31 @@ function taskEventId(event, payload) {
   return Number.isSafeInteger(value) && value > 0 ? value : 0;
 }
 
+function updateTaskUiFromEvent(taskId, payload = {}) {
+  if (!taskId || state.currentTask?.id !== taskId || !state.taskUiRunning) return;
+  const type = String(payload.type || '').toLowerCase();
+  const statusMap = {
+    start: ['正在理解任务…', 'thinking'], intent: ['正在理解你的目标…', 'thinking'],
+    plan: ['正在制定执行计划…', 'thinking'], plan_progress: ['正在执行计划…', 'thinking'],
+    skill: ['正在匹配技能…', 'thinking'], model: ['正在调用模型…', 'thinking'],
+    knowledge: ['正在检索相关资料…', 'thinking'], tool_call: ['正在调用工具…', 'thinking'],
+    tool_result: ['工具已返回，正在整理结果…', 'thinking'], progress: ['正在执行任务…', 'thinking'],
+    plan_check: ['正在校验调用参数…', 'thinking'], output_check: ['正在检查输出质量…', 'verifying'],
+    verification_started: ['正在验收生成结果…', 'verifying'], verification_result: ['正在发布验收通过的结果…', 'verifying'],
+    answer_delta: ['正在输出结果…', 'outputting'], answer: ['正在完成最终答复…', 'outputting'],
+    approval_required: ['等待你的确认…', 'verifying'], clarification: ['等待你补充信息…', 'verifying'],
+    error: ['任务执行失败', 'error'], cancelled: ['任务已停止', 'done'], done: ['已完成', 'done'],
+  };
+  const next = statusMap[type];
+  if (next) setTaskUiStatus(taskId, next[0], next[1]);
+  if (['approval_required', 'clarification'].includes(type)) {
+    state.taskUiRunning = false;
+    state.taskUiCancelRequested = false;
+    setSendButtonState('idle');
+  }
+  if (['done', 'error', 'cancelled'].includes(type)) finishTaskUi(taskId, type === 'done' ? 'completed' : type);
+}
+
 function handleTaskStreamEvent(taskId, event) {
   let payload;
   try {
@@ -739,16 +1966,25 @@ function handleTaskStreamEvent(taskId, event) {
     state.streamCursor = eventId;
     state.seenEventIds.add(eventId);
   }
+  updateAgentThinkingEvent(taskId, payload);
+  updateTaskUiFromEvent(taskId, payload);
   if (privateTaskEventTypes.has(String(payload.type || '').toLowerCase())) return;
   scheduleTaskRuntimeRefresh(taskId, 280);
-  if (!['answer_delta', 'approval_required'].includes(payload.type)) appendEvent(payload);
+  if (!['answer_delta', 'answer_reset', 'approval_required'].includes(payload.type)) appendEvent(payload);
   if (payload.type === 'start' && state.currentTask?.id === taskId) {
     state.currentTask.status = 'running';
     renderTaskMeta(state.currentTask);
   }
   if (payload.type === 'answer_reset') resetStreamedAnswer(taskId);
   if (payload.type === 'answer_delta') appendAnswerDelta(taskId, payload.content || '');
-  if (['answer', 'error'].includes(payload.type)) finalizeStreamedAnswer(taskId, payload);
+  if (payload.type === 'clarification') publishClarification(taskId, payload);
+  if (payload.type === 'verification_started') markDraftVerificationStarted(taskId);
+  if (payload.type === 'verification_result') markDraftVerificationResult(taskId, payload);
+  if (payload.type === 'answer') publishStreamedAnswer(taskId, payload);
+  if (payload.type === 'error') {
+    markDraftFailed(taskId, payload);
+    publishTaskError(taskId, payload);
+  }
   if (payload.type === 'approval_required') renderApproval(taskId, payload);
   if (payload.type === 'install') {
     loadSkillsOnly().catch((err) => notify(`技能列表刷新失败：${err.message || err}`, 'error'));
@@ -776,6 +2012,9 @@ function connectTaskStream(taskId, generation) {
     if (state.currentTask?.id === taskId && payload.status) {
       state.currentTask.status = payload.status;
       renderTaskMeta(state.currentTask);
+    }
+    if (payload.status && ['completed', 'failed', 'cancelled', 'waiting_approval'].includes(payload.status)) {
+      finishTaskUi(taskId, payload.status);
     }
     source.close();
     if (state.eventSource === source) state.eventSource = null;
@@ -819,35 +2058,146 @@ window.addEventListener('beforeunload', () => stopTaskStream());
 
 function resetStreamedAnswer(taskId) {
   const streamed = $('conversation').querySelector(`[data-stream-task="${taskId}"]`);
-  if (!streamed) return;
-  streamed.dataset.rawContent = '';
-  streamed.innerHTML = '<div class="stream-meta"><span></span>已应用追加指令，正在重新生成</div><div class="stream-body"></div>';
+  if (streamed) streamed.remove();
 }
 
 function appendAnswerDelta(taskId, content) {
   let message = $('conversation').querySelector(`[data-stream-task="${taskId}"]`);
   if (!message) {
     message = document.createElement('div');
-    message.className = 'message agent streaming';
+    message.className = 'message agent streaming draft-answer';
     message.dataset.streamTask = taskId;
+    message.dataset.deliveryState = 'draft_unverified';
     message.dataset.rawContent = '';
     $('conversation').appendChild(message);
   }
   message.dataset.rawContent = (message.dataset.rawContent || '') + content;
+  message.dataset.deliveryState = 'draft_unverified';
+  message.classList.add('streaming', 'draft-answer');
+  message.classList.remove('verifying', 'draft-failed');
   const count = message.dataset.rawContent.length;
-  message.innerHTML = `<div class="stream-meta"><span></span>正在实时输出 · ${count} 字</div><div class="stream-body">${renderMarkdown(message.dataset.rawContent)}</div>`;
+  message.innerHTML = `<div class="stream-meta"><span></span><strong>草稿 · 待验收</strong><small>实时生成 · ${count} 字</small></div><div class="stream-body">${renderMarkdown(stripInternalAnswerMarkers(message.dataset.rawContent))}</div>`;
   $('conversation').scrollTop = $('conversation').scrollHeight;
 }
 
-function finalizeStreamedAnswer(taskId, payload) {
+function markDraftVerificationStarted(taskId) {
+  const streamed = $('conversation').querySelector(`[data-stream-task="${taskId}"]`);
+  if (!streamed) return;
+  streamed.dataset.deliveryState = 'verifying';
+  streamed.classList.remove('streaming', 'draft-failed');
+  streamed.classList.add('draft-answer', 'verifying');
+  const meta = streamed.querySelector('.stream-meta');
+  if (meta) meta.innerHTML = '<span></span><strong>正在验收</strong><small>通过后才会正式发布</small>';
+}
+
+function markDraftVerificationResult(taskId, payload) {
+  const streamed = $('conversation').querySelector(`[data-stream-task="${taskId}"]`);
+  if (!streamed) return;
+  const report = publicVerificationReport(payload?.data?.report || payload?.data?.public_report);
+  const passed = report?.passed === true || payload?.data?.delivery_state === 'verified';
+  streamed.dataset.deliveryState = passed ? 'verified_pending_publish' : 'rejected';
+  streamed.classList.remove('streaming', 'verifying');
+  streamed.classList.toggle('draft-failed', !passed);
+  const meta = streamed.querySelector('.stream-meta');
+  if (meta) {
+    meta.innerHTML = passed
+      ? '<span></span><strong>验收通过</strong><small>等待正式发布</small>'
+      : '<span></span><strong>验收未通过</strong><small>此草稿不会发布</small>';
+  }
+}
+
+function markDraftFailed(taskId) {
+  const streamed = $('conversation').querySelector(`[data-stream-task="${taskId}"]`);
+  if (!streamed) return;
+  streamed.dataset.deliveryState = 'error_unpublished';
+  streamed.classList.remove('streaming', 'verifying');
+  streamed.classList.add('draft-answer', 'draft-failed');
+  const meta = streamed.querySelector('.stream-meta');
+  if (meta) meta.innerHTML = '<span></span><strong>任务失败</strong><small>草稿未发布</small>';
+}
+
+function publishClarification(taskId, payload = {}) {
+  const id = String(payload.id || '');
+  const taskKey = String(taskId || '');
+  const content = localizeMissingInformationText(payload.content || payload.title || '请补充完成任务所需的信息。');
+  const existing = [...$('conversation').querySelectorAll('[data-clarification-task]')]
+    .find((item) => item.dataset.clarificationTask === taskKey);
+  if (existing) {
+    if (id) existing.dataset.eventId = id;
+    return;
+  }
+  // The backend may keep an answer event for auditability even when the task
+  // ended in needs-input. Replace that answer in the conversation so the
+  // clarification prompt appears only once.
+  [...$('conversation').querySelectorAll('[data-task-message]')]
+    .filter((item) => item.dataset.taskMessage === taskKey)
+    .forEach((item) => item.remove());
+  [...$('conversation').querySelectorAll('[data-stream-task]')]
+    .filter((item) => item.dataset.streamTask === taskKey)
+    .forEach((item) => item.remove());
+  const message = document.createElement('div');
+  message.className = 'message agent clarification-message';
+  message.dataset.clarificationTask = taskKey;
+  if (id) message.dataset.eventId = id;
+  message.innerHTML = `<div class="clarification-meta"><span>?</span><strong>需要补充信息</strong><small>补充后会继续当前任务</small></div><div class="clarification-body">${renderMarkdown(content)}</div>`;
+  $('conversation').appendChild(message);
+  $('conversation').scrollTop = $('conversation').scrollHeight;
+}
+
+function localizeMissingInformationText(value) {
+  return String(value || '')
+    .replace(/product\s+description/gi, '产品描述')
+    .replace(/programming\s+language/gi, '编程语言')
+    .replace(/selected\s+language/gi, '编程语言')
+    .replace(/preferred\s+language/gi, '编程语言');
+}
+
+function looksLikeClarificationResponse(value) {
+  const text = String(value || '').trim();
+  return /^(?:在安排专家协作前，)?(?:还需要你补充|还差一个信息|请补充)/.test(text)
+    && /(产品描述|编程语言|product\s+description|programming\s+language|selected\s+language|preferred\s+language|必要信息|信息)/i.test(text);
+}
+
+function publishTaskError(taskId, payload = {}) {
+  const taskKey = String(taskId || '');
+  const existing = [...$('conversation').querySelectorAll('[data-task-error]')]
+    .find((item) => item.dataset.taskError === taskKey);
+  if (existing) {
+    if (payload.content) renderMessageContent(existing.querySelector('.error-body') || existing, payload.content);
+    return;
+  }
+  const message = document.createElement('div');
+  message.className = 'message agent task-error-message';
+  message.dataset.taskError = taskKey;
+  if (payload.id) message.dataset.eventId = String(payload.id);
+  const pptxSetup = payload.data?.error_code === 'artifact_pptx_unavailable' || payload.error_code === 'artifact_pptx_unavailable';
+  message.innerHTML = `<div class="error-meta"><span>!</span><strong>${escapeHtml(payload.title || '任务未完成')}</strong><small>可以检查配置后重试</small></div><div class="error-body">${renderMarkdown(payload.content || '任务执行未完成，请检查模型、参数或工具配置后重试。')}</div>${pptxSetup ? '<button class="text-button capability-action" data-open-pptx-config type="button">打开完整 PPTX 配置向导</button>' : ''}`;
+  $('conversation').appendChild(message);
+  if ($('taskOverviewSection')) $('taskOverviewSection').open = true;
+  if ($('runtimeInspectorSection')) $('runtimeInspectorSection').open = true;
+  if ($('timelineSection')) $('timelineSection').open = true;
+  if ($('timelineStatus')) $('timelineStatus').textContent = '执行失败 · 点击追踪';
+  $('conversation').scrollTop = $('conversation').scrollHeight;
+}
+
+function publishStreamedAnswer(taskId, payload) {
+  // A clarification is the user-facing response for a needs-input run. Some
+  // older runtimes also emit an answer event containing the same text; keep
+  // the conversation from showing that prompt twice.
+  if ([...$('conversation').querySelectorAll('[data-clarification-task]')]
+    .some((item) => item.dataset.clarificationTask === String(taskId || ''))) return;
   const streamed = $('conversation').querySelector(`[data-stream-task="${taskId}"]`);
   if (streamed) {
     renderMessageContent(streamed, payload.content || payload.title);
-    streamed.classList.remove('streaming');
+    streamed.classList.remove('streaming', 'draft-answer', 'verifying', 'draft-failed');
+    streamed.classList.add('verified-answer');
     delete streamed.dataset.streamTask;
+    delete streamed.dataset.rawContent;
+    delete streamed.dataset.deliveryState;
     streamed.dataset.eventId = String(payload.id);
   } else if (!$('conversation').querySelector(`[data-event-id="${payload.id}"]`)) {
-    addMessage('agent', payload.content || payload.title, payload.id);
+    const message = addMessage('agent', payload.content || payload.title, payload.id);
+    message.dataset.taskMessage = String(taskId || '');
   }
 }
 
@@ -855,11 +2205,15 @@ const taskEventLabels = {
   start: '开始执行', intent: '目标理解', plan: '执行计划', plan_progress: '计划进度',
   skill: '技能匹配', model: '模型调用', progress: '执行进度', plan_check: '调用校验',
   tool_call: '调用工具', tool_result: '工具结果', tool_error: '工具失败',
+  tool_blocked: '工具阻止',
   output_check: '结果验收', answer: '最终答复', done: '执行完成', error: '执行失败',
   approval_required: '等待确认', install: '能力安装', checkpoint: '检查点',
+  knowledge: '知识引用',
   expert_selection: '专家选择', team_queued: '专家团排队', team_parallel_start: '专家并行',
   team_aggregating: '主管汇总', team_completed: '协作完成', team_partial_failed: '部分失败',
   team_member_retry: '成员重试', policy_decision: '权限决策',
+  verification_started: '正在验收', verification_result: '验收结果', candidate_verified: '候选已验收',
+  clarification: '需要补充信息',
 };
 
 function taskEventLabel(type) {
@@ -910,10 +2264,80 @@ function renderExpertSelectionEvent(event) {
   }
 }
 
+function renderVerificationResultEvent(event) {
+  const data = event?.data && typeof event.data === 'object' ? event.data : {};
+  const report = publicVerificationReport(data.report || data.public_report);
+  const stateValue = data.delivery_state === 'verified' || report?.passed === true ? 'passed' : report?.passed === false ? 'failed' : (data.state || 'inconclusive');
+  const verificationId = String(data.verification_id || 'latest');
+  const existing = [...$('timeline').querySelectorAll('[data-verification-summary]')]
+    .find((item) => item.dataset.verificationSummary === verificationId);
+  const div = existing || document.createElement('div');
+  div.className = 'event verification-event';
+  div.dataset.verificationSummary = verificationId;
+  div.innerHTML = `
+    <div class="event-title">
+      <span>最终验收报告</span>
+      <span class="badge verification_result ${escapeHtml(verificationStateClass(stateValue))}">${escapeHtml(verificationStateLabel(stateValue))}</span>
+    </div>
+    ${verificationSummaryMarkup(report, stateValue)}
+  `;
+  if (!existing) $('timeline').appendChild(div);
+
+  if (report && Array.isArray(report.rules)) {
+    const criteria = $('acceptanceCriteria');
+    if (criteria) {
+      criteria.innerHTML = report.rules.map((item) => renderAcceptanceCriterion({
+        id: item.id,
+        title: item.title,
+        status: item.status,
+        detail: item.public_reason,
+      })).join('');
+    }
+    const summary = $('acceptanceSummary');
+    if (summary) {
+      const failed = report.rules.filter((item) => item.status === 'failed').length;
+      summary.textContent = report.passed ? `全部 ${report.rules.length} 项通过` : `${failed} 项未通过`;
+      summary.className = report.passed ? 'passed' : 'failed';
+    }
+  }
+  updateAcceptanceDeliveryPanel({ event, report });
+  $('timeline').scrollTop = $('timeline').scrollHeight;
+}
+
+function renderKnowledgeEvent(event) {
+  const data = event?.data && typeof event.data === 'object' ? event.data : {};
+  const matches = runtimeArray(data.matches);
+  const docs = new Map();
+  matches.forEach((item) => {
+    const key = item.document_id || item.document_name || item.chunk_id || 'unknown';
+    const current = docs.get(key) || { name: item.document_name || item.document_id || '知识文档', count: 0, ordinals: [] };
+    current.count += 1;
+    if (item.ordinal !== undefined && item.ordinal !== null) current.ordinals.push(Number(item.ordinal) + 1);
+    docs.set(key, current);
+  });
+  const docItems = [...docs.values()].slice(0, 6);
+  const div = document.createElement('div');
+  div.className = 'event knowledge-event';
+  div.innerHTML = `
+    <div class="event-title">
+      <span>${escapeHtml(event.title || '已检索知识库')}</span>
+      <span class="badge knowledge">知识引用</span>
+    </div>
+    ${event.content ? `<div class="event-content">${escapeHtml(event.content)}</div>` : ''}
+    ${docItems.length ? `<div class="knowledge-event-list">${docItems.map((item) => `<span><strong>${escapeHtml(item.name)}</strong><small>${Number(item.count || 0)} 个片段${item.ordinals.length ? ` · #${item.ordinals.slice(0, 4).join(' #')}` : ''}</small></span>`).join('')}</div>` : ''}
+  `;
+  $('timeline').appendChild(div);
+  $('timeline').scrollTop = $('timeline').scrollHeight;
+}
+
 function appendEvent(event) {
   if (['analysis', 'reasoning', 'thought', 'thinking'].includes(event.type)) return;
-  if (event.type === 'checkpoint') return;
+  if (['answer_delta', 'answer_reset'].includes(event.type)) return;
+  if (['checkpoint', 'permissions', 'agent', 'memory', 'goal_spec_progress', 'goal_spec'].includes(event.type)) return;
   if (event.type === 'policy_decision' && event.data?.outcome === 'allow') return;
+  if ($('timelineStatus')) $('timelineStatus').textContent = `${taskEventLabel(event.type)} · ${event.title || '执行记录'}`;
+  if ($('timelineSection') && !['answer', 'done'].includes(event.type)) $('timelineSection').open = true;
+  if (event.type === 'error' && $('timelineSection')) $('timelineSection').open = true;
   if (event.type === 'expert_selection') {
     renderExpertSelectionEvent(event);
     return;
@@ -926,21 +2350,40 @@ function appendEvent(event) {
     updateExecutionProgress(event);
     return;
   }
-  if ($('executionPlan') && ['intent', 'skill', 'model', 'plan_check', 'tool_call', 'tool_result', 'tool_error', 'output_check', 'progress'].includes(event.type)) {
-    appendPlanDetail(event);
+  if (event.type === 'verification_result') {
+    renderVerificationResultEvent(event);
     return;
+  }
+  if (event.type === 'clarification') {
+    publishClarification(event.task_id || state.currentTask?.id, event);
+  }
+  if (event.type === 'error') {
+    publishTaskError(event.task_id || state.currentTask?.id, event);
+  }
+  if (event.type === 'knowledge') {
+    renderKnowledgeEvent(event);
+    return;
+  }
+  if ($('executionPlan') && ['intent', 'skill', 'model', 'knowledge', 'plan_check', 'tool_call', 'tool_result', 'tool_error', 'tool_blocked', 'output_check', 'progress'].includes(event.type)) {
+    appendPlanDetail(event);
+    if (!['tool_blocked'].includes(event.type)) return;
   }
   if ($('executionPlan') && ['answer', 'done'].includes(event.type)) {
     return;
   }
   const div = document.createElement('div');
-  div.className = 'event';
+  div.className = `event ${escapeHtml(event.type)}-event`;
+  const title = event.type === 'verification_started' ? '正在验收' : (event.title || taskEventLabel(event.type));
+  const toolSummary = event.type === 'tool_blocked' && event.data?.server_id && event.data?.tool_name
+    ? `<div class="event-facts"><span>工具</span><strong>${escapeHtml(`${event.data.server_id}.${event.data.tool_name}`)}</strong><span>原因</span><strong>${escapeHtml(event.data.reason || '未通过校验')}</strong></div>`
+    : '';
   div.innerHTML = `
     <div class="event-title">
-      <span>${escapeHtml(event.title)}</span>
+      <span>${escapeHtml(title)}</span>
       <span class="badge ${escapeHtml(event.type)}">${escapeHtml(taskEventLabel(event.type))}</span>
     </div>
     ${event.content ? `<div class="event-content">${escapeHtml(event.content)}</div>` : ''}
+    ${toolSummary}
   `;
   $('timeline').appendChild(div);
   $('timeline').scrollTop = $('timeline').scrollHeight;
@@ -1000,6 +2443,65 @@ function renderAcceptanceCriterion(item) {
   const status = item.status || 'pending';
   const symbol = status === 'passed' ? '✓' : status === 'failed' ? '!' : '·';
   return `<div class="acceptance-item ${escapeHtml(status)}" data-criterion-id="${escapeHtml(item.id || '')}"><span>${symbol}</span><div><strong>${escapeHtml(item.title || '')}</strong>${item.detail ? `<small>${escapeHtml(item.detail)}</small>` : ''}</div></div>`;
+}
+
+function acceptanceArtifactItems(event = null) {
+  const eventArtifacts = runtimeArray(event?.data?.artifacts);
+  const taskArtifacts = runtimeArray(state.currentTask?.artifacts);
+  const byId = new Map();
+  [...taskArtifacts, ...eventArtifacts].forEach((item) => {
+    if (!item || typeof item !== 'object') return;
+    const key = item.id || item.download_url || item.name;
+    if (key) byId.set(String(key), item);
+  });
+  return [...byId.values()];
+}
+
+function renderAcceptanceDeliveryArtifacts(artifacts) {
+  return artifacts.map((item) => {
+    const downloadUrl = safeArtifactDownloadUrl(item.download_url);
+    const previewUrl = safeArtifactPreviewUrl(item.preview_url);
+    const kind = String(item.kind || item.format || 'file').toUpperCase();
+    return `
+      <div class="acceptance-artifact">
+        <span><strong>${escapeHtml(item.name || item.id || '生成文件')}</strong><small>${escapeHtml(kind)}${item.delivery_status ? ` · ${escapeHtml(item.delivery_status)}` : ''}</small></span>
+        <span class="acceptance-artifact-actions">
+          ${previewUrl ? `<a href="${escapeHtml(previewUrl)}" target="_blank" rel="noopener noreferrer">预览</a>` : ''}
+          ${downloadUrl ? `<a href="${escapeHtml(downloadUrl)}" target="_blank" rel="noopener noreferrer" download>下载</a>` : '<em>等待发布</em>'}
+        </span>
+      </div>
+    `;
+  }).join('');
+}
+
+function updateAcceptanceDeliveryPanel({ event = null, report = null } = {}) {
+  const tree = $('executionPlan');
+  const panel = tree?.querySelector('.acceptance-panel');
+  if (!panel) return;
+  let delivery = $('acceptanceDelivery');
+  if (!delivery) {
+    panel.insertAdjacentHTML('beforeend', '<div id="acceptanceDelivery" class="acceptance-delivery"></div>');
+    delivery = $('acceptanceDelivery');
+  }
+  const data = event?.data && typeof event.data === 'object' ? event.data : {};
+  const artifacts = acceptanceArtifactItems(event);
+  const expectedFormat = data.expected_format || '';
+  const reportedCount = Number(data.artifact_count || artifacts.length || 0);
+  const summary = $('acceptanceSummary');
+  const existingPassed = delivery.classList.contains('passed') || summary?.classList.contains('passed');
+  const existingFailed = delivery.classList.contains('failed') || summary?.classList.contains('failed');
+  const reportPassed = report?.passed === true || data.passed === true || (!event && existingPassed);
+  const reportFailed = report?.passed === false || data.passed === false || (!event && existingFailed);
+  const statusText = reportPassed ? '交付校验通过' : reportFailed ? '交付校验未通过' : '等待交付校验';
+  const countText = reportedCount ? `${reportedCount} 个产物` : '暂无产物';
+  delivery.className = `acceptance-delivery ${reportPassed ? 'passed' : reportFailed ? 'failed' : 'pending'}`;
+  delivery.innerHTML = `
+    <div class="acceptance-delivery-head">
+      <span>交付物</span>
+      <strong>${escapeHtml(statusText)} · ${escapeHtml(countText)}${expectedFormat ? ` · ${escapeHtml(String(expectedFormat).toUpperCase())}` : ''}</strong>
+    </div>
+    ${artifacts.length ? `<div class="acceptance-artifacts">${renderAcceptanceDeliveryArtifacts(artifacts)}</div>` : `<p>${reportedCount ? '产物已生成，任务完成刷新后会显示下载入口。' : '当前任务还没有生成可下载产物。'}</p>`}
+  `;
 }
 
 function renderPlanChild(child) {
@@ -1063,11 +2565,13 @@ function appendPlanDetail(event) {
       summary.textContent = event.data.passed ? `全部 ${event.data.criteria.length} 项通过` : `${event.data.criteria.filter((item) => item.status === 'failed').length} 项未通过`;
       summary.className = event.data.passed ? 'passed' : 'failed';
     }
+    updateAcceptanceDeliveryPanel({ event, report: event.data?.report });
   }
   const mapping = {
     intent: 'understand', skill: 'understand', model: 'execute', progress: 'execute',
     plan_check: tree.dataset.toolNodeId || 'execute', tool_call: tree.dataset.toolNodeId || 'execute',
-    tool_result: tree.dataset.toolNodeId || 'execute', tool_error: tree.dataset.toolNodeId || 'execute', output_check: 'validate',
+    tool_result: tree.dataset.toolNodeId || 'execute', tool_error: tree.dataset.toolNodeId || 'execute',
+    tool_blocked: tree.dataset.toolNodeId || 'execute', output_check: 'validate',
   };
   const nodeId = mapping[event.type] || 'execute';
   const node = [...tree.querySelectorAll('.plan-node')].find((item) => item.dataset.nodeId === nodeId);
@@ -1076,16 +2580,26 @@ function appendPlanDetail(event) {
   if (!details) return;
   const detail = document.createElement('div');
   detail.className = `plan-detail ${escapeHtml(event.type)}`;
-  const label = { plan_check: '调用前校验', tool_call: '调用参数', tool_result: '工具结果', tool_error: '工具失败', output_check: '最终验收', model: '模型', skill: '技能', intent: '目标解析', progress: '进度' }[event.type] || taskEventLabel(event.type);
+  const label = { plan_check: '调用前校验', tool_call: '调用参数', tool_result: '工具结果', tool_error: '工具失败', tool_blocked: '工具阻止', output_check: '最终验收', model: '模型', skill: '技能', intent: '目标解析', progress: '进度' }[event.type] || taskEventLabel(event.type);
   let content = event.content || '';
   let meta = '';
   if (event.type === 'tool_call') {
     const args = event.data?.arguments || {};
     content = Object.entries(args).map(([key, value]) => `${key}: ${typeof value === 'string' ? value : JSON.stringify(value)}`).join(' · ') || '无额外参数';
     meta = `${event.data?.server_id || ''}.${event.data?.tool_name || ''}`;
+  } else if (event.type === 'plan_check') {
+    const tool = event.data?.tool || '';
+    const status = event.data?.passed === false ? '未通过' : '通过';
+    meta = [status, tool].filter(Boolean).join(' · ');
+    if (event.data?.reason && !content.includes(event.data.reason)) content = `${content || '调用前校验结果'} · ${event.data.reason}`;
   } else if (event.type === 'tool_result') {
     meta = event.data?.duration_ms ? `耗时 ${event.data.duration_ms} ms` : '';
     if (event.data?.artifact?.name) content = `${content} · ${event.data.artifact.name}`;
+  } else if (event.type === 'tool_blocked') {
+    meta = `${event.data?.server_id || ''}.${event.data?.tool_name || ''}`;
+    const reason = event.data?.reason ? `原因：${event.data.reason}` : '';
+    const source = event.data?.source ? `来源：${event.data.source}` : '';
+    content = [content, reason, source].filter(Boolean).join(' · ');
   }
   detail.innerHTML = `<span class="plan-detail-kind">${escapeHtml(label)}</span><div><strong>${escapeHtml(event.title || label)}</strong>${content ? `<small>${escapeHtml(content)}</small>` : ''}</div>${meta ? `<em>${escapeHtml(meta)}</em>` : ''}`;
   details.appendChild(detail);
@@ -1109,15 +2623,26 @@ function renderApproval(taskId, event = {}) {
   div.innerHTML = `
     <div class="event-title"><span>${isInstall ? '发现可补充的 Skill' : '人工审批'}</span><span class="badge approval_required">${isInstall ? '能力补充' : '等待确认'}</span></div>
     <div class="event-content">${escapeHtml(event.content || (isInstall ? '当前能力不足，是否安装推荐 Skill？' : '是否批准执行敏感操作？'))}</div>
-    ${recommendations.map((item) => `<div class="recommendation-item"><strong>${escapeHtml(item.name)}</strong><span>${escapeHtml(item.description || '')}</span><small>${escapeHtml(item.source_label || '内置目录')}</small></div>`).join('')}
+    ${recommendations.map((item) => {
+      const installed = state.skills.some((skill) => skill.id === item.id);
+      return `<div class="recommendation-item ${installed ? 'installed' : ''}"><strong>${escapeHtml(item.name)}</strong><span>${escapeHtml(item.description || '')}</span><small>${escapeHtml(item.source_label || '内置目录')} · ${installed ? '已安装' : '可安装'}</small></div>`;
+    }).join('')}
     <div class="approval-actions">
       <button id="approveYes">${isInstall ? '确认安装' : '批准'}</button>
       <button id="approveNo" class="secondary">${isInstall ? '暂不安装' : '拒绝'}</button>
+      ${isInstall && recommendations[0] ? `<button id="viewRecommendation" class="secondary">去市场查看</button>` : ''}
     </div>
   `;
   $('timeline').appendChild(div);
   $('approveYes').onclick = () => approveTask(taskId, true);
   $('approveNo').onclick = () => approveTask(taskId, false);
+  if (isInstall && recommendations[0]) {
+    $('viewRecommendation').onclick = () => {
+      state.marketplaceFocusId = recommendations[0].id;
+      switchTab('marketplace');
+      renderMarketplace();
+    };
+  }
 }
 
 async function approveTask(taskId, approved) {
@@ -1132,10 +2657,31 @@ async function refreshCurrentTask(taskId) {
   try {
     const task = await api(`/api/tasks/${taskId}`);
     state.currentTask = task;
+    const thinking = agentThinkingCard(taskId);
+    if (thinking) {
+      thinking.loaded = true;
+      (task.events || []).forEach((event) => updateAgentThinkingEvent(taskId, event));
+    }
+    if (runtimeIsActive(task.status)) {
+      state.taskUiRunning = taskUiGeneratingStatus(task.status);
+      state.taskUiTaskId = taskId;
+      setSendButtonState(state.taskUiRunning ? (state.taskUiCancelRequested ? 'cancel_requested' : 'running') : 'idle');
+      if (!state.taskUiStatusNode) setTaskUiStatus(taskId, task.status === 'waiting_approval' ? '等待你的确认…' : task.status === 'waiting_input' ? '等待你补充信息…' : task.status === 'queued' ? '任务已排队，正在启动…' : '正在执行任务…', taskUiGeneratingStatus(task.status) ? 'thinking' : 'verifying');
+    } else if (['completed', 'failed', 'cancelled'].includes(task.status)) {
+      state.taskUiTaskId = taskId;
+      finishTaskUi(taskId, task.status);
+    }
     renderTaskMeta(task);
     renderArtifacts(task.artifacts || []);
-    const answer = [...(task.events || [])].reverse().find((event) => ['answer', 'error'].includes(event.type));
-    if (answer && !$('conversation').querySelector(`[data-event-id="${answer.id}"]`)) addMessage('agent', answer.content || answer.title, answer.id);
+    const clarification = [...(task.events || [])].reverse().find((event) => event.type === 'clarification');
+    if (clarification) publishClarification(taskId, clarification);
+    const error = [...(task.events || [])].reverse().find((event) => event.type === 'error');
+    if (error) publishTaskError(taskId, error);
+    const answer = [...(task.events || [])].reverse().find((event) => event.type === 'answer');
+    if (answer && !clarification && !$('conversation').querySelector(`[data-event-id="${answer.id}"]`)) {
+      const message = addMessage('agent', answer.content || answer.title, answer.id);
+      message.dataset.taskMessage = String(taskId || '');
+    }
     await loadTaskRuntime(taskId, { silent: true });
   } catch (err) {
     console.error(err);
@@ -1162,6 +2708,7 @@ function renderArtifacts(artifacts) {
   box.querySelectorAll('[data-preview-artifact]').forEach((button) => {
     button.onclick = () => openArtifactPreview(button.dataset.previewArtifact).catch((err) => notify(`产物预览失败：${err.message || err}`, 'error'));
   });
+  updateAcceptanceDeliveryPanel();
 }
 
 function renderSkills() {
@@ -1173,6 +2720,12 @@ function renderSkills() {
     </div>
   `).join('');
   document.querySelectorAll('[data-skill]').forEach((el) => el.onclick = () => selectSkill(el.dataset.skill));
+}
+
+function scrollSkillCardIntoView(id) {
+  if (!id) return;
+  const card = document.querySelector(`[data-skill="${CSS.escape(id)}"]`);
+  if (card) card.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
 }
 
 async function selectSkill(id) {
@@ -1196,6 +2749,7 @@ async function selectSkill(id) {
   $('exportSkillBtn').disabled = false;
   await loadSkillFiles(id);
   renderSkills();
+  scrollSkillCardIntoView(id);
 }
 
 function newSkill() {
@@ -1369,6 +2923,12 @@ function renderMcp() {
   document.querySelectorAll('[data-mcp]').forEach((el) => el.onclick = () => selectMcp(el.dataset.mcp));
 }
 
+function scrollMcpCardIntoView(id) {
+  if (!id) return;
+  const card = document.querySelector(`[data-mcp="${CSS.escape(id)}"]`);
+  if (card) card.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+}
+
 async function selectMcp(id) {
   const mcp = await api(`/api/mcp/${id}`);
   state.selectedMcp = mcp;
@@ -1391,6 +2951,7 @@ async function selectMcp(id) {
     $('toolArgs').value = exampleArgs(mcp.id, tool?.name);
   });
   renderMcp();
+  scrollMcpCardIntoView(id);
 }
 
 function newMcp() {
@@ -1493,6 +3054,168 @@ function newAgent() { state.selectedAgent = null; $('agentEditorTitle').textCont
 function selectAgent(id) { const a = state.agents.find((x) => x.id === id); if (!a) return; state.selectedAgent = a; $('agentEditorTitle').textContent = a.name; $('agentId').disabled = true; $('agentId').value = a.id; $('agentName').value = a.name; $('agentDescription').value = a.description; $('agentPrompt').value = a.system_prompt; $('agentSkills').value = (a.skills || []).join(','); $('agentMcps').value = (a.mcp_servers || []).join(','); $('agentPermissions').value = formatJson(a.permissions || {}); $('agentModel').value = a.model; renderAgents(); }
 async function saveAgent() { const list = (id) => $(id).value.split(',').map((x) => x.trim()).filter(Boolean); const payload = { id: $('agentId').value.trim(), name: $('agentName').value.trim(), description: $('agentDescription').value.trim(), model: $('agentModel').value, system_prompt: $('agentPrompt').value, skills: list('agentSkills'), mcp_servers: list('agentMcps'), permissions: JSON.parse($('agentPermissions').value || '{}') }; if (state.selectedAgent) await api(`/api/agents/${state.selectedAgent.id}`, { method: 'PUT', body: JSON.stringify(payload) }); else await api('/api/agents', { method: 'POST', body: JSON.stringify(payload) }); state.agents = await api('/api/agents'); renderAgentsSelect(); selectAgent(payload.id); }
 
+function renderWorkspaceModelOptions() {
+  const agentSelect = $('workspaceDefaultAgent');
+  const modelSelect = $('workspaceDefaultModel');
+  if (agentSelect) agentSelect.innerHTML = state.agents.map((item) => `<option value="${escapeHtml(item.id)}">${escapeHtml(item.name)}</option>`).join('');
+  if (modelSelect) modelSelect.innerHTML = state.models.filter((item) => item.enabled).map((item) => `<option value="${escapeHtml(item.id)}">${escapeHtml(item.name)}</option>`).join('');
+}
+
+function renderWorkspaces() {
+  renderWorkspaceModelOptions();
+  $('workspaceCount').textContent = String(state.workspaces.length);
+  $('workspaceList').innerHTML = state.workspaces.map((item) => `
+    <div class="card workspace-card ${state.selectedWorkspace?.id === item.id ? 'active' : ''} ${item.enabled ? '' : 'disabled'}" data-workspace="${escapeHtml(item.id)}">
+      <div class="card-title"><span>${escapeHtml(item.name)}</span><span class="status ${item.enabled ? 'completed' : ''}">${item.enabled ? '已启用' : '已停用'}</span></div>
+      <div class="card-desc">${escapeHtml(item.description || '暂无描述')}</div>
+      <div class="memory-card-meta"><span>${escapeHtml(item.id)}</span><span>智能体 ${escapeHtml(item.default_agent_id || 'general-agent')}</span><span>模型 ${escapeHtml(item.default_model_id || 'deterministic')}</span></div>
+    </div>
+  `).join('') || '<div class="meta empty">还没有项目。</div>';
+  document.querySelectorAll('[data-workspace]').forEach((element) => {
+    element.onclick = () => selectWorkspaceEditor(element.dataset.workspace);
+  });
+}
+
+function newWorkspace() {
+  state.selectedWorkspace = null;
+  renderWorkspaces();
+  $('workspaceEditorTitle').textContent = '新建项目';
+  $('workspaceEditorMeta').textContent = '保存后可在左侧切换当前项目';
+  $('workspaceId').disabled = false;
+  $('workspaceId').value = 'project-' + Date.now().toString(36).slice(-6);
+  $('workspaceName').value = '新项目';
+  $('workspaceDescription').value = '';
+  $('workspaceDefaultAgent').value = $('agentSelect')?.value || 'general-agent';
+  $('workspaceDefaultModel').value = $('taskModelSelect')?.value || 'deterministic';
+  $('workspaceSettings').value = '{}';
+  $('workspaceEnabled').checked = true;
+  $('deleteWorkspaceBtn').classList.add('hidden');
+}
+
+function selectWorkspaceEditor(id, { activate = true } = {}) {
+  const item = state.workspaces.find((workspace) => workspace.id === id);
+  if (!item) return;
+  state.selectedWorkspace = item;
+  if (activate && item.enabled) {
+    state.workspaceId = item.id;
+    writePreference('workspace', item.id);
+    renderWorkspaceSelect();
+  }
+  renderWorkspaces();
+  $('workspaceEditorTitle').textContent = item.name;
+  $('workspaceEditorMeta').textContent = `${item.id} · 更新于 ${runtimeTime(item.updated_at)}`;
+  $('workspaceId').disabled = true;
+  $('workspaceId').value = item.id;
+  $('workspaceName').value = item.name || '';
+  $('workspaceDescription').value = item.description || '';
+  $('workspaceDefaultAgent').value = item.default_agent_id || 'general-agent';
+  $('workspaceDefaultModel').value = item.default_model_id || 'deterministic';
+  $('workspaceSettings').value = formatJson(item.settings || {});
+  $('workspaceEnabled').checked = !!item.enabled;
+  $('deleteWorkspaceBtn').classList.toggle('hidden', item.id === 'default' || !item.enabled);
+}
+
+async function saveWorkspace() {
+  const id = $('workspaceId').value.trim();
+  const payload = {
+    id,
+    name: $('workspaceName').value.trim(),
+    description: $('workspaceDescription').value.trim(),
+    organization_id: 'local-org',
+    user_id: 'local-user',
+    default_agent_id: $('workspaceDefaultAgent').value || 'general-agent',
+    default_model_id: $('workspaceDefaultModel').value || 'deterministic',
+    settings: JSON.parse($('workspaceSettings').value || '{}'),
+    enabled: $('workspaceEnabled').checked,
+  };
+  if (!payload.id || !payload.name) return notify('请填写项目 ID 和名称', 'error');
+  const button = $('saveWorkspaceBtn'); setBusy(button, true);
+  try {
+    const saved = state.workspaces.some((item) => item.id === id)
+      ? await api(`/api/workspaces/${encodeURIComponent(id)}?${workspaceQuery()}`, {
+        method: 'PUT',
+        body: JSON.stringify({
+          name: payload.name,
+          description: payload.description,
+          default_agent_id: payload.default_agent_id,
+          default_model_id: payload.default_model_id,
+          settings: payload.settings,
+          enabled: payload.enabled,
+        }),
+      })
+      : await api('/api/workspaces', { method: 'POST', body: JSON.stringify(payload) });
+    await loadWorkspacesOnly({ preserveSelection: false });
+    state.workspaceId = saved.id;
+    writePreference('workspace', saved.id);
+    ensureSelectedWorkspace();
+    renderWorkspaceSelect();
+    selectWorkspaceEditor(saved.id, { activate: true });
+    await reloadWorkspaceScopedData();
+    notify(`项目“${saved.name}”已保存并切换`);
+  } catch (err) { notify(`项目保存失败：${err.message || err}`, 'error'); }
+  finally { setBusy(button, false); }
+}
+
+async function deleteWorkspace() {
+  const item = state.selectedWorkspace;
+  if (!item || item.id === 'default') return;
+  if (!confirm(`确定停用项目“${item.name}”吗？已有任务、知识库和产物不会删除，但该项目不会再出现在切换列表中。`)) return;
+  const button = $('deleteWorkspaceBtn'); setBusy(button, true, '停用中…');
+  try {
+    await api(`/api/workspaces/${encodeURIComponent(item.id)}?${workspaceQuery()}`, { method: 'DELETE' });
+    state.workspaceId = 'default';
+    writePreference('workspace', 'default');
+    await loadWorkspacesOnly({ preserveSelection: false });
+    await reloadWorkspaceScopedData();
+    notify('项目已停用，当前已切回默认项目');
+  } catch (err) { notify(`项目停用失败：${err.message || err}`, 'error'); }
+  finally { setBusy(button, false); }
+}
+
+async function switchWorkspace(id) {
+  if (!id || id === currentWorkspaceId()) return;
+  state.workspaceId = id;
+  writePreference('workspace', id);
+  ensureSelectedWorkspace();
+  selectWorkspaceEditor(id, { activate: false });
+  const workspace = state.selectedWorkspace;
+  if (workspace?.default_agent_id && state.agents.some((item) => item.id === workspace.default_agent_id)) {
+    $('agentSelect').value = workspace.default_agent_id;
+    writePreference('agent', workspace.default_agent_id);
+  }
+  if (workspace?.default_model_id && state.models.some((item) => item.id === workspace.default_model_id && item.enabled)) {
+    $('taskModelSelect').value = workspace.default_model_id;
+    writePreference('model', workspace.default_model_id);
+    writePreference('model-explicit', '0');
+  }
+  state.currentTask = null;
+  state.taskRuntime = null;
+  state.runtimeTaskId = null;
+  resetTaskRuntime();
+  $('timeline').innerHTML = '';
+  $('taskMeta').className = 'meta empty';
+  $('taskMeta').textContent = '尚未创建任务';
+  await reloadWorkspaceScopedData();
+  notify(`已切换到项目“${workspace?.name || id}”`);
+}
+
+async function reloadWorkspaceScopedData() {
+  const [tasks, loops] = await Promise.all([
+    api(`/api/tasks?${new URLSearchParams(platformScopeValues()).toString()}`),
+    api(`/api/loops?${new URLSearchParams(platformScopeValues()).toString()}`),
+  ]);
+  state.tasks = tasks;
+  state.loops = loops;
+  renderTasks();
+  renderLoops();
+  await Promise.allSettled([
+    loadMemoriesOnly({ preserveSelection: false }),
+    loadKnowledgeBasesOnly({ preserveSelection: false }),
+    loadArtifactsOnly({ preserveSelection: false }),
+    loadExpertWorkspace({ preserveSelection: true }),
+  ]);
+}
+
 const expertVisibilityLabels = { private: '本机使用者', workspace: '当前工作区', organization: '当前实例', public: '实例内公共' };
 const expertRunStatusLabels = {
   queued: '已排队', running: '成员执行中', aggregating: '主管汇总中', partial_failed: '部分失败',
@@ -1500,7 +3223,7 @@ const expertRunStatusLabels = {
 };
 
 function expertScopeValues() {
-  return { organization_id: 'local-org', workspace_id: 'default', user_id: 'local-user' };
+  return platformScopeValues();
 }
 
 function expertQuery({ includeDisabled = false } = {}) {
@@ -1781,6 +3504,12 @@ function renderExpertTeams() {
   renderWorkbenchMode();
 }
 
+function scrollExpertTeamCardIntoView(id) {
+  if (!id) return;
+  const card = document.querySelector(`[data-expert-team="${CSS.escape(id)}"]`);
+  if (card) card.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+}
+
 function defaultExpertTeamMembers() {
   const agents = orderedExpertAgents();
   return [0, 1].map((index) => ({
@@ -1895,6 +3624,7 @@ async function selectExpertTeam(id, { reload = true, loadRuns = true } = {}) {
   renderExpertTeamMembers(item.members || []);
   renderExpertRunControls();
   if (loadRuns) await loadExpertTeamRuns(item.id, { preserveSelection: true });
+  scrollExpertTeamCardIntoView(id);
 }
 
 function expertTeamMembersPayload() {
@@ -2071,6 +3801,8 @@ function renderExpertRunLive() {
       ${summary ? `<div class="expert-supervisor-answer">${renderMarkdown(summary)}</div>` : `<div class="expert-supervisor-placeholder">${runError ? escapeHtml(runError) : run.status === 'aggregating' ? '主管正在整合成员结论并执行最终验收…' : run.status === 'partial_failed' ? '失败成员完成独立重试后，主管会重新汇总。' : '等待全部成员完成。'}</div>`}
       ${run.supervisor_child_task_id ? `<button class="text-button" data-team-child-task="${escapeHtml(run.supervisor_child_task_id)}" type="button">查看主管任务</button>` : ''}
     </div>`;
+  if ($('timelineSection')) $('timelineSection').open = true;
+  if ($('timelineStatus')) $('timelineStatus').textContent = `执行计划 · ${nodes.length} 个节点`;
   $('expertRunLive').querySelectorAll('[data-team-child-task], [data-team-parent-task]').forEach((button) => {
     button.onclick = () => openTask(button.dataset.teamChildTask || button.dataset.teamParentTask);
   });
@@ -2182,12 +3914,11 @@ async function retryExpertTeamMember(memberRunId, button) {
 }
 
 const memoryScopeLabels = { organization: '当前实例', workspace: '当前工作区', user: '本机使用者', agent: '智能体', conversation: '对话' };
+const knowledgeVisibilityLabels = { organization: '当前实例', workspace: '当前工作区', private: '仅本机使用者' };
 
 function memoryScopeValues() {
   return {
-    organization_id: 'local-org',
-    workspace_id: 'default',
-    user_id: 'local-user',
+    ...platformScopeValues(),
     agent_id: $('agentSelect')?.value || readPreference('agent') || 'general-agent',
     conversation_id: state.conversationId,
   };
@@ -2195,6 +3926,961 @@ function memoryScopeValues() {
 
 function memoryQuery() {
   return new URLSearchParams(memoryScopeValues()).toString();
+}
+
+function knowledgeScopeValues() {
+  const { organization_id, workspace_id, user_id } = memoryScopeValues();
+  return { organization_id, workspace_id, user_id };
+}
+
+function knowledgeQuery(extra = {}) {
+  return new URLSearchParams({ ...knowledgeScopeValues(), ...extra }).toString();
+}
+
+async function loadKnowledgeBasesOnly({ preserveSelection = false } = {}) {
+  const selectedId = preserveSelection ? state.selectedKnowledgeBase?.id : '';
+  state.knowledgeBases = await api(`/api/knowledge-bases?${knowledgeQuery()}`);
+  state.selectedKnowledgeBase = selectedId
+    ? state.knowledgeBases.find((item) => item.id === selectedId) || null
+    : state.selectedKnowledgeBase && state.knowledgeBases.find((item) => item.id === state.selectedKnowledgeBase.id) || null;
+  renderKnowledgeBases();
+  renderKnowledgeCapability();
+  if (state.selectedKnowledgeBase) await selectKnowledgeBase(state.selectedKnowledgeBase.id, { reload: false });
+  else newKnowledgeBase({ clearListSelection: false });
+}
+
+function renderKnowledgeCapability() {
+  const info = state.capabilities?.knowledge_base;
+  if (!$('knowledgeCapabilityStatus')) return;
+  if (!info?.supported) {
+    $('knowledgeCapabilityStatus').textContent = '知识库服务未启用';
+    $('knowledgeCapabilityStatus').classList.add('disabled');
+    return;
+  }
+  $('knowledgeCapabilityStatus').classList.remove('disabled');
+  const formats = Array.isArray(info.formats) ? info.formats.slice(0, 8).join('、') : '常见文档';
+  $('knowledgeCapabilityStatus').textContent = `已启用 · ${info.retrieval || 'keyword'} · ${formats}`;
+}
+
+function renderKnowledgeBases() {
+  const items = state.knowledgeBases || [];
+  $('knowledgeBaseCount').textContent = String(items.length);
+  $('knowledgeBaseList').innerHTML = items.map((item) => `
+    <div class="card knowledge-base-card ${state.selectedKnowledgeBase?.id === item.id ? 'active' : ''} ${item.enabled ? '' : 'disabled'}" data-knowledge-base="${escapeHtml(item.id)}">
+      <div class="card-title"><span>${escapeHtml(item.name)}</span><span class="status ${item.enabled ? 'completed' : ''}">${item.enabled ? '已启用' : '已停用'}</span></div>
+      <div class="card-desc">${escapeHtml(item.description || '暂无描述')}</div>
+      <div class="memory-card-meta"><span>${escapeHtml(knowledgeVisibilityLabels[item.visibility] || item.visibility)}</span><span>${escapeHtml(item.id)}</span></div>
+    </div>
+  `).join('') || '<div class="meta empty">还没有知识库。点击“新建知识库”开始。</div>';
+  document.querySelectorAll('[data-knowledge-base]').forEach((element) => {
+    element.onclick = () => selectKnowledgeBase(element.dataset.knowledgeBase).catch((err) => notify(`知识库读取失败：${err.message || err}`, 'error'));
+  });
+}
+
+function scrollKnowledgeBaseCardIntoView(id) {
+  if (!id) return;
+  const card = document.querySelector(`[data-knowledge-base="${CSS.escape(id)}"]`);
+  if (card) card.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+}
+
+function renderKnowledgeDocuments() {
+  const items = state.knowledgeDocuments || [];
+  $('knowledgeDocumentCount').textContent = String(items.length);
+  $('knowledgeDocumentList').innerHTML = items.map((item) => `
+    <div class="knowledge-document">
+      <div><strong>${escapeHtml(item.name)}</strong><span>${escapeHtml(item.mime_type || 'application/octet-stream')} · ${item.chunk_count || 0} 个片段</span></div>
+      <span class="status ${item.status === 'indexed' ? 'completed' : ''}">${escapeHtml(item.status || 'unknown')}</span>
+    </div>
+  `).join('') || '<div class="meta empty">暂无已索引文档。</div>';
+}
+
+function renderKnowledgeSearchResults() {
+  const items = state.knowledgeSearchResults || [];
+  $('knowledgeSearchCount').textContent = String(items.length);
+  $('knowledgeSearchResults').innerHTML = items.map((item, index) => `
+    <div class="knowledge-result">
+      <div class="knowledge-result-head"><strong>${index + 1}. ${escapeHtml(item.document_name || item.document_id)}</strong><span>片段 ${(Number(item.ordinal) || 0) + 1} · 分数 ${escapeHtml(item.score)}</span></div>
+      <p>${escapeHtml(item.content || '')}</p>
+      <div class="knowledge-result-meta">chunk_id=${escapeHtml(item.chunk_id || '')} · 命中：${escapeHtml((item.matched_terms || []).join('、') || '—')}</div>
+    </div>
+  `).join('') || '<div class="meta empty">没有命中片段。可以换更具体的关键词，或确认文档是否已成功索引。</div>';
+}
+
+async function loadDiagnosticsOnly() {
+  state.diagnostics = await api(`/api/diagnostics?${new URLSearchParams(platformScopeValues()).toString()}`);
+  renderDiagnostics();
+  return state.diagnostics;
+}
+
+async function copyTextToClipboard(text) {
+  if (!text) throw new Error('没有可复制的内容');
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+  const textarea = document.createElement('textarea');
+  textarea.value = text;
+  textarea.setAttribute('readonly', 'true');
+  textarea.style.position = 'fixed';
+  textarea.style.left = '-9999px';
+  document.body.appendChild(textarea);
+  textarea.select();
+  const ok = document.execCommand('copy');
+  document.body.removeChild(textarea);
+  if (!ok) throw new Error('浏览器拒绝复制');
+}
+
+async function copyDiagnosticsReport() {
+  if (!state.diagnostics) {
+    await loadDiagnosticsOnly();
+  }
+  const report = state.diagnostics?.report_markdown || '';
+  await copyTextToClipboard(report);
+  notify('平台自检报告已复制');
+}
+
+function diagnosticsExportStamp() {
+  const value = state.diagnostics?.generated_at || new Date().toISOString();
+  return String(value).replace(/[:.]/g, '-').replace(/Z$/, '').slice(0, 19);
+}
+
+function downloadTextFile({ content, filename, type }) {
+  const blob = new Blob([content], { type });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+}
+
+async function downloadDiagnosticsReport() {
+  if (!state.diagnostics) {
+    await loadDiagnosticsOnly();
+  }
+  const report = state.diagnostics?.report_markdown || '';
+  if (!report) throw new Error('没有可下载的报告内容');
+  const stamp = diagnosticsExportStamp();
+  downloadTextFile({ content: report, filename: `agentnexus-diagnostics-${stamp}.md`, type: 'text/markdown;charset=utf-8' });
+  notify('平台自检报告已开始下载');
+}
+
+async function downloadDiagnosticsJson() {
+  if (!state.diagnostics) {
+    await loadDiagnosticsOnly();
+  }
+  if (!state.diagnostics) throw new Error('没有可下载的自检数据');
+  const stamp = diagnosticsExportStamp();
+  const content = JSON.stringify(state.diagnostics, null, 2);
+  downloadTextFile({ content, filename: `agentnexus-diagnostics-${stamp}.json`, type: 'application/json;charset=utf-8' });
+  notify('平台自检数据已开始下载');
+}
+
+function diagnosticLabel(status) {
+  if (status === 'pass') return '通过';
+  if (status === 'fail') return '失败';
+  return '提醒';
+}
+
+function readinessLabel(state) {
+  if (state === 'ready') return '可使用';
+  if (state === 'blocked') return '需处理';
+  return '待配置';
+}
+
+function improvementStatusLabel(status) {
+  if (status === 'ready') return '基本就绪';
+  if (status === 'in_progress') return '建设中';
+  return '待开发';
+}
+
+async function focusModelConfiguration({ preferProblem = true } = {}) {
+  switchTab('models');
+  try {
+    state.models = await api('/api/models');
+    renderModels();
+    renderTaskModelSelect();
+  } catch (err) {
+    notify(`模型列表刷新失败：${err.message || err}`, 'error');
+  }
+  const problemModel = state.models.find((model) => (
+    model.id !== 'deterministic'
+    && model.enabled
+    && (model.readiness?.state || 'ready') !== 'ready'
+  ));
+  const unconfiguredModel = state.models.find((model) => model.id !== 'deterministic');
+  const target = preferProblem ? (problemModel || unconfiguredModel) : unconfiguredModel;
+  if (target) {
+    selectModel(target.id);
+    const reason = target.readiness?.detail || modelCredentialText(target);
+    notify(`已定位模型“${target.name}”：${reason}`);
+  } else {
+    newModel();
+    notify('还没有在线模型配置，已打开新增模型表单');
+  }
+}
+
+function isModelDiagnosticTarget(item = {}) {
+  return AgentNexusDiagnosticsRouting.isModelDiagnosticTarget(item);
+}
+
+function isSkillMcpDiagnosticTarget(item = {}) {
+  return AgentNexusDiagnosticsRouting.isSkillMcpDiagnosticTarget(item);
+}
+
+function diagnosticSkillMcpTarget(item = {}) {
+  return AgentNexusDiagnosticsRouting.diagnosticSkillMcpTarget(item);
+}
+
+function diagnosticMcpPreference(item = {}) {
+  return AgentNexusDiagnosticsRouting.diagnosticMcpPreference(item);
+}
+
+function chooseDiagnosticMcpServer(servers = [], source = {}) {
+  return AgentNexusDiagnosticsRouting.chooseDiagnosticMcpServer(servers, source);
+}
+
+function marketplaceCandidates() {
+  const market = state.marketplace || {};
+  const skills = Array.isArray(market.skills) ? market.skills.map((item) => ({ ...item, kind: 'skill' })) : [];
+  const mcps = Array.isArray(market.mcp_servers) ? market.mcp_servers.map((item) => ({ ...item, kind: 'mcp' })) : [];
+  return [...skills, ...mcps];
+}
+
+async function focusSkillMcpConfiguration({ target = 'auto', source = null } = {}) {
+  const resolvedTarget = target === 'auto' ? diagnosticSkillMcpTarget(source || {}) : target;
+  if (resolvedTarget === 'skills') {
+    switchTab('skills');
+    const skills = await loadSkillsOnly();
+    const targetSkill = skills.find((item) => item.enabled) || skills[0];
+    if (targetSkill) {
+      await selectSkill(targetSkill.id);
+      notify(`已定位 Skill：“${targetSkill.name || targetSkill.id}”`);
+    } else {
+      newSkill();
+      notify('未发现已安装 Skill，已打开新建 Skill 表单');
+    }
+    return;
+  }
+  if (resolvedTarget === 'mcp') {
+    switchTab('mcp');
+    const mcps = await loadMcpOnly();
+    const preference = diagnosticMcpPreference(source || {});
+    const targetMcp = chooseDiagnosticMcpServer(mcps, source || {});
+    if (targetMcp) {
+      await selectMcp(targetMcp.id);
+      notify(`已定位 MCP：“${targetMcp.name || targetMcp.id}”`);
+    } else {
+      newMcp();
+      if (preference.id || preference.tool) {
+        $('mcpId').value = preference.id || 'web-search';
+        $('mcpName').value = preference.id === 'web-search' ? '联网搜索 MCP' : '新的工具服务';
+        $('mcpDescription').value = preference.id === 'web-search' ? '配置联网搜索 Provider 后用于实时检索。' : '';
+      }
+      notify(preference.id || preference.tool ? '未发现匹配的 MCP，已打开对应工具服务配置表单' : '未发现已配置 MCP，已打开新增工具服务表单');
+    }
+    return;
+  }
+  switchTab('marketplace');
+  await loadMarketplaceOnly();
+  const candidate = marketplaceCandidates().find((item) => !item.installed || !item.enabled) || marketplaceCandidates()[0];
+  if (candidate) {
+    state.marketplaceFocusId = candidate.id;
+    renderMarketplace();
+    notify(`已打开市场候选：${candidate.kind === 'skill' ? 'Skill' : 'MCP'}“${candidate.name || candidate.id}”`);
+  } else {
+    notify('市场暂无可推荐的 Skill/MCP，可在 Skill 或 MCP 页面手动创建', 'error');
+  }
+}
+
+function diagnosticRouteTarget(item = {}) {
+  return AgentNexusDiagnosticsRouting.diagnosticRouteTarget(item);
+}
+
+async function focusKnowledgeConfiguration() {
+  switchTab('knowledge');
+  await loadKnowledgeBasesOnly({ preserveSelection: true });
+  const target = state.knowledgeBases.find((item) => item.enabled) || state.knowledgeBases[0];
+  if (target) {
+    await selectKnowledgeBase(target.id, { reload: false });
+    notify(`已定位知识库：“${target.name || target.id}”`);
+  } else {
+    newKnowledgeBase();
+    notify('未发现知识库，已打开新建知识库表单');
+  }
+}
+
+async function focusArtifactWorkspace() {
+  switchTab('artifacts');
+  await loadArtifactsOnly({ preserveSelection: true });
+  const target = state.selectedArtifact || state.artifacts[0];
+  if (target) {
+    await selectArtifact(target.id, { reload: false });
+    notify(`已定位产物：“${target.name || target.id}”`);
+  } else {
+    resetArtifactPreview('当前工作区还没有生成文件。请先在工作台发起文档、表格、PPT、HTML 或 Markdown 生成任务。');
+    notify('当前工作区还没有产物，已打开产物中心');
+  }
+}
+
+async function focusExpertConfiguration() {
+  switchTab('experts');
+  await loadExpertWorkspace({ preserveSelection: true });
+  const team = state.expertTeams.find((item) => item.enabled) || state.expertTeams[0];
+  if (team) {
+    await selectExpertTeam(team.id, { reload: false, loadRuns: true });
+    notify(`已定位专家团：“${team.name || team.id}”`);
+  } else if (state.expertTemplates.length) {
+    await selectExpertTemplate(state.expertTemplates[0].id, { reload: false });
+    newExpertTeam({ preserveLists: true });
+    notify('已定位专家模板；还没有专家团，已打开新建团队表单');
+  } else {
+    newExpertTemplate({ preserveLists: true });
+    newExpertTeam({ preserveLists: true });
+    notify('未发现专家模板或团队，已打开专家配置表单');
+  }
+}
+
+async function focusMemoryConfiguration() {
+  switchTab('memory');
+  await loadMemoriesOnly({ preserveSelection: true });
+  const target = state.selectedMemory || state.memories.find((item) => item.enabled) || state.memories[0];
+  if (target) {
+    await selectMemory(target.id, { reload: false });
+    notify(`已定位记忆：“${target.title || target.id}”`);
+  } else {
+    newMemory();
+    notify('未发现长期记忆，已打开新建记忆表单');
+  }
+}
+
+async function focusAutomationConfiguration() {
+  switchTab('loops');
+  await loadLoopsOnly();
+  const target = state.loops.find((item) => ['active', 'running', 'queued'].includes(item.status)) || state.loops[0];
+  if (target) {
+    await selectLoop(target.id);
+    notify(`已定位自动化：“${target.name || target.id}”`);
+  } else {
+    newLoop();
+    notify('未发现自动化，已打开新建自动化表单');
+  }
+}
+
+function focusWorkbenchConfiguration(item = {}) {
+  const id = String(item.id || item.check_id || item.ref_id || '');
+  switchTab('chat');
+  const input = $('messageInput');
+  if (input) input.focus();
+  if (id === 'file.upload_context' || id === 'file_input') {
+    notify('已打开工作台。点击输入框下方“添加附件”上传文件，再发送任务测试上下文读取');
+  } else {
+    notify('已打开工作台。可查看执行计划、节点状态、工具调用和交付校验');
+  }
+}
+
+function handleDiagnosticNavigation(item = {}, fallbackTab = '') {
+  const target = diagnosticRouteTarget(item) || fallbackTab;
+  if (target === 'models') {
+    focusModelConfiguration().catch((err) => notify(`模型定位失败：${err.message || err}`, 'error'));
+    return true;
+  }
+  if (target === 'skill_mcp') {
+    focusSkillMcpConfiguration({ source: item }).catch((err) => notify(`Skill/MCP 定位失败：${err.message || err}`, 'error'));
+    return true;
+  }
+  if (target === 'knowledge') {
+    focusKnowledgeConfiguration().catch((err) => notify(`知识库定位失败：${err.message || err}`, 'error'));
+    return true;
+  }
+  if (target === 'artifacts') {
+    focusArtifactWorkspace().catch((err) => notify(`产物定位失败：${err.message || err}`, 'error'));
+    return true;
+  }
+  if (target === 'experts') {
+    focusExpertConfiguration().catch((err) => notify(`专家团定位失败：${err.message || err}`, 'error'));
+    return true;
+  }
+  if (target === 'memory') {
+    focusMemoryConfiguration().catch((err) => notify(`记忆定位失败：${err.message || err}`, 'error'));
+    return true;
+  }
+  if (target === 'loops') {
+    focusAutomationConfiguration().catch((err) => notify(`自动化定位失败：${err.message || err}`, 'error'));
+    return true;
+  }
+  if (target === 'chat') {
+    focusWorkbenchConfiguration(item);
+    return true;
+  }
+  if (target === 'diagnostics') {
+    switchTab('diagnostics');
+    notify(`已打开：${item.action_target?.label || item.action_label || item.title || '自检中心'}`);
+    return true;
+  }
+  if (target) {
+    switchTab(target);
+    notify(`已打开：${item.action_target?.label || item.action_label || item.title || target}`);
+    return true;
+  }
+  return false;
+}
+
+function useReadinessAction(id) {
+  const item = (state.diagnostics?.readiness || []).find((entry) => String(entry.id) === String(id));
+  const tab = item?.action_target?.tab || '';
+  if (!item || !tab) {
+    notify('这个能力项没有可跳转的配置入口', 'error');
+    return;
+  }
+  handleDiagnosticNavigation(item, tab);
+}
+
+function useImprovementPrompt(id) {
+  const item = (state.diagnostics?.improvement_backlog || []).find((entry) => String(entry.id) === String(id));
+  const prompt = item?.prompt || '';
+  const input = $('messageInput');
+  if (!item || !input || !prompt.trim()) {
+    notify('这个优化建议没有可填入的任务内容', 'error');
+    return;
+  }
+  setWorkbenchMode('agent');
+  switchTab('chat');
+  input.value = prompt;
+  input.focus();
+  notify(`已填入优化任务：${item.title || item.id}`);
+}
+
+function useSelfTestPrompt(id) {
+  const item = (state.diagnostics?.self_tests || []).find((entry) => String(entry.id) === String(id));
+  const prompt = item?.prompt || '';
+  const input = $('messageInput');
+  if (!item || !input || !prompt.trim()) {
+    notify('这个自测用例没有可填入的任务内容', 'error');
+    return;
+  }
+  setWorkbenchMode(item.workbench_mode === 'expert' ? 'expert' : 'agent');
+  switchTab('chat');
+  input.value = prompt;
+  input.focus();
+  notify(`已填入${item.workbench_mode === 'expert' ? '专家' : '普通'}工作台，请确认后手动发送`);
+}
+
+function runNextAction(id) {
+  const item = (state.diagnostics?.next_actions || []).find((entry) => String(entry.id) === String(id));
+  if (!item) {
+    notify('这个优先事项已不存在，请重新运行自检', 'error');
+    return;
+  }
+  if (item.action_type === 'navigate' && item.target_tab) {
+    handleDiagnosticNavigation(item, item.target_tab);
+    return;
+  }
+  if (item.action_type === 'prompt' && item.prompt) {
+    const input = $('messageInput');
+    if (!input) {
+      notify('工作台输入框不可用', 'error');
+      return;
+    }
+    setWorkbenchMode('agent');
+    switchTab('chat');
+    input.value = item.prompt;
+    input.focus();
+    notify(`已填入：${item.title || '优先事项'}`);
+    return;
+  }
+  if (item.kind === 'readiness') {
+    useReadinessAction(item.ref_id);
+    return;
+  }
+  if (item.kind === 'improvement') {
+    useImprovementPrompt(item.ref_id);
+    return;
+  }
+  notify('暂不支持这个优先事项类型', 'error');
+}
+
+function renderDiagnosticCapabilityEntries(data, capabilityEntryGrid, capabilityEntryCount) {
+  if (!capabilityEntryGrid || !capabilityEntryCount) return;
+  const checks = data?.checks || [];
+  if (!checks.length) {
+    capabilityEntryCount.textContent = '未检查';
+    capabilityEntryGrid.innerHTML = '<div class="meta empty">运行自检后会显示平台默认支持的能力和使用入口。</div>';
+    return;
+  }
+  const checksById = Object.fromEntries(checks.map((item) => [String(item.id || ''), item]));
+  const entries = DIAGNOSTIC_CAPABILITY_ENTRIES.map((entry) => ({
+    ...entry,
+    check: checksById[entry.checkId] || null,
+  }));
+  const readyCount = entries.filter((entry) => entry.check?.status === 'pass').length;
+  capabilityEntryCount.textContent = `${readyCount}/${entries.length} 可用`;
+  capabilityEntryGrid.innerHTML = entries.map((entry) => {
+    const status = entry.check?.status || 'warn';
+    return `
+      <article class="capability-entry-card ${escapeHtml(status)}">
+        <div class="capability-entry-head">
+          <strong>${escapeHtml(entry.label)}</strong>
+          <span>${escapeHtml(diagnosticLabel(status))}</span>
+        </div>
+        <p>${escapeHtml(entry.check?.detail || '尚未检查到对应能力项。')}</p>
+        <div class="capability-entry-footer">
+          <span>${escapeHtml(entry.entry)}</span>
+          <button class="secondary" data-capability-entry-tab="${escapeHtml(entry.tab)}" data-capability-entry-check="${escapeHtml(entry.checkId)}">打开</button>
+        </div>
+      </article>
+    `;
+  }).join('');
+  capabilityEntryGrid.querySelectorAll('[data-capability-entry-tab]').forEach((button) => {
+    button.onclick = () => {
+      const source = {
+        check_id: button.dataset.capabilityEntryCheck,
+        target_tab: button.dataset.capabilityEntryTab,
+      };
+      handleDiagnosticNavigation(source, button.dataset.capabilityEntryTab);
+    };
+  });
+}
+
+function useDiagnosticIssueAction(id) {
+  const item = (state.diagnostics?.issues || []).find((entry) => String(entry.id) === String(id));
+  const tab = item?.action_target?.tab || '';
+  if (!item || !tab) {
+    notify('这个问题没有可跳转的处理入口', 'error');
+    return;
+  }
+  handleDiagnosticNavigation(item, tab);
+}
+
+function useDiagnosticCheckAction(id) {
+  const item = (state.diagnostics?.checks || []).find((entry) => String(entry.id) === String(id));
+  if (!item) {
+    notify('这个检查项已不存在，请重新运行自检', 'error');
+    return;
+  }
+  if (!handleDiagnosticNavigation(item, diagnosticRouteTarget(item))) {
+    notify('这个检查项没有可跳转的处理入口', 'error');
+  }
+}
+
+function useDiagnosticIssuePrompt(id) {
+  const item = (state.diagnostics?.issues || []).find((entry) => String(entry.id) === String(id));
+  const prompt = item?.fix_prompt || '';
+  const input = $('messageInput');
+  if (!item || !input || !prompt.trim()) {
+    notify('这个问题没有可填入的修复任务', 'error');
+    return;
+  }
+  setWorkbenchMode('agent');
+  switchTab('chat');
+  input.value = prompt;
+  input.focus();
+  notify(`已填入修复任务：${item.title || item.check_id}`);
+}
+
+function renderDiagnosticSelfTests(selfTests, selfTestGrid, selfTestCount) {
+  if (!selfTestGrid || !selfTestCount) return;
+  const readyTests = selfTests.filter((item) => item.readiness === 'ready').length;
+  const needsSetupTests = selfTests.filter((item) => item.readiness !== 'ready').length;
+  const filter = state.diagnosticSelfTestFilter || 'all';
+  const categoryFilter = state.diagnosticSelfTestCategory || 'all';
+  const artifactFilter = state.diagnosticSelfTestArtifact || 'all';
+  const categories = [...new Set(selfTests.map((item) => item.category).filter(Boolean))];
+  const artifacts = [...new Set(selfTests.flatMap((item) => Array.isArray(item.artifacts) ? item.artifacts : []).filter(Boolean))];
+  if (categoryFilter !== 'all' && !categories.includes(categoryFilter)) {
+    state.diagnosticSelfTestCategory = 'all';
+    writePreference('diagnostics-self-test-category', 'all');
+  }
+  if (artifactFilter !== 'all' && !artifacts.includes(artifactFilter)) {
+    state.diagnosticSelfTestArtifact = 'all';
+    writePreference('diagnostics-self-test-artifact', 'all');
+  }
+  const activeCategory = state.diagnosticSelfTestCategory || 'all';
+  const activeArtifact = state.diagnosticSelfTestArtifact || 'all';
+  const visibleSelfTests = selfTests.filter((item) => (filter === 'all' || item.readiness === filter)
+    && (activeCategory === 'all' || item.category === activeCategory)
+    && (activeArtifact === 'all' || (Array.isArray(item.artifacts) && item.artifacts.includes(activeArtifact))));
+  const readinessFilterBox = $('selfTestReadinessFilter');
+  if (readinessFilterBox) {
+    readinessFilterBox.innerHTML = [
+      `<button class="secondary" data-self-test-filter="all">全部 <span>${selfTests.length}</span></button>`,
+      `<button class="secondary" data-self-test-filter="ready">可直接测 <span>${readyTests}</span></button>`,
+      `<button class="secondary" data-self-test-filter="needs_setup">需准备 <span>${needsSetupTests}</span></button>`,
+    ].join('');
+    readinessFilterBox.querySelectorAll('[data-self-test-filter]').forEach((button) => {
+      button.classList.toggle('active', button.dataset.selfTestFilter === filter);
+      button.onclick = () => {
+        state.diagnosticSelfTestFilter = button.dataset.selfTestFilter || 'all';
+        writePreference('diagnostics-self-test-filter', state.diagnosticSelfTestFilter);
+        renderDiagnostics();
+      };
+    });
+  }
+  const categoryFilterBox = $('selfTestCategoryFilter');
+  if (categoryFilterBox) {
+    const categoryCounts = selfTests.reduce((acc, item) => {
+      if (item.category) acc[item.category] = (acc[item.category] || 0) + 1;
+      return acc;
+    }, {});
+    categoryFilterBox.innerHTML = [
+      `<button class="secondary" data-self-test-category="all">全部分类 <span>${selfTests.length}</span></button>`,
+      ...categories.map((category) => `<button class="secondary" data-self-test-category="${escapeHtml(category)}">${escapeHtml(category)} <span>${Number(categoryCounts[category] || 0)}</span></button>`),
+      '<button class="secondary self-test-reset" id="resetSelfTestFiltersBtn">重置筛选</button>',
+    ].join('');
+    categoryFilterBox.querySelectorAll('[data-self-test-category]').forEach((button) => {
+      button.classList.toggle('active', button.dataset.selfTestCategory === activeCategory);
+      button.onclick = () => {
+        state.diagnosticSelfTestCategory = button.dataset.selfTestCategory || 'all';
+        writePreference('diagnostics-self-test-category', state.diagnosticSelfTestCategory);
+        renderDiagnostics();
+      };
+    });
+    const resetButton = $('resetSelfTestFiltersBtn');
+    if (resetButton) {
+      resetButton.onclick = () => {
+        state.diagnosticSelfTestFilter = 'all';
+        state.diagnosticSelfTestCategory = 'all';
+        state.diagnosticSelfTestArtifact = 'all';
+        writePreference('diagnostics-self-test-filter', 'all');
+        writePreference('diagnostics-self-test-category', 'all');
+        writePreference('diagnostics-self-test-artifact', 'all');
+        renderDiagnostics();
+      };
+    }
+  }
+  const artifactFilterBox = $('selfTestArtifactFilter');
+  if (artifactFilterBox) {
+    const artifactCounts = selfTests.reduce((acc, item) => {
+      (Array.isArray(item.artifacts) ? item.artifacts : []).forEach((artifact) => {
+        acc[artifact] = (acc[artifact] || 0) + 1;
+      });
+      return acc;
+    }, {});
+    artifactFilterBox.innerHTML = [
+      `<button class="secondary" data-self-test-artifact="all">全部产物 <span>${selfTests.length}</span></button>`,
+      ...artifacts.map((artifact) => `<button class="secondary" data-self-test-artifact="${escapeHtml(artifact)}">${escapeHtml(String(artifact).toUpperCase())} <span>${Number(artifactCounts[artifact] || 0)}</span></button>`),
+    ].join('');
+    artifactFilterBox.querySelectorAll('[data-self-test-artifact]').forEach((button) => {
+      button.classList.toggle('active', button.dataset.selfTestArtifact === activeArtifact);
+      button.onclick = () => {
+        state.diagnosticSelfTestArtifact = button.dataset.selfTestArtifact || 'all';
+        writePreference('diagnostics-self-test-artifact', state.diagnosticSelfTestArtifact);
+        renderDiagnostics();
+      };
+    });
+  }
+  selfTestCount.textContent = selfTests.length ? `${readyTests} 可测 / ${needsSetupTests} 需准备 / ${visibleSelfTests.length} 当前` : '未检查';
+  selfTestGrid.innerHTML = visibleSelfTests.length ? visibleSelfTests.map((item) => `
+    <article class="self-test-card ${escapeHtml(item.readiness || 'needs_setup')}">
+      <div class="self-test-head"><strong>${escapeHtml(item.title || item.id || '')}</strong><span>${item.readiness === 'ready' ? '可测试' : '需准备'}</span></div>
+      <div class="self-test-meta">
+        ${item.category ? `<span>${escapeHtml(item.category)}</span>` : ''}
+        <span>${item.workbench_mode === 'expert' ? '专家模式' : '普通模式'}</span>
+        ${Array.isArray(item.artifacts) && item.artifacts.length ? item.artifacts.map((entry) => `<span>${escapeHtml(String(entry).toUpperCase())}</span>`).join('') : ''}
+      </div>
+      <p>${escapeHtml(item.prompt || '')}</p>
+      ${Array.isArray(item.requires) && item.requires.length ? `<div class="self-test-requires">${item.requires.map((entry) => `<span>${escapeHtml(entry)}</span>`).join('')}</div>` : ''}
+      ${item.setup ? `<div class="self-test-setup">${escapeHtml(item.setup)}</div>` : ''}
+      ${Array.isArray(item.expected) && item.expected.length ? `<ul>${item.expected.map((entry) => `<li>${escapeHtml(entry)}</li>`).join('')}</ul>` : ''}
+      <div class="self-test-actions">
+        <button class="secondary self-test-use" data-self-test-id="${escapeHtml(item.id || '')}">填入工作台</button>
+      </div>
+    </article>
+  `).join('') : `<div class="meta empty">${selfTests.length ? '当前筛选下没有自测用例。' : '运行自检后会给出可复制到工作台的回归任务。'}</div>`;
+  selfTestGrid.querySelectorAll('[data-self-test-id]').forEach((button) => {
+    button.onclick = () => useSelfTestPrompt(button.dataset.selfTestId);
+  });
+}
+
+function renderDiagnosticIssues(issues, issueGrid, issueCount) {
+  if (!issueGrid || !issueCount) return;
+  const blocking = issues.filter((item) => item.severity === 'blocking').length;
+  issueCount.textContent = issues.length ? `${blocking} 阻塞 / ${issues.length} 项` : '无问题';
+  issueGrid.innerHTML = issues.length ? issues.map((item) => `
+    <article class="diagnostic-issue-card ${escapeHtml(item.severity || 'attention')}">
+      <div class="diagnostic-issue-head">
+        <strong>${escapeHtml(item.title || item.check_id || '')}</strong>
+        <span>${escapeHtml(item.severity === 'blocking' ? '阻塞' : '提醒')}</span>
+      </div>
+      <p>${escapeHtml(item.detail || '')}</p>
+      ${item.action ? `<div class="diagnostic-issue-action">${escapeHtml(item.action)}</div>` : ''}
+      <div class="diagnostic-issue-actions">
+        ${item.action_target?.tab ? `<button class="secondary diagnostic-issue-use" data-issue-id="${escapeHtml(item.id || '')}">${escapeHtml(item.action_target.label || '去处理')}</button>` : ''}
+        ${item.fix_prompt ? `<button class="secondary diagnostic-issue-prompt" data-issue-prompt-id="${escapeHtml(item.id || '')}">填入修复任务</button>` : ''}
+      </div>
+    </article>
+  `).join('') : '<div class="meta empty">当前没有失败或提醒项。</div>';
+  issueGrid.querySelectorAll('[data-issue-id]').forEach((button) => {
+    button.onclick = () => useDiagnosticIssueAction(button.dataset.issueId);
+  });
+  issueGrid.querySelectorAll('[data-issue-prompt-id]').forEach((button) => {
+    button.onclick = () => useDiagnosticIssuePrompt(button.dataset.issuePromptId);
+  });
+}
+
+function renderDiagnosticNextActions(nextActions, nextActionGrid, nextActionCount) {
+  if (!nextActionGrid || !nextActionCount) return;
+  nextActionCount.textContent = nextActions.length ? `${nextActions.length} 项` : '未检查';
+  nextActionGrid.innerHTML = nextActions.length ? nextActions.map((item) => `
+    <article class="next-action-card ${escapeHtml(String(item.priority || 'P1').toLowerCase())}">
+      <div class="next-action-head">
+        <span>${escapeHtml(item.priority || 'P1')}</span>
+        <strong>${escapeHtml(item.title || item.id || '')}</strong>
+      </div>
+      <p>${escapeHtml(item.detail || '')}</p>
+      <button class="secondary next-action-use" data-next-action-id="${escapeHtml(item.id || '')}">${escapeHtml(item.action_label || '处理')}</button>
+    </article>
+  `).join('') : '<div class="meta empty">当前没有必须优先处理的事项。</div>';
+  nextActionGrid.querySelectorAll('[data-next-action-id]').forEach((button) => {
+    button.onclick = () => runNextAction(button.dataset.nextActionId);
+  });
+}
+
+function renderDiagnostics() {
+  const overview = $('diagnosticsOverview');
+  const list = $('diagnosticList');
+  const reportPreview = $('diagnosticsReportPreview');
+  const reportMeta = $('diagnosticsReportMeta');
+  const issueGrid = $('diagnosticIssueGrid');
+  const issueCount = $('diagnosticIssueCount');
+  const capabilityEntryGrid = $('capabilityEntryGrid');
+  const capabilityEntryCount = $('capabilityEntryCount');
+  const nextActionGrid = $('nextActionGrid');
+  const nextActionCount = $('nextActionCount');
+  const readinessGrid = $('readinessGrid');
+  const readinessCount = $('readinessCount');
+  const improvementGrid = $('improvementGrid');
+  const improvementCount = $('improvementCount');
+  const selfTestGrid = $('selfTestGrid');
+  const selfTestCount = $('selfTestCount');
+  if (!overview || !list) return;
+  const data = state.diagnostics || null;
+  const summary = data?.summary || { passed: 0, warnings: 0, failed: 0 };
+  const actionable = data?.actionable_summary || {};
+  overview.className = `diagnostics-overview ${data?.overall || 'idle'}`;
+  overview.innerHTML = `
+    <div><span>整体状态</span><strong>${escapeHtml(data ? diagnosticLabel(data.overall) : '尚未运行')}</strong></div>
+    <div><span>通过</span><strong>${Number(summary.passed || 0)}</strong></div>
+    <div><span>提醒</span><strong>${Number(summary.warnings || 0)}</strong></div>
+    <div><span>失败</span><strong>${Number(summary.failed || 0)}</strong></div>
+    <div><span>待配置能力</span><strong>${Number(actionable.needs_config_capabilities || 0)}</strong></div>
+    <div><span>阻塞能力</span><strong>${Number(actionable.blocked_capabilities || 0)}</strong></div>
+    <div><span>P0 优化</span><strong>${Number(actionable.p0_improvements || 0)}</strong></div>
+    <div><span>可测用例</span><strong>${Number(actionable.ready_self_tests || 0)}/${Number(actionable.total_self_tests || 0)}</strong></div>
+  `;
+  if (reportPreview && reportMeta) {
+    const report = data?.report_markdown || '';
+    reportPreview.textContent = report || '运行自检后会在这里预览可复制、可下载的 Markdown 报告。';
+    reportMeta.textContent = report ? `${data?.generated_at || '未记录时间'} · ${report.length} 字符` : '未检查';
+  }
+  renderDiagnosticCapabilityEntries(data, capabilityEntryGrid, capabilityEntryCount);
+  const issues = data?.issues || [];
+  renderDiagnosticIssues(issues, issueGrid, issueCount);
+  const nextActions = data?.next_actions || [];
+  renderDiagnosticNextActions(nextActions, nextActionGrid, nextActionCount);
+  const readiness = data?.readiness || [];
+  if (readinessGrid && readinessCount) {
+    const readyCount = readiness.filter((item) => item.state === 'ready').length;
+    readinessCount.textContent = readiness.length ? `${readyCount}/${readiness.length} 可使用` : '未检查';
+    readinessGrid.innerHTML = readiness.length ? readiness.map((item) => `
+      <article class="readiness-card ${escapeHtml(item.state || 'needs_config')}">
+        <div class="readiness-card-head">
+          <strong>${escapeHtml(item.title || item.id || '')}</strong>
+          <span>${escapeHtml(readinessLabel(item.state))}</span>
+        </div>
+        <p>${escapeHtml(item.detail || '')}</p>
+        ${item.action ? `<div class="readiness-action">${escapeHtml(item.action)}</div>` : ''}
+        ${item.action_target?.tab ? `<div class="readiness-actions"><button class="secondary readiness-use" data-readiness-id="${escapeHtml(item.id || '')}">${escapeHtml(item.action_target.label || '去处理')}</button></div>` : ''}
+      </article>
+    `).join('') : '<div class="meta empty">运行自检后会显示各项平台能力的可用状态。</div>';
+    readinessGrid.querySelectorAll('[data-readiness-id]').forEach((button) => {
+      button.onclick = () => useReadinessAction(button.dataset.readinessId);
+    });
+  }
+  const improvements = data?.improvement_backlog || [];
+  if (improvementGrid && improvementCount) {
+    const p0Count = improvements.filter((item) => item.priority === 'P0').length;
+    improvementCount.textContent = improvements.length ? `${p0Count} 个 P0 / ${improvements.length} 项` : '未检查';
+    improvementGrid.innerHTML = improvements.length ? improvements.map((item) => `
+      <article class="improvement-card ${escapeHtml(String(item.priority || 'P2').toLowerCase())} ${escapeHtml(item.status || 'planned')}">
+        <div class="improvement-card-head">
+          <div>
+            <span>${escapeHtml(item.priority || 'P2')}</span>
+            <strong>${escapeHtml(item.title || item.id || '')}</strong>
+          </div>
+          <em>${escapeHtml(improvementStatusLabel(item.status))}</em>
+        </div>
+        <p>${escapeHtml(item.detail || '')}</p>
+        <div class="improvement-reason"><strong>原因</strong><span>${escapeHtml(item.reason || '')}</span></div>
+        <div class="improvement-next"><strong>下一步</strong><span>${escapeHtml(item.next_step || '')}</span></div>
+        <div class="improvement-actions">
+          <button class="secondary improvement-use" data-improvement-id="${escapeHtml(item.id || '')}">填入工作台</button>
+        </div>
+      </article>
+    `).join('') : '<div class="meta empty">运行自检后会按优先级给出下一步开发和配置建议。</div>';
+    improvementGrid.querySelectorAll('[data-improvement-id]').forEach((button) => {
+      button.onclick = () => useImprovementPrompt(button.dataset.improvementId);
+    });
+  }
+  const selfTests = data?.self_tests || [];
+  renderDiagnosticSelfTests(selfTests, selfTestGrid, selfTestCount);
+  const checks = data?.checks || [];
+  if (!checks.length) {
+    list.innerHTML = '<div class="meta empty">点击“运行自检”查看平台关键能力是否可用。</div>';
+    return;
+  }
+  list.innerHTML = checks.map((item) => {
+    const evidence = item.evidence && Object.keys(item.evidence).length
+      ? `<pre>${escapeHtml(JSON.stringify(item.evidence, null, 2))}</pre>`
+      : '<div class="small">暂无额外证据</div>';
+    return `
+      <article class="diagnostic-card ${escapeHtml(item.status)}">
+        <div class="diagnostic-card-head">
+          <div><h2>${escapeHtml(item.title)}</h2><span>${escapeHtml(item.id)}</span></div>
+          <strong>${escapeHtml(diagnosticLabel(item.status))}</strong>
+        </div>
+        <p>${escapeHtml(item.detail || '')}</p>
+        <details>
+          <summary>证据与建议</summary>
+          ${evidence}
+          ${item.action ? `<div class="diagnostic-action">${escapeHtml(item.action)}</div>` : ''}
+          <div class="diagnostic-detail-actions">
+            <button class="secondary diagnostic-check-use" data-check-id="${escapeHtml(item.id || '')}">${escapeHtml(item.action_target?.label || '去处理')}</button>
+          </div>
+        </details>
+      </article>
+    `;
+  }).join('');
+  list.querySelectorAll('[data-check-id]').forEach((button) => {
+    button.onclick = () => useDiagnosticCheckAction(button.dataset.checkId);
+  });
+}
+
+function newKnowledgeBase({ clearListSelection = true } = {}) {
+  if (clearListSelection) {
+    state.selectedKnowledgeBase = null;
+    state.knowledgeDocuments = [];
+    state.knowledgeSearchResults = [];
+    renderKnowledgeBases();
+  }
+  $('knowledgeEditorTitle').textContent = '新建知识库';
+  $('knowledgeEditorMeta').textContent = '保存后即可上传文档建立索引';
+  $('knowledgeBaseId').value = '';
+  $('knowledgeBaseName').value = '';
+  $('knowledgeBaseDescription').value = '';
+  $('knowledgeBaseVisibility').value = 'workspace';
+  $('knowledgeBaseEnabled').checked = true;
+  $('deleteKnowledgeBaseBtn').classList.add('hidden');
+  $('knowledgeFileInput').disabled = true;
+  $('knowledgeSearchInput').disabled = true;
+  $('knowledgeSearchBtn').disabled = true;
+  renderKnowledgeDocuments();
+  renderKnowledgeSearchResults();
+}
+
+async function selectKnowledgeBase(id, { reload = true } = {}) {
+  if (reload) state.knowledgeBases = await api(`/api/knowledge-bases?${knowledgeQuery()}`);
+  const item = state.knowledgeBases.find((base) => base.id === id);
+  if (!item) return;
+  state.selectedKnowledgeBase = item;
+  renderKnowledgeBases();
+  $('knowledgeEditorTitle').textContent = item.name;
+  $('knowledgeEditorMeta').textContent = `${item.id} · 更新于 ${runtimeTime(item.updated_at)}`;
+  $('knowledgeBaseId').value = item.id;
+  $('knowledgeBaseName').value = item.name || '';
+  $('knowledgeBaseDescription').value = item.description || '';
+  $('knowledgeBaseVisibility').value = item.visibility || 'workspace';
+  $('knowledgeBaseEnabled').checked = !!item.enabled;
+  $('deleteKnowledgeBaseBtn').classList.remove('hidden');
+  $('knowledgeFileInput').disabled = false;
+  $('knowledgeSearchInput').disabled = false;
+  $('knowledgeSearchBtn').disabled = false;
+  state.knowledgeDocuments = await api(`/api/knowledge-bases/${encodeURIComponent(item.id)}/documents?${knowledgeQuery()}`);
+  state.knowledgeSearchResults = [];
+  renderKnowledgeDocuments();
+  renderKnowledgeSearchResults();
+  scrollKnowledgeBaseCardIntoView(id);
+}
+
+async function saveKnowledgeBase() {
+  const name = $('knowledgeBaseName').value.trim();
+  if (!name) return notify('请填写知识库名称', 'error');
+  const button = $('saveKnowledgeBaseBtn'); setBusy(button, true);
+  try {
+    const baseId = $('knowledgeBaseId').value;
+    const payload = {
+      name,
+      description: $('knowledgeBaseDescription').value.trim(),
+      visibility: $('knowledgeBaseVisibility').value,
+      enabled: $('knowledgeBaseEnabled').checked,
+    };
+    const saved = baseId
+      ? await api(`/api/knowledge-bases/${encodeURIComponent(baseId)}?${knowledgeQuery()}`, {
+        method: 'PUT',
+        body: JSON.stringify(payload),
+      })
+      : await api('/api/knowledge-bases', {
+        method: 'POST',
+        body: JSON.stringify({ ...knowledgeScopeValues(), ...payload }),
+      });
+    await loadKnowledgeBasesOnly({ preserveSelection: false });
+    await selectKnowledgeBase(saved.id, { reload: false });
+    notify(`知识库“${saved.name}”已保存`);
+  } catch (err) { notify(`知识库保存失败：${err.message || err}`, 'error'); }
+  finally { setBusy(button, false); }
+}
+
+async function deleteKnowledgeBase() {
+  const item = state.selectedKnowledgeBase;
+  if (!item || !confirm(`确定删除知识库“${item.name}”吗？该知识库下的文档索引和片段会一并删除，原始上传文件不受影响。`)) return;
+  const button = $('deleteKnowledgeBaseBtn'); setBusy(button, true, '删除中…');
+  try {
+    await api(`/api/knowledge-bases/${encodeURIComponent(item.id)}?${knowledgeQuery()}`, { method: 'DELETE' });
+    state.selectedKnowledgeBase = null;
+    state.knowledgeDocuments = [];
+    state.knowledgeSearchResults = [];
+    await loadKnowledgeBasesOnly({ preserveSelection: false });
+    notify('知识库已删除，后续任务不会再检索它');
+  } catch (err) { notify(`知识库删除失败：${err.message || err}`, 'error'); }
+  finally { setBusy(button, false); }
+}
+
+async function indexKnowledgeFile(file) {
+  const base = state.selectedKnowledgeBase;
+  if (!base) return notify('请先选择或创建知识库', 'error');
+  const input = $('knowledgeFileInput');
+  input.disabled = true;
+  try {
+    const form = new FormData();
+    form.append('file', file);
+    const uploaded = await api('/api/uploads', { method: 'POST', body: form });
+    const document = await api(`/api/knowledge-bases/${encodeURIComponent(base.id)}/documents/upload?${knowledgeQuery()}`, {
+      method: 'POST',
+      body: JSON.stringify({ upload_id: uploaded.id }),
+    });
+    state.knowledgeDocuments = [document, ...state.knowledgeDocuments.filter((item) => item.id !== document.id)];
+    renderKnowledgeDocuments();
+    notify(`已索引“${document.name}”，生成 ${document.chunk_count || 0} 个片段`);
+  } catch (err) { notify(`文档索引失败：${err.message || err}`, 'error'); }
+  finally {
+    input.disabled = !state.selectedKnowledgeBase;
+    input.value = '';
+  }
+}
+
+async function searchKnowledge() {
+  const query = $('knowledgeSearchInput').value.trim();
+  if (!query) return notify('请输入检索问题或关键词', 'error');
+  const baseId = state.selectedKnowledgeBase?.id || '';
+  const button = $('knowledgeSearchBtn'); setBusy(button, true, '检索中…');
+  try {
+    const result = await api(`/api/knowledge/search?${knowledgeQuery({ q: query, base_id: baseId, limit: '8' })}`);
+    state.knowledgeSearchResults = result.matches || [];
+    renderKnowledgeSearchResults();
+  } catch (err) { notify(`知识库检索失败：${err.message || err}`, 'error'); }
+  finally { setBusy(button, false); }
 }
 
 async function loadMemoriesOnly({ preserveSelection = false } = {}) {
@@ -2318,6 +5004,12 @@ function renderMemories() {
   document.querySelectorAll('[data-memory]').forEach((element) => { element.onclick = () => selectMemory(element.dataset.memory); });
 }
 
+function scrollMemoryCardIntoView(id) {
+  if (!id) return;
+  const card = document.querySelector(`[data-memory="${CSS.escape(id)}"]`);
+  if (card) card.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+}
+
 function memoryScopeId(scopeType) {
   const values = memoryScopeValues();
   return ({ organization: values.organization_id, workspace: values.workspace_id, user: values.user_id, agent: values.agent_id, conversation: values.conversation_id })[scopeType] || '';
@@ -2371,6 +5063,7 @@ async function selectMemory(id, { reload = true } = {}) {
   $('memoryRevisions').innerHTML = revisions.slice().reverse().map((revision) => `
     <div class="memory-revision"><strong>版本 ${revision.revision}</strong><span>${escapeHtml(revision.reason)} · ${escapeHtml(runtimeTime(revision.created_at))}</span></div>
   `).join('') || '<div class="meta empty">暂无修订记录</div>';
+  scrollMemoryCardIntoView(id);
 }
 
 function memoryPayload() {
@@ -2440,6 +5133,16 @@ function safeArtifactDownloadUrl(value, { inline = false } = {}) {
   }
 }
 
+function safeArtifactPreviewUrl(value) {
+  try {
+    const url = new URL(String(value || ''), window.location.href);
+    if (url.origin !== window.location.origin || !/^\/api\/artifacts\/[^/]+\/preview$/.test(url.pathname)) return '';
+    return url.pathname;
+  } catch (_) {
+    return '';
+  }
+}
+
 function resetArtifactPreview(message = '从左侧选择一个文件。') {
   $('artifactPreviewTitle').textContent = '选择文件预览';
   $('artifactPreviewMeta').textContent = '支持 Word、PDF、PPT、Excel、Markdown 和 HTML';
@@ -2453,7 +5156,7 @@ function resetArtifactPreview(message = '从左侧选择一个文件。') {
 async function loadArtifactsOnly({ preserveSelection = false } = {}) {
   const selectedId = preserveSelection ? state.selectedArtifact?.id : '';
   const kind = $('artifactKindFilter')?.value || '';
-  const query = new URLSearchParams({ workspace_id: 'default', limit: '300' });
+  const query = new URLSearchParams({ workspace_id: currentWorkspaceId(), limit: '300' });
   if (kind) query.set('kind', kind);
   state.artifacts = runtimeArray(await api(`/api/artifacts?${query.toString()}`));
   state.selectedArtifact = selectedId ? state.artifacts.find((item) => item.id === selectedId) || null : null;
@@ -2480,6 +5183,12 @@ function renderArtifactWorkspace() {
   $('artifactWorkspaceList').querySelectorAll('[data-workspace-artifact]').forEach((element) => {
     element.onclick = () => selectArtifact(element.dataset.workspaceArtifact).catch((err) => notify(`产物预览失败：${err.message || err}`, 'error'));
   });
+}
+
+function scrollArtifactCardIntoView(id) {
+  if (!id) return;
+  const card = document.querySelector(`[data-workspace-artifact="${CSS.escape(id)}"]`);
+  if (card) card.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
 }
 
 async function openArtifactPreview(id) {
@@ -2515,6 +5224,7 @@ async function selectArtifact(id, { reload = true } = {}) {
     $('artifactPreview').textContent = `预览生成失败：${err.message || err}`;
     throw err;
   }
+  scrollArtifactCardIntoView(id);
 }
 
 function previewTable(rows) {
@@ -2649,13 +5359,371 @@ function renderCapabilities() {
       <article class="capability-card">
         <div><strong>${escapeHtml(item.title)}</strong><span class="capability-state ${item.state.className}">${escapeHtml(item.state.label)}</span></div>
         <p>${escapeHtml(item.detail)}</p>
+        ${item.title === '文档交付' && !pptxReady ? '<button class="text-button capability-action" data-open-pptx-config type="button">打开 PPTX 配置向导</button>' : ''}
       </article>`).join('')}
     </div>`;
+  $('capabilities').querySelectorAll('[data-open-pptx-config]').forEach((button) => {
+    button.onclick = () => openPptxConfigDialog().catch((err) => notify(`读取 PPTX 配置失败：${err.message || err}`, 'error'));
+  });
 }
-function renderModels() { $('modelCount').textContent = state.models.length; $('modelList').innerHTML = state.models.map((m) => `<div class="card ${state.selectedModel?.id === m.id ? 'active' : ''}" data-model="${escapeHtml(m.id)}"><div class="card-title"><span>${escapeHtml(m.name)}</span><span class="status">${m.enabled ? '已启用' : '已停用'}</span></div><div class="card-desc">${escapeHtml(m.provider)} · ${escapeHtml(m.model)}</div><div class="small">${escapeHtml(m.id)} · ${m.has_api_key ? 'API Key 已在本机加密保存' : (m.api_key_env ? `环境变量 ${escapeHtml(m.api_key_env)}` : '无需密钥')}</div></div>`).join('') || '<div class="meta empty">尚未配置模型</div>'; $('agentModel').innerHTML = state.models.filter((m) => m.enabled).map((m) => `<option value="${escapeHtml(m.id)}">${escapeHtml(m.name)}</option>`).join(''); document.querySelectorAll('[data-model]').forEach((el) => el.onclick = () => selectModel(el.dataset.model)); }
-function toggleModelKeyMode() { const direct = $('modelKeyMode').value === 'direct'; $('modelKeyEnvField').classList.toggle('hidden', direct); $('modelKeyDirectField').classList.toggle('hidden', !direct); $('modelKeyStatus').textContent = direct ? (state.selectedModel?.has_api_key ? '本机已保存加密密钥；输入新值可替换，留空保持不变。' : '密钥将在本机加密保存；生产部署建议接入专用密钥服务。') : '平台运行时从服务端环境变量读取密钥。'; }
-function newModel() { state.selectedModel = null; renderModels(); $('deleteModelBtn').classList.add('hidden'); $('saveModelBtn').disabled = false; $('modelEditorTitle').textContent = '添加模型配置'; $('modelId').disabled = false; $('modelId').value = 'openai-main'; $('modelName').value = 'OpenAI 主模型'; $('modelProvider').value = 'openai_compatible'; $('modelNameValue').value = ''; $('modelBaseUrl').value = 'https://api.openai.com/v1'; $('modelKeyMode').value = 'env'; $('modelApiKeyEnv').value = 'OPENAI_API_KEY'; $('modelApiKey').value = ''; $('modelConfig').value = '{"temperature":0.2,"timeout":90}'; $('modelEnabled').checked = true; $('modelTestResult').textContent = '填写后保存，再测试连接'; toggleModelKeyMode(); }
-function selectModel(id) { const m = state.models.find((x) => x.id === id); if (!m) return; state.selectedModel = m; renderModels(); $('deleteModelBtn').classList.toggle('hidden', id === 'deterministic'); $('modelId').disabled = true; $('modelId').value = m.id; $('modelName').value = m.name; $('modelProvider').value = m.provider; $('modelNameValue').value = m.model; $('modelBaseUrl').value = m.base_url || ''; $('modelKeyMode').value = m.api_key_mode || (m.has_api_key ? 'direct' : 'env'); $('modelApiKeyEnv').value = m.api_key_env || ''; $('modelApiKey').value = ''; $('modelConfig').value = formatJson(m.config || {}); $('modelEnabled').checked = !!m.enabled; if (id === 'deterministic') { $('modelEditorTitle').textContent = '内置离线模型（只读）'; $('modelKeyStatus').textContent = '内置模型不需要密钥。'; $('saveModelBtn').disabled = true; $('modelTestResult').textContent = '离线确定性模型可直接使用，无需连接测试'; return; } $('saveModelBtn').disabled = false; $('modelEditorTitle').textContent = m.name; toggleModelKeyMode(); }
+
+function renderPptxConfigInstructions(config = {}) {
+  const instructions = config.instructions || {};
+  const renderList = (title, values) => `<section><strong>${escapeHtml(title)}</strong><div>${runtimeArray(values).map((item, index) => `${index + 1}. ${escapeHtml(item)}`).join('<br>')}</div></section>`;
+  $('pptxConfigInstructions').innerHTML = [
+    renderList('推荐：平台内置 Python 生成器', instructions.native_python),
+    renderList('已有 Artifact Tool 时', instructions.artifact_tool),
+    `<section><strong>平台实际写入的配置项</strong><div>${runtimeArray(instructions.environment).map((item) => `<code>${escapeHtml(item)}</code>`).join('<br>')}</div></section>`,
+    '<section><strong>为什么需要确认</strong><div>生成 PPTX 会在本机创建文件。平台不会从任意网址下载或执行组件；只有你点击确认后，才会保存本机配置并立即启用。</div></section>',
+  ].join('');
+}
+
+function renderPptxConfigStatus(config = {}) {
+  state.pptxConfiguration = config;
+  const status = $('pptxConfigStatus');
+  if (!status) return;
+  const configured = !!config.configured;
+  status.className = `config-status ${configured ? 'ready' : 'pending'}`;
+  status.innerHTML = configured
+    ? `<strong>当前已可生成 PPTX</strong><br>方式：${escapeHtml(config.mode === 'python' ? '平台内置 Python' : 'Artifact Tool')}。${config.node_binary ? `Node.js：${escapeHtml(config.node_binary)}` : ''}`
+    : `<strong>当前尚未配置 PPTX 生成器</strong><br>${escapeHtml(config.reason || '请选择一种生成方式并确认保存。')}`;
+  if (config.node_binary) $('pptxNodeBinary').value = config.node_binary;
+  if (config.entrypoint) $('pptxArtifactEntrypoint').value = config.entrypoint;
+  const selectedMode = config.mode === 'artifact_tool' ? 'artifact' : 'python';
+  $('pptxModePython').checked = selectedMode === 'python';
+  $('pptxModeArtifact').checked = selectedMode === 'artifact';
+  $('pptxArtifactFields').classList.toggle('hidden', selectedMode !== 'artifact');
+  renderPptxConfigInstructions(config);
+}
+
+async function loadPptxConfiguration() {
+  const config = await api('/api/presentation/configuration');
+  renderPptxConfigStatus(config);
+  return config;
+}
+
+async function openPptxConfigDialog() {
+  $('pptxConfigDialog').classList.remove('hidden');
+  await loadPptxConfiguration();
+}
+
+function closePptxConfigDialog() {
+  $('pptxConfigDialog').classList.add('hidden');
+}
+
+async function savePptxConfiguration() {
+  const mode = document.querySelector('input[name="pptxMode"]:checked')?.value || 'python';
+  const confirmed = confirm(
+    mode === 'python'
+      ? '确认启用平台内置 Python PPTX 生成器？平台会写入本机 .env.local，并立即生效。'
+      : '确认保存 Artifact Tool 路径？平台会验证入口并写入本机 .env.local。',
+  );
+  if (!confirmed) return;
+  const button = $('savePptxConfigBtn');
+  setBusy(button, true, '验证并保存中…');
+  try {
+    const result = await api('/api/presentation/configure', {
+      method: 'POST',
+      body: JSON.stringify({
+        mode,
+        confirmed: true,
+        node_binary: $('pptxNodeBinary').value.trim() || 'node',
+        entrypoint: $('pptxArtifactEntrypoint').value.trim(),
+      }),
+    });
+    renderPptxConfigStatus(result.configuration || {});
+    state.capabilities = await api('/api/capabilities');
+    renderCapabilities();
+    notify('PPTX 生成器配置成功，当前服务已立即生效');
+  } catch (err) {
+    const status = $('pptxConfigStatus');
+    status.className = 'config-status error';
+    status.textContent = err.message || 'PPTX 配置失败';
+    notify(`PPTX 配置失败：${err.message || err}`, 'error');
+  } finally {
+    setBusy(button, false);
+  }
+}
+
+async function loadMarketplaceOnly() {
+  state.marketplace = await api('/api/marketplace');
+  renderMarketplace();
+  return state.marketplace;
+}
+
+function marketplacePermissionLabel(key) {
+  return {
+    reads_uploaded_files: '读取附件正文',
+    writes_artifacts: '生成文件',
+    runs_local_process: '本地进程',
+    uses_network: '联网访问',
+  }[key] || key;
+}
+
+function renderMarketplacePlan(item, fallbackTools = []) {
+  const plan = item.install_plan && typeof item.install_plan === 'object' ? item.install_plan : {};
+  const permissions = plan.permissions && typeof plan.permissions === 'object' ? plan.permissions : {};
+  const activePermissions = Object.entries(permissions).filter(([, value]) => !!value).map(([key]) => marketplacePermissionLabel(key));
+  const willCreate = Array.isArray(plan.will_create) ? plan.will_create : [];
+  const willEnable = Array.isArray(plan.will_enable) ? plan.will_enable : [];
+  const requiredMcps = Array.isArray(plan.required_mcps) ? plan.required_mcps : [];
+  const tools = Array.isArray(plan.tools) ? plan.tools : fallbackTools;
+  const effects = Array.isArray(plan.tool_effects) ? plan.tool_effects : [];
+  const changes = [
+    willCreate.length ? `创建 ${willCreate.join('、')}` : '',
+    willEnable.length ? `启用 ${willEnable.join('、')}` : '',
+  ].filter(Boolean);
+  return `
+    <div class="marketplace-plan">
+      <div class="marketplace-plan-row"><span>安装影响</span><strong>${escapeHtml(changes.join('；') || (item.installed ? '无需变更' : '登记能力'))}</strong></div>
+      ${activePermissions.length ? `<div class="marketplace-tags">${activePermissions.map((label) => `<span>${escapeHtml(label)}</span>`).join('')}</div>` : '<div class="marketplace-tags muted"><span>不请求额外运行权限</span></div>'}
+      ${requiredMcps.length ? `<div class="small">依赖 MCP：${escapeHtml(requiredMcps.join('、'))}</div>` : ''}
+      ${tools.length ? `<div class="small">工具：${escapeHtml(tools.join('、'))}${effects.length ? ` · ${escapeHtml(effects.join('/'))}` : ''}</div>` : ''}
+      ${plan.impact ? `<p>${escapeHtml(plan.impact)}</p>` : ''}
+      ${plan.post_install ? `<p class="marketplace-post-install">${escapeHtml(plan.post_install)}</p>` : ''}
+    </div>
+  `;
+}
+
+function renderMarketplace() {
+  const market = state.marketplace || { skills: [], mcp_servers: [] };
+  const skills = Array.isArray(market.skills) ? market.skills : [];
+  const mcps = Array.isArray(market.mcp_servers) ? market.mcp_servers : [];
+  $('marketplaceSkillCount').textContent = String(skills.length);
+  $('marketplaceMcpCount').textContent = String(mcps.length);
+  $('marketplaceSkillList').innerHTML = skills.map((item) => `
+    <article class="card marketplace-card ${item.installed ? 'active' : ''} ${state.marketplaceFocusId === item.id ? 'focus' : ''}" data-marketplace-skill="${escapeHtml(item.id)}">
+      <div class="card-title"><span>${escapeHtml(item.name)}</span><span class="status ${item.enabled ? 'completed' : ''}">${item.installed ? (item.enabled ? '已安装' : '已停用') : '未安装'}</span></div>
+      <div class="card-desc">${escapeHtml(item.description)}</div>
+      <div class="small">${escapeHtml(item.source_label || '市场推荐')} · ${escapeHtml((item.keywords || []).join('、') || '无关键词')}</div>
+      ${renderMarketplacePlan(item)}
+      <div class="marketplace-actions">
+        <button class="secondary" data-install-market-skill="${escapeHtml(item.id)}">${item.installed ? (item.enabled ? '已安装' : '启用') : '安装'}</button>
+        <button class="text-button" data-open-skill="${escapeHtml(item.id)}">查看</button>
+      </div>
+    </article>
+  `).join('') || '<div class="meta empty">暂无推荐 Skill。</div>';
+  $('marketplaceMcpList').innerHTML = mcps.map((item) => `
+    <article class="card marketplace-card ${item.installed ? 'active' : ''} ${state.marketplaceFocusId === item.id ? 'focus' : ''}" data-marketplace-mcp="${escapeHtml(item.id)}">
+      <div class="card-title"><span>${escapeHtml(item.name)}</span><span class="status ${item.enabled ? 'completed' : ''}">${item.installed ? (item.enabled ? '已启用' : '已停用') : '未安装'}</span></div>
+      <div class="card-desc">${escapeHtml(item.description)}</div>
+      <div class="small">${escapeHtml(item.source_label || '平台内置 MCP')} · ${escapeHtml((item.tools || []).join('、') || '无工具')}</div>
+      ${renderMarketplacePlan(item, item.tools || [])}
+      <div class="marketplace-actions">
+        <button class="secondary" data-enable-market-mcp="${escapeHtml(item.id)}">${item.installed ? (item.enabled ? '已启用' : '启用') : '启用'}</button>
+        <button class="text-button" data-open-mcp="${escapeHtml(item.id)}">查看</button>
+      </div>
+    </article>
+  `).join('') || '<div class="meta empty">暂无推荐 MCP。</div>';
+  document.querySelectorAll('[data-install-market-skill]').forEach((btn) => {
+    btn.onclick = () => installMarketplaceSkill(btn.dataset.installMarketSkill);
+  });
+  document.querySelectorAll('[data-enable-market-mcp]').forEach((btn) => {
+    btn.onclick = () => enableMarketplaceMcp(btn.dataset.enableMarketMcp);
+  });
+  document.querySelectorAll('[data-open-skill]').forEach((btn) => {
+    btn.onclick = async () => {
+      switchTab('skills');
+      const skillId = btn.dataset.openSkill;
+      if (state.skills.some((item) => item.id === skillId)) {
+        await selectSkill(skillId).catch((err) => notify(`技能读取失败：${err.message || err}`, 'error'));
+      } else {
+        notify('该 Skill 尚未安装，可直接点击安装。');
+      }
+    };
+  });
+  document.querySelectorAll('[data-open-mcp]').forEach((btn) => {
+    btn.onclick = async () => {
+      switchTab('mcp');
+      const serverId = btn.dataset.openMcp;
+      if (state.mcp.some((item) => item.id === serverId)) {
+        await selectMcp(serverId).catch((err) => notify(`工具服务读取失败：${err.message || err}`, 'error'));
+      }
+    };
+  });
+  if (state.marketplaceFocusId) {
+    const focusElement = document.querySelector(`[data-marketplace-skill="${CSS.escape(state.marketplaceFocusId)}"], [data-marketplace-mcp="${CSS.escape(state.marketplaceFocusId)}"]`);
+    if (focusElement) focusElement.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+    state.marketplaceFocusId = '';
+  }
+}
+
+async function installMarketplaceSkill(skillId) {
+  const button = document.querySelector(`[data-install-market-skill="${CSS.escape(skillId)}"]`);
+  if (button) setBusy(button, true, '安装中…');
+  try {
+    const installed = await api(`/api/marketplace/skills/${encodeURIComponent(skillId)}/install`, { method: 'POST' });
+    state.skills = await api('/api/skills');
+    state.marketplace = await api('/api/marketplace');
+    renderSkills();
+    renderMarketplace();
+    await selectSkill(installed.id);
+    notify(`技能“${installed.name}”已准备好`);
+  } catch (err) {
+    notify(`Skill 安装失败：${err.message || err}`, 'error');
+  } finally {
+    if (button) setBusy(button, false);
+  }
+}
+
+async function enableMarketplaceMcp(serverId) {
+  const button = document.querySelector(`[data-enable-market-mcp="${CSS.escape(serverId)}"]`);
+  if (button) setBusy(button, true, '启用中…');
+  try {
+    await api(`/api/marketplace/mcp/${encodeURIComponent(serverId)}/enable`, { method: 'POST' });
+    state.mcp = await api('/api/mcp');
+    state.marketplace = await api('/api/marketplace');
+    renderMcp();
+    renderMarketplace();
+    await selectMcp(serverId);
+    notify(`工具服务“${serverId}”已启用`);
+  } catch (err) {
+    notify(`MCP 启用失败：${err.message || err}`, 'error');
+  } finally {
+    if (button) setBusy(button, false);
+  }
+}
+function modelReadinessLabel(model) {
+  return model?.readiness?.label || (model?.enabled ? '已启用' : '已停用');
+}
+
+function modelReadinessClass(model) {
+  const stateValue = model?.readiness?.state || (model?.enabled ? 'ready' : 'off');
+  if (stateValue === 'ready') return 'ready';
+  if (stateValue === 'off') return 'off';
+  return 'pending';
+}
+
+function modelCredentialText(model) {
+  if (model.provider === 'deterministic') return '无需密钥';
+  if (model.has_api_key) return '直接 API Key 已加密保存';
+  if (model.api_key_env) return `环境变量 ${model.api_key_env}`;
+  return '未配置密钥';
+}
+
+function modelCapabilityTags(model) {
+  const caps = model.capabilities || {};
+  const tags = [];
+  tags.push(caps.protocol === 'offline' ? '离线' : 'OpenAI Chat');
+  if (caps.streaming) tags.push('流式');
+  if (caps.tool_calling) tags.push('工具调用');
+  if (caps.online_required) tags.push('需联网');
+  const contextWindow = caps.context_window;
+  if (contextWindow) tags.push(`上下文 ${contextWindow}`);
+  return tags;
+}
+
+function modelLastTest(model) {
+  const local = state.modelTestResults[model.id];
+  if (local) {
+    return {
+      status: local.ok ? 'pass' : 'fail',
+      message: local.message || '',
+      tested_at: local.tested_at || '',
+    };
+  }
+  return model.last_test || { status: 'untested', message: '尚未测试连接', tested_at: '' };
+}
+
+function modelTestBadge(model) {
+  const result = modelLastTest(model);
+  if (!result || result.status === 'untested') return '<span class="model-test-badge pending">未测试</span>';
+  return `<span class="model-test-badge ${result.status === 'pass' ? 'ready' : 'failed'}">${result.status === 'pass' ? '测试通过' : '测试失败'}</span>`;
+}
+
+function modelTestSummary(model) {
+  const result = modelLastTest(model);
+  if (!result || result.status === 'untested') return '最近测试：未测试';
+  const label = result.status === 'pass' ? '最近测试通过' : '最近测试失败';
+  const time = result.tested_at ? ` · ${result.tested_at}` : '';
+  return `${label}${time}${result.message ? ` · ${result.message}` : ''}`;
+}
+
+function renderModels() {
+  $('modelCount').textContent = state.models.length;
+  $('modelList').innerHTML = state.models.map((m) => {
+    const tags = modelCapabilityTags(m);
+    return `<div class="card model-card ${state.selectedModel?.id === m.id ? 'active' : ''}" data-model="${escapeHtml(m.id)}">
+      <div class="card-title"><span>${escapeHtml(m.name)}</span><span class="status ${escapeHtml(modelReadinessClass(m))}">${escapeHtml(modelReadinessLabel(m))}</span></div>
+      <div class="card-desc">${escapeHtml(m.provider)} · ${escapeHtml(m.model)}</div>
+      <div class="model-meta-row"><span>${escapeHtml(m.id)}</span>${modelTestBadge(m)}</div>
+      <div class="model-tags">${tags.map((tag) => `<span>${escapeHtml(tag)}</span>`).join('')}</div>
+      <div class="small">${escapeHtml(modelCredentialText(m))}</div>
+      <div class="model-test-summary">${escapeHtml(modelTestSummary(m))}</div>
+      ${m.readiness?.detail ? `<div class="model-readiness-detail">${escapeHtml(m.readiness.detail)}</div>` : ''}
+    </div>`;
+  }).join('') || '<div class="meta empty">尚未配置模型</div>';
+  $('agentModel').innerHTML = state.models.filter((m) => m.enabled).map((m) => `<option value="${escapeHtml(m.id)}">${escapeHtml(m.name)}</option>`).join('');
+  document.querySelectorAll('[data-model]').forEach((el) => el.onclick = () => selectModel(el.dataset.model));
+}
+
+function toggleModelKeyMode() {
+  const direct = $('modelKeyMode').value === 'direct';
+  $('modelKeyEnvField').classList.toggle('hidden', direct);
+  $('modelKeyDirectField').classList.toggle('hidden', !direct);
+  $('modelKeyStatus').textContent = direct
+    ? (state.selectedModel?.has_api_key ? '本机已保存加密密钥；输入新值可替换，留空保持不变。' : '密钥将在本机加密保存；生产部署建议接入专用密钥服务。')
+    : '平台运行时从服务端环境变量读取密钥；保存的是变量名，不保存明文。';
+}
+
+function newModel() {
+  state.selectedModel = null;
+  renderModels();
+  $('deleteModelBtn').classList.add('hidden');
+  $('saveModelBtn').disabled = false;
+  $('modelEditorTitle').textContent = '添加模型配置';
+  $('modelId').disabled = false;
+  $('modelId').value = 'openai-main';
+  $('modelName').value = 'OpenAI 主模型';
+  $('modelProvider').value = 'openai_compatible';
+  $('modelNameValue').value = '';
+  $('modelBaseUrl').value = 'https://api.openai.com/v1';
+  $('modelKeyMode').value = 'env';
+  $('modelApiKeyEnv').value = 'OPENAI_API_KEY';
+  $('modelApiKey').value = '';
+  $('modelConfig').value = '{"temperature":0.2,"timeout":90}';
+  $('modelEnabled').checked = true;
+  $('modelTestResult').textContent = '填写后保存，再测试连接。保存成功后会出现在左侧列表和工作台模型选择器。';
+  toggleModelKeyMode();
+}
+
+function selectModel(id) {
+  const m = state.models.find((x) => x.id === id);
+  if (!m) return;
+  state.selectedModel = m;
+  renderModels();
+  requestAnimationFrame(() => {
+    const card = document.querySelector(`[data-model="${CSS.escape(id)}"]`);
+    if (card) card.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+  });
+  $('deleteModelBtn').classList.toggle('hidden', id === 'deterministic');
+  $('modelId').disabled = true;
+  $('modelId').value = m.id;
+  $('modelName').value = m.name;
+  $('modelProvider').value = m.provider;
+  $('modelNameValue').value = m.model;
+  $('modelBaseUrl').value = m.base_url || '';
+  $('modelKeyMode').value = m.api_key_mode || (m.has_api_key ? 'direct' : 'env');
+  $('modelApiKeyEnv').value = m.api_key_env || '';
+  $('modelApiKey').value = '';
+  $('modelConfig').value = formatJson(m.config || {});
+  $('modelEnabled').checked = !!m.enabled;
+  const lastTest = modelLastTest(m);
+  if (id === 'deterministic') {
+    $('modelEditorTitle').textContent = '内置离线模型（只读）';
+    $('modelKeyStatus').textContent = '内置模型不需要密钥。';
+    $('saveModelBtn').disabled = true;
+    $('modelTestResult').textContent = '离线确定性模型可直接使用，无需连接测试。';
+    return;
+  }
+  $('saveModelBtn').disabled = false;
+  $('modelEditorTitle').textContent = m.name;
+  $('modelTestResult').textContent = lastTest && lastTest.status !== 'untested'
+    ? `${lastTest.status === 'pass' ? '最近测试通过' : '最近测试失败'}：${lastTest.message || ''}${lastTest.tested_at ? `\n时间：${lastTest.tested_at}` : ''}`
+    : `${m.readiness?.label || '尚未测试'}：${m.readiness?.detail || '保存后可测试连接。'}`;
+  toggleModelKeyMode();
+  renderWorkbenchModelStatus();
+}
 
 async function deleteModel() {
   const model = state.selectedModel;
@@ -2663,6 +5731,7 @@ async function deleteModel() {
   if (!confirm(`确定删除模型“${model.name}”吗？`)) return;
   await api(`/api/models/${model.id}`, { method: 'DELETE' });
   state.models = await api('/api/models');
+  delete state.modelTestResults[model.id];
   newModel(); renderModels(); renderTaskModelSelect(); notify(`模型“${model.name}”已删除`);
 }
 async function saveModel() {
@@ -2674,6 +5743,7 @@ async function saveModel() {
     if (state.selectedModel?.id === 'deterministic') throw new Error('内置离线模型不能修改，请点击“添加模型”');
     if (state.selectedModel) await api(`/api/models/${state.selectedModel.id}`, { method: 'PUT', body: JSON.stringify(payload) });
     else await api('/api/models', { method: 'POST', body: JSON.stringify(payload) });
+    delete state.modelTestResults[payload.id];
     state.models = await api('/api/models'); selectModel(payload.id); renderModels(); renderTaskModelSelect();
     $('modelTestResult').textContent = `已保存：${payload.name}（${payload.model}）\n现在可点击“测试连接”，也可在工作台选择该模型。`;
     notify(`模型“${payload.name}”已保存，可在智能体配置中选择`);
@@ -2688,29 +5758,92 @@ async function testModel() {
   const button = $('testModelBtn'); setBusy(button, true, '测试中…'); $('modelTestResult').textContent = '正在连接模型…';
   try {
     const result = await api(`/api/models/${modelId}/test`, { method: 'POST' });
-    $('modelTestResult').textContent = formatJson(result);
+    state.modelTestResults[modelId] = { ok: true, message: String(result.response || 'OK').slice(0, 300), tested_at: new Date().toISOString() };
+    $('modelTestResult').textContent = `测试通过：${String(result.response || 'OK').slice(0, 300)}`;
+    state.models = await api('/api/models');
+    renderModels();
+    renderTaskModelSelect();
+    if (state.selectedModel?.id === modelId) selectModel(modelId);
     notify('模型连接测试成功');
   } catch (err) {
+    state.modelTestResults[modelId] = { ok: false, message: String(err.message || err).slice(0, 300), tested_at: new Date().toISOString() };
     $('modelTestResult').textContent = String(err.message || err);
+    renderModels();
+    renderWorkbenchModelStatus();
     notify(`模型连接失败：${err.message || err}`, 'error');
   } finally { setBusy(button, false); }
 }
 
-async function uploadFiles(files) { for (const file of files) { const form = new FormData(); form.append('file', file); state.uploads.push(await api('/api/uploads', { method: 'POST', body: form })); } renderUploads(); }
-function renderUploads() { $('uploadList').innerHTML = state.uploads.map((f) => `<span class="upload-chip">${escapeHtml(f.name)} · ${Math.ceil(f.size / 1024)}KB</span>`).join(''); }
+function uploadContextStateLabel(upload) {
+  const context = upload?.context_status || {};
+  if (context.label) return context.label;
+  if (context.extractable) return '可进入上下文';
+  return '已上传';
+}
+
+function uploadContextStateClass(upload) {
+  const stateValue = upload?.context_status?.state || 'unknown';
+  if (stateValue === 'ready') return 'ready';
+  if (stateValue === 'too_large') return 'warning';
+  if (stateValue === 'unsupported') return 'unsupported';
+  return 'pending';
+}
+
+function uploadSizeLabel(size) {
+  const value = Number(size || 0);
+  if (value >= 1024 * 1024) return `${(value / 1024 / 1024).toFixed(1)}MB`;
+  return `${Math.max(1, Math.ceil(value / 1024))}KB`;
+}
+
+async function uploadFiles(files) {
+  for (const file of files) {
+    try {
+      const form = new FormData();
+      form.append('file', file);
+      const uploaded = await api('/api/uploads', { method: 'POST', body: form });
+      state.uploads.push(uploaded);
+    } catch (err) {
+      notify(`附件“${file.name}”上传失败：${err.message || err}`, 'error');
+    }
+  }
+  renderUploads();
+}
+
+function removeUpload(uploadId) {
+  state.uploads = state.uploads.filter((item) => String(item.id) !== String(uploadId));
+  renderUploads();
+}
+
+function renderUploads() {
+  const list = $('uploadList');
+  if (!list) return;
+  list.innerHTML = state.uploads.map((f) => {
+    const context = f.context_status || {};
+    return `<div class="upload-chip ${escapeHtml(uploadContextStateClass(f))}" title="${escapeHtml(context.detail || '')}">
+      <div class="upload-chip-main">
+        <span>${escapeHtml(f.name)} · ${escapeHtml(uploadSizeLabel(f.size))}</span>
+        <button class="upload-remove" type="button" data-remove-upload="${escapeHtml(f.id || '')}" aria-label="移除附件 ${escapeHtml(f.name || '')}">×</button>
+      </div>
+      <small>${escapeHtml(uploadContextStateLabel(f))}</small>
+    </div>`;
+  }).join('');
+  list.querySelectorAll('[data-remove-upload]').forEach((button) => {
+    button.onclick = () => removeUpload(button.dataset.removeUpload);
+  });
+}
 async function installSkillPackage(file) { try { const form = new FormData(); form.append('file', file); const installed = await api('/api/skills/install/upload', { method: 'POST', body: form }); state.skills = await api('/api/skills'); await selectSkill(installed.id); notify(`技能“${installed.name}”安装成功`); } catch (err) { notify(`技能安装失败：${err.message || err}`, 'error'); } }
 async function importMcpPackage(file) { try { const form = new FormData(); form.append('file', file); const imported = await api('/api/mcp/import', { method: 'POST', body: form }); state.mcp = await api('/api/mcp'); renderMcp(); if (imported[0]) await selectMcp(imported[0].id); notify(`已导入 ${imported.length} 个工具服务`); } catch (err) { notify(`工具配置导入失败：${err.message || err}`, 'error'); } }
 async function installSkillFromUrl() { const url = $('skillDownloadUrl').value.trim(); if (!url) return notify('请粘贴 Skill 下载直链', 'error'); try { const installed = await api('/api/skills/install/url', { method:'POST', body:JSON.stringify({url}) }); state.skills = await api('/api/skills'); await selectSkill(installed.id); notify(`技能“${installed.name}”安装成功`); } catch (err) { notify(`Skill 链接安装失败：${err.message || err}`, 'error'); } }
 async function installMcpFromUrl() { const url = $('mcpDownloadUrl').value.trim(); if (!url) return notify('请粘贴 MCP JSON 下载直链', 'error'); try { const imported = await api('/api/mcp/install/url', { method:'POST', body:JSON.stringify({url}) }); state.mcp = await api('/api/mcp'); if (imported[0]) await selectMcp(imported[0].id); notify(`已安装 ${imported.length} 个工具服务`); } catch (err) { notify(`MCP 链接安装失败：${err.message || err}`, 'error'); } }
 
 async function loadTasksOnly() {
-  state.tasks = await api('/api/tasks');
+  state.tasks = await api(`/api/tasks?${new URLSearchParams(platformScopeValues()).toString()}`);
   renderTasks();
 }
 
 async function loadLoopsOnly() {
   const selectedId = state.selectedLoop?.id;
-  state.loops = await api('/api/loops');
+  state.loops = await api(`/api/loops?${new URLSearchParams(platformScopeValues()).toString()}`);
   renderLoops();
   if (selectedId && state.loops.some((item) => item.id === selectedId)) await selectLoop(selectedId);
   else if (selectedId) newLoop();
@@ -2780,6 +5913,12 @@ function renderLoops() {
     </div>
   `).join('') || '<div class="meta empty">还没有自动化。创建一个持续目标开始使用。</div>';
   document.querySelectorAll('[data-loop]').forEach((el) => el.onclick = () => selectLoop(el.dataset.loop));
+}
+
+function scrollLoopCardIntoView(id) {
+  if (!id) return;
+  const card = document.querySelector(`[data-loop="${CSS.escape(id)}"]`);
+  if (card) card.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
 }
 
 function renderLoopOverview(item = null) {
@@ -2883,6 +6022,7 @@ async function selectLoop(id) {
   renderLoopNotifications();
   state.loopEditorDirty = false;
   state.loopStateDirty = false;
+  scrollLoopCardIntoView(id);
   scheduleLoopRefresh(id, item.status);
 }
 
@@ -3025,6 +6165,7 @@ function loopPayload() {
     onceAt = parsed.toISOString();
   }
   const payload = {
+    ...platformScopeValues(),
     name: $('loopName').value.trim(), prompt: $('loopPrompt').value.trim(),
     agent_id: $('loopAgent').value, model_id: $('loopModel').value,
     trigger_type: triggerType, interval_seconds: intervalSeconds || 3600,
@@ -3056,7 +6197,7 @@ async function saveLoop() {
     const saved = state.selectedLoop
       ? await api(`/api/loops/${state.selectedLoop.id}`, { method: 'PUT', body: JSON.stringify(payload) })
       : await api('/api/loops', { method: 'POST', body: JSON.stringify(payload) });
-    state.loops = await api('/api/loops'); await selectLoop(saved.id); notify(`自动化“${saved.name}”已保存`);
+    state.loops = await api(`/api/loops?${new URLSearchParams(platformScopeValues()).toString()}`); await selectLoop(saved.id); notify(`自动化“${saved.name}”已保存`);
   } catch (err) { notify(`自动化保存失败：${err.message || err}`, 'error'); }
   finally {
     setBusy(button, false);
@@ -3072,7 +6213,7 @@ async function loopAction(action) {
   try {
     await api(`/api/loops/${state.selectedLoop.id}/${action}`, { method: 'POST' });
     if (action === 'run') await new Promise((resolve) => setTimeout(resolve, 450));
-    state.loops = await api('/api/loops'); await selectLoop(state.selectedLoop.id);
+    state.loops = await api(`/api/loops?${new URLSearchParams(platformScopeValues()).toString()}`); await selectLoop(state.selectedLoop.id);
     notify(action === 'run' ? '试运行已提交，运行历史会自动刷新' : action === 'start' ? '自动化调度已启动' : '自动化已暂停');
   } catch (err) { notify(`操作失败：${err.message || err}`, 'error'); }
   finally {
@@ -3085,7 +6226,7 @@ async function loopAction(action) {
 async function deleteLoop() {
   if (!state.selectedLoop || !confirm(`确定删除自动化“${state.selectedLoop.name}”及其运行索引吗？已生成的普通任务和文件会保留。`)) return;
   await api(`/api/loops/${state.selectedLoop.id}`, { method: 'DELETE' });
-  state.loops = await api('/api/loops'); newLoop(); notify('自动化已删除，历史普通任务和产物仍保留');
+  state.loops = await api(`/api/loops?${new URLSearchParams(platformScopeValues()).toString()}`); newLoop(); notify('自动化已删除，历史普通任务和产物仍保留');
 }
 
 function renderTasks() {
@@ -3117,11 +6258,25 @@ async function openTask(id) {
   renderTaskMeta(task);
   await watchTaskRuntime(id);
   await renderConversation(state.conversationId);
+  const thinking = agentThinkingCard(id) || createAgentThinkingCard(id, { historical: true, open: false });
+  thinking.historical = false;
+  thinking.loaded = true;
   $('timeline').innerHTML = '';
-  (task.events || []).forEach(appendEvent);
+  (task.events || []).forEach((event) => {
+    updateAgentThinkingEvent(id, event);
+    appendEvent(event);
+  });
   renderArtifacts(task.artifacts || []);
   if (runtimeIsActive(currentRuntimeStatus())) {
+    thinking.node.open = true;
+    state.taskUiRunning = taskUiGeneratingStatus(currentRuntimeStatus());
+    state.taskUiTaskId = id;
+    setSendButtonState(state.taskUiRunning ? 'running' : 'idle');
+    setTaskUiStatus(id, state.taskUiRunning ? '正在恢复任务执行状态…' : '等待你的确认…', state.taskUiRunning ? 'thinking' : 'verifying');
     startTaskStream(id, { seenEventIds: (task.events || []).map((event) => event.id) });
+  } else if (['completed', 'failed', 'cancelled'].includes(task.status)) {
+    state.taskUiTaskId = id;
+    finishTaskUi(id, task.status);
   }
 }
 
@@ -3129,13 +6284,32 @@ async function renderConversation(conversationId) {
   const data = await api(`/api/conversations/${encodeURIComponent(conversationId)}/messages`);
   $('conversation').innerHTML = '';
   for (const message of data.messages || []) {
-    addMessage(message.role === 'assistant' ? 'agent' : 'user', message.content, message.event_id || null);
+    if (message.message_type === 'error') {
+      publishTaskError(message.task_id || '', message);
+      continue;
+    }
+    const localizedContent = message.role === 'assistant'
+      ? localizeMissingInformationText(message.content)
+      : message.content;
+    if (message.role === 'assistant' && message.task_id && looksLikeClarificationResponse(localizedContent)) {
+      publishClarification(message.task_id, { id: message.event_id, content: localizedContent });
+      continue;
+    }
+    const messageNode = addMessage(message.role === 'assistant' ? 'agent' : 'user', localizedContent, message.event_id || null);
+    if (message.task_id) messageNode.dataset.taskMessage = String(message.task_id);
+    if (message.role === 'user' && message.task_id) {
+      createAgentThinkingCard(message.task_id, { historical: true, open: false });
+    }
   }
   return (data.messages || []).length > 0;
 }
 
 function newConversation() {
   stopTaskStream();
+  state.taskUiRunning = false;
+  state.taskUiCancelRequested = false;
+  clearTaskUiStatus();
+  setSendButtonState('idle');
   state.currentTask = null;
   state.currentExpertSelection = null;
   state.conversationId = createConversationId();
@@ -3144,6 +6318,10 @@ function newConversation() {
   $('timeline').innerHTML = '';
   $('taskMeta').className = 'meta empty';
   $('taskMeta').textContent = '尚未创建任务';
+  $('taskOverviewSection').open = false;
+  $('taskOverviewStatus').textContent = '尚未选择任务';
+  $('timelineSection').open = false;
+  $('timelineStatus').textContent = '按需查看节点日志';
   resetTaskRuntime();
   renderArtifacts([]);
   addMessage('agent', '新对话已开始。你可以继续描述要完成的事情。');
@@ -3168,6 +6346,8 @@ function initSidebar() {
 function bindEvents() {
   document.querySelectorAll('.nav').forEach((btn) => btn.onclick = () => switchTab(btn.dataset.tab));
   $('sidebarToggle').onclick = () => setSidebarCollapsed(!$('sidebar').classList.contains('collapsed'));
+  $('workspaceSelect').onchange = (event) => switchWorkspace(event.target.value).catch((err) => notify(`项目切换失败：${err.message || err}`, 'error'));
+  $('openWorkspaceTabBtn').onclick = () => switchTab('workspaces');
   document.querySelectorAll('[data-workbench-mode]').forEach((button) => {
     button.onclick = () => setWorkbenchMode(button.dataset.workbenchMode);
   });
@@ -3176,13 +6356,50 @@ function bindEvents() {
     renderWorkbenchMode();
   };
   $('sendBtn').onclick = sendTask;
+  $('closePptxConfigBtn').onclick = closePptxConfigDialog;
+  $('detectPptxConfigBtn').onclick = () => loadPptxConfiguration().catch((err) => notify(`重新检测失败：${err.message || err}`, 'error'));
+  $('savePptxConfigBtn').onclick = () => savePptxConfiguration().catch((err) => notify(`PPTX 配置失败：${err.message || err}`, 'error'));
+  ['pptxModePython', 'pptxModeArtifact'].forEach((id) => {
+    $(id).onchange = () => $('pptxArtifactFields').classList.toggle('hidden', !$('pptxModeArtifact').checked);
+  });
+  $('pptxConfigDialog').addEventListener('click', (event) => {
+    if (event.target === $('pptxConfigDialog')) closePptxConfigDialog();
+  });
+  $('conversation').addEventListener('click', (event) => {
+    const copyButton = event.target.closest('[data-copy-code]');
+    if (copyButton) {
+      const code = copyButton.closest('.code-block')?.querySelector('code')?.textContent || '';
+      copyTextToClipboard(code)
+        .then(() => {
+          copyButton.classList.add('copied');
+          copyButton.textContent = '已复制';
+          window.setTimeout(() => {
+            copyButton.classList.remove('copied');
+            copyButton.textContent = '复制';
+          }, 1200);
+        })
+        .catch((err) => notify(`复制失败：${err.message || err}`, 'error'));
+      return;
+    }
+    const button = event.target.closest('[data-open-pptx-config]');
+    if (button) openPptxConfigDialog().catch((err) => notify(`读取 PPTX 配置失败：${err.message || err}`, 'error'));
+  });
   $('newConversationBtn').onclick = newConversation;
   $('agentSelect').onchange = (e) => {
     writePreference('agent', e.target.value);
     syncMemoryScopeId();
     loadMemoriesOnly({ preserveSelection: false }).catch((err) => notify(`记忆刷新失败：${err.message || err}`, 'error'));
   };
-  $('taskModelSelect').onchange = (e) => writePreference('model', e.target.value);
+  $('taskModelSelect').onchange = (e) => {
+    writePreference('model', e.target.value);
+    writePreference('model-explicit', '1');
+    renderWorkbenchModelStatus();
+  };
+  $('modelStatusPill').onclick = () => {
+    const model = currentWorkbenchModel();
+    switchTab('models');
+    if (model) selectModel(model.id);
+  };
   $('exampleBtn').onclick = () => {
     $('messageInput').value = state.workbenchMode === 'expert'
       ? '请从业务价值、交付风险和用户体验三个角度评审这份方案，归纳一致结论与主要分歧，并给出按优先级排序的改进建议。'
@@ -3190,6 +6407,10 @@ function bindEvents() {
     $('messageInput').focus();
   };
   $('refreshBtn').onclick = loadAll;
+  $('refreshWorkspacesBtn').onclick = () => loadWorkspacesOnly({ preserveSelection: true }).catch((err) => notify(`项目刷新失败：${err.message || err}`, 'error'));
+  $('newWorkspaceBtn').onclick = newWorkspace;
+  $('saveWorkspaceBtn').onclick = saveWorkspace;
+  $('deleteWorkspaceBtn').onclick = deleteWorkspace;
   $('newSkillBtn').onclick = newSkill;
   $('skillPackageInput').onchange = (e) => e.target.files[0] && installSkillPackage(e.target.files[0]);
   $('installSkillUrlBtn').onclick = installSkillFromUrl;
@@ -3204,6 +6425,7 @@ function bindEvents() {
   };
   $('saveSkillFileBtn').onclick = () => saveSkillFile().catch((err) => notify(`文件保存失败：${err.message || err}`, 'error'));
   $('deleteSkillFileBtn').onclick = () => deleteSkillFile().catch((err) => notify(`文件删除失败：${err.message || err}`, 'error'));
+  $('refreshMarketplaceBtn').onclick = () => loadMarketplaceOnly().catch((err) => notify(`市场刷新失败：${err.message || err}`, 'error'));
   $('invokeToolBtn').onclick = invokeTool;
   $('newMcpBtn').onclick = newMcp; $('saveMcpBtn').onclick = saveMcp; $('discoverMcpBtn').onclick = discoverMcp; $('deleteMcpBtn').onclick = () => deleteMcp().catch((err) => notify(`工具服务卸载失败：${err.message || err}`, 'error'));
   $('mcpImportInput').onchange = (e) => e.target.files[0] && importMcpPackage(e.target.files[0]);
@@ -3219,6 +6441,22 @@ function bindEvents() {
   $('deleteExpertTeamBtn').onclick = deleteExpertTeam;
   $('addExpertMemberBtn').onclick = addExpertTeamMember;
   $('runExpertTeamBtn').onclick = runSelectedExpertTeam;
+  $('refreshKnowledgeBtn').onclick = () => loadKnowledgeBasesOnly({ preserveSelection: true }).catch((err) => notify(`知识库刷新失败：${err.message || err}`, 'error'));
+  $('newKnowledgeBtn').onclick = () => newKnowledgeBase();
+  $('saveKnowledgeBaseBtn').onclick = saveKnowledgeBase;
+  $('deleteKnowledgeBaseBtn').onclick = deleteKnowledgeBase;
+  $('runDiagnosticsBtn').onclick = () => loadDiagnosticsOnly().catch((err) => notify(`自检失败：${err.message || err}`, 'error'));
+  $('copyDiagnosticsReportBtn').onclick = () => copyDiagnosticsReport().catch((err) => notify(`复制失败：${err.message || err}`, 'error'));
+  $('downloadDiagnosticsReportBtn').onclick = () => downloadDiagnosticsReport().catch((err) => notify(`下载失败：${err.message || err}`, 'error'));
+  $('downloadDiagnosticsJsonBtn').onclick = () => downloadDiagnosticsJson().catch((err) => notify(`下载失败：${err.message || err}`, 'error'));
+  $('knowledgeFileInput').onchange = (event) => {
+    const file = event.target.files?.[0];
+    if (file) indexKnowledgeFile(file);
+  };
+  $('knowledgeSearchBtn').onclick = searchKnowledge;
+  $('knowledgeSearchInput').addEventListener('keydown', (event) => {
+    if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') searchKnowledge();
+  });
   $('refreshMemoriesBtn').onclick = () => loadMemoriesOnly({ preserveSelection: true }).catch((err) => notify(`记忆刷新失败：${err.message || err}`, 'error'));
   $('newMemoryBtn').onclick = newMemory;
   $('saveMemoryBtn').onclick = saveMemory;
@@ -3234,7 +6472,10 @@ function bindEvents() {
   $('artifactKindFilter').onchange = () => loadArtifactsOnly({ preserveSelection: true }).catch((err) => notify(`产物筛选失败：${err.message || err}`, 'error'));
   $('newModelBtn').onclick = newModel; $('saveModelBtn').onclick = saveModel; $('testModelBtn').onclick = testModel; $('deleteModelBtn').onclick = () => deleteModel().catch((err) => notify(`模型删除失败：${err.message || err}`, 'error'));
   $('modelKeyMode').onchange = toggleModelKeyMode;
-  $('fileInput').onchange = (e) => uploadFiles(Array.from(e.target.files || []));
+  $('fileInput').onchange = (e) => {
+    uploadFiles(Array.from(e.target.files || []));
+    e.target.value = '';
+  };
   $('reloadTasksBtn').onclick = loadTasksOnly;
   $('cancelTaskBtn').onclick = () => sendTaskRuntimeCommand('cancel', {}, $('cancelTaskBtn'));
   $('retryTaskBtn').onclick = () => sendTaskRuntimeCommand('retry', {}, $('retryTaskBtn'));

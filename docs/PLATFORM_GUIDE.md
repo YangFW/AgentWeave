@@ -441,19 +441,26 @@ Policy 规则可以在目标、计划、工具、审批、产物和输出等阶�
 | XLSX | Python 依赖 | 工作表表格 |
 | Markdown | 无额外组件 | 渲染后的 Markdown |
 | HTML | 无额外组件 | 移除脚本和外部资源后的沙箱预览 |
-| PPTX | Node.js 与已配置的 Artifact Tool；未配置时不可用 | 页面文字和结构 |
+| PPTX | 平台内置 Python 生成器，或 Node.js 与已配置的 Artifact Tool | 页面文字和结构 |
 
 产物会出现在回答下载区、任务详情和“产物”页面。系统记录所属任务和 Run、版本、大小、MIME、SHA-256，并使用受控 ID 提供预览与下载。文件超过 25MB 时不提供平台内预览，但仍可下载。
 
-PPTX 只有在 Node.js 和 Artifact Tool 都已安装，且入口路径指向有效组件时才可用：
+PPTX 推荐使用平台内置 Python 生成器。在模型设置页打开“PPTX 配置向导”，选择“平台内置 Python 生成器”并确认，平台会写入本机 `.env.local`：
 
 ```bash
+APP_PPTX_GENERATOR=python
+```
+
+如果部署环境已有受支持的 Artifact Tool，也可以选择外部组件并配置：
+
+```bash
+APP_PPTX_GENERATOR=artifact_tool
 export APP_NODE_BINARY='node'
 export APP_ARTIFACT_TOOL_ENTRYPOINT='/absolute/path/to/artifact_tool.mjs'
 export APP_PRESENTATION_TIMEOUT_SECONDS=180
 ```
 
-项目不会自动下载 Artifact Tool，默认 Docker 镜像也没有安装 Node.js 或该组件。因此，只有完成上述配置的部署才能生成 PPTX；未配置时会明确返回组件不可用，其他格式不受影响。
+项目不会从任意网址自动下载或执行 Artifact Tool。未配置时会在对话中明确说明缺少什么，并提供可确认的配置向导；其他格式不受影响。
 
 根据附件生成文件时，运行时会抽取少量来源特征做一致性检查，避免交付与附件完全无关的空泛文档。它只能检查可提取文本和有限样本，不能替代人工校对、事实核验或专业审核。
 
@@ -487,7 +494,7 @@ export BRAVE_SEARCH_API_KEY='your-brave-key'
 
 同一对话的历史消息会用于后续目标还原，较早内容可以压缩为可查看的摘要。新建对话后，对话级历史不会继续混入，但用户或工作区级记忆仍可能生效。
 
-知识库能力本阶段暂缓。当前没有文档集合、向量索引、跨文件语义检索、同步连接器、页级引用或增量更新；附件上下文、长期记忆和对话摘要也不等同于知识库。
+当前已支持基础知识库：可以创建知识库、上传已解析的文本资料、建立分片索引、按关键词检索，并在后续任务中自动注入可见且启用的命中片段。页面会显示命中文档和片段编号。当前检索是关键词检索，不是向量或混合检索；还没有文档同步连接器、页级引用、增量更新评测或可信登录主体下的强制租户隔离。附件上下文、长期记忆和对话摘要仍不等同于知识库。
 
 ## 自动化
 
@@ -563,4 +570,4 @@ data/artifacts/
 
 ### PPTX 失败而其他文档正常
 
-检查 Node.js、`APP_NODE_BINARY`、`APP_ARTIFACT_TOOL_ENTRYPOINT` 和超时配置。Python 文档依赖安装成功并不能证明 PowerPoint 子进程也已准备好。
+先检查“模型设置 → 文档交付 → PPTX 配置向导”中的状态。推荐使用平台内置 Python 生成器（不需要 Docker、Node.js 或 npm），确认当前虚拟环境已安装 `python-pptx`，并确认 `APP_PPTX_GENERATOR=python`。只有选择外部 Artifact Tool 时，才需要继续检查 `APP_NODE_BINARY`、`APP_ARTIFACT_TOOL_ENTRYPOINT` 和超时配置。若仍失败，错误应显示在对话中，不要只看后台日志。
