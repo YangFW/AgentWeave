@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>AgentWeave · 工作台</title>
   <link rel="icon" href="./favicon.svg?v=20260817-1" type="image/svg+xml" />
-  <link rel="stylesheet" href="./styles.css?v=20260916-execution-engines-5" />
+  <link rel="stylesheet" href="./styles.css?v=20260916-execution-engines-6" />
 </head>
 <body class="auth-pending">
   <section id="loginPanel" class="login-panel hidden" aria-labelledby="loginTitle">
@@ -666,7 +666,13 @@
               <datalist id="discoveredModelsList"></datalist>
               <div id="discoveredModelsHint" class="field-hint"></div>
             </label></div>
-          <label>Base URL<input id="modelBaseUrl" placeholder="https://api.openai.com/v1" /></label><label>密钥方式<select id="modelKeyMode"><option value="env">环境变量</option><option value="direct">直接填写 API Key</option></select></label><label id="modelKeyEnvField">API Key 环境变量名<input id="modelApiKeyEnv" placeholder="OPENAI_API_KEY" /></label><label id="modelKeyDirectField" class="hidden">API Key<input id="modelApiKey" type="password" autocomplete="new-password" placeholder="密钥在本机加密保存，页面不会回显" /></label><div id="modelKeyStatus" class="secret-status"></div><label>高级配置 JSON<textarea id="modelConfig" class="code" rows="6">{"temperature":0.2,"timeout":90}</textarea></label><label class="checkbox"><input id="modelEnabled" type="checkbox" checked /> 启用</label><div class="toolbar"><button id="deleteModelBtn" class="secondary hidden">删除模型</button><button id="saveModelBtn">保存模型</button><button id="testModelBtn" class="secondary">测试连接</button></div><pre id="modelTestResult" class="result-box compact">选择模型后可测试连接</pre>
+          <label>Base URL<input id="modelBaseUrl" placeholder="https://api.openai.com/v1" /></label><label>密钥方式<select id="modelKeyMode"><option value="env">环境变量</option><option value="direct">直接填写 API Key</option></select></label><label id="modelKeyEnvField">API Key 环境变量名<input id="modelApiKeyEnv" placeholder="OPENAI_API_KEY" /></label><label id="modelKeyDirectField" class="hidden">API Key<input id="modelApiKey" type="password" autocomplete="new-password" placeholder="密钥在本机加密保存，页面不会回显" /></label><div id="modelKeyStatus" class="secret-status"></div><label>高级配置 JSON<textarea id="modelConfig" class="code" rows="6">{"temperature":0.2,"timeout":90}</textarea></label><label>使用授权（哪些角色可用）
+            <select id="modelAllowedRoles">
+              <option value="admin,user">管理员 + 普通用户</option>
+              <option value="admin">仅管理员可见与使用</option>
+            </select>
+          </label>
+          <label class="checkbox"><input id="modelEnabled" type="checkbox" checked /> 启用</label><div class="toolbar"><button id="deleteModelBtn" class="secondary hidden">删除模型</button><button id="saveModelBtn">保存模型</button><button id="testModelBtn" class="secondary">测试连接</button></div><pre id="modelTestResult" class="result-box compact">选择模型后可测试连接</pre>
         </div></div>
       </section>
 
@@ -677,6 +683,27 @@
             <h1>执行引擎</h1>
             <p>由管理员配置 Codex、Claude Code 的接口地址和密钥。密钥只保存在本机，页面不会显示明文。后续可在此接入更多引擎。</p>
           </div>
+        </div>
+        <div class="editor-card" style="margin-bottom: 16px;">
+          <div class="editor-header">
+            <div>
+              <h3>容器生命周期与保活设置</h3>
+              <p class="small">设置第三方执行引擎（Codex / Claude Code）容器闲置保留时间。闲置超过该时长自动销毁，节省系统资源。</p>
+            </div>
+            <div class="toolbar">
+              <button id="saveRunnerSettingsBtn" type="button">保存设置</button>
+            </div>
+          </div>
+          <div class="form-grid two" style="align-items: flex-end;">
+            <label>
+              容器闲置销毁时间 (秒)
+              <input id="runnerIdleSecondsInput" type="number" min="0" max="86400" placeholder="例如 300" />
+            </label>
+            <div style="font-size: 12px; color: var(--muted); margin-bottom: 8px;">
+              💡 默认 <code>300</code> 秒（5 分钟）；设为 <code>0</code> 表示单次任务执行完后立即销毁；页面修改即时生效，无需重启服务。
+            </div>
+          </div>
+          <div id="runnerSettingsHint" class="field-hint" style="margin-top: 4px;"></div>
         </div>
         <div class="split">
           <div>
@@ -707,6 +734,12 @@
             <label id="engineKeyEnvField">密钥环境变量名<input id="engineApiKeyEnv" placeholder="OPENAI_API_KEY" /></label>
             <label id="engineKeyDirectField" class="hidden">API Key<input id="engineApiKey" type="password" autocomplete="new-password" placeholder="密钥在本机加密保存，页面不会回显" /></label>
             <div id="engineKeyStatus" class="secret-status">选择引擎后查看密钥状态</div>
+            <label>使用授权（哪些角色可用）
+              <select id="engineAllowedRoles">
+                <option value="admin,user">管理员 + 普通用户</option>
+                <option value="admin">仅管理员可见与使用</option>
+              </select>
+            </label>
             <label class="checkbox"><input id="engineEnabled" type="checkbox" checked /> 启用此引擎</label>
             <div class="toolbar">
               <button id="testEngineBtn" class="secondary" type="button">测试连接</button>
@@ -853,7 +886,7 @@
     </main>
   </div>
 
-  <script src="./diagnostics-routing.js?v=20260916-execution-engines-5"></script>
-  <script src="./app.js?v=20260916-execution-engines-5"></script>
+  <script src="./diagnostics-routing.js?v=20260916-execution-engines-6"></script>
+  <script src="./app.js?v=20260916-execution-engines-6"></script>
 </body>
 </html>

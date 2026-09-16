@@ -240,6 +240,10 @@ class McpServerUpdate(BaseModel):
     tools: list[dict[str, Any]] | None = None
 
 
+class SystemSettingsUpdate(BaseModel):
+    runner_idle_seconds: int = Field(default=300, ge=0, le=86400)
+
+
 class PresentationConfigureRequest(BaseModel):
     mode: Literal["python", "artifact_tool"] = "python"
     node_binary: str = Field(default="node", max_length=500)
@@ -266,6 +270,7 @@ class ModelConfigCreate(BaseModel):
     api_key: str | None = None
     api_key_mode: ApiKeyMode = "env"
     enabled: bool = True
+    allowed_roles: str = Field(default="admin,user", max_length=100)
     config: dict[str, Any] = Field(default_factory=dict)
     copy_credentials_from: str | None = None
 
@@ -274,6 +279,7 @@ class ModelConfigCreate(BaseModel):
 
 class ModelConfigUpdate(BaseModel):
     name: ResourceName | None = None
+    allowed_roles: str | None = Field(default=None, max_length=100)
     provider: ModelProvider | None = None
     model: str | None = Field(default=None, min_length=1, max_length=200)
     base_url: str | None = Field(default=None, max_length=2_000)
@@ -291,6 +297,7 @@ class ModelConfigUpdate(BaseModel):
 
 class ExecutionEngineUpdate(BaseModel):
     enabled: bool | None = None
+    allowed_roles: str | None = Field(default=None, max_length=100)
     base_url: str | None = Field(default=None, max_length=2_000)
     api_key_env: str | None = Field(default=None, max_length=200)
     api_key: str | None = None

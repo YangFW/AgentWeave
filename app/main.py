@@ -28,6 +28,8 @@ from fastapi.staticfiles import StaticFiles
 
 from app import db
 from app.builtin_skill_catalog import BUILTIN_SKILL_CATALOG, get_builtin_skill
+from app.schemas import SystemSettingsUpdate
+from app.services.container_agent_runner import get_runner_idle_seconds, set_runner_idle_seconds
 from app.schemas import (
     AgentCreate, AgentUpdate, ApprovalRequest, McpServerCreate, McpServerUpdate,
     ExpertInstallRequest, ExpertMemberRetryRequest, ExpertTeamCreate, ExpertTeamRunCreate,
@@ -181,7 +183,7 @@ async def authentication_middleware(request: Request, call_next: Any) -> Any:
             if audit_id:
                 auth_service.finish_audit(audit_id, "authentication_denied", 401)
             return JSONResponse({"detail": "需要登录"}, status_code=401)
-        management = {"users", "models", "agents", "skills", "mcp", "policies", "marketplace", "presentation", "execution-engines"}
+        management = {"users", "models", "agents", "skills", "mcp", "policies", "marketplace", "presentation", "execution-engines", "system-settings"}
         resource = request.url.path.split("/")[2]
         if identity:
             identity = {**identity, "request_method": request.method, "request_resource": resource}
@@ -2777,7 +2779,7 @@ def model_to_api(row: dict[str, Any]) -> dict[str, Any]:
     has_direct_key = bool(row.get("api_key_ciphertext")) or bool(legacy_key and not _is_env_name(legacy_key))
     safe = {k: v for k, v in row.items() if k not in {"api_key_ciphertext", "config_json"}}
     safe["api_key_env"] = legacy_key if _is_env_name(legacy_key) else ""
-    public = {**safe, "enabled": bool(row.get("enabled")), "config": db.json_loads(row.get("config_json"), {}), "has_api_key": has_direct_key, "api_key_mode": "direct" if has_direct_key else "env"}
+    public = {**safe, "enabled": bool(row.get("enabled")), "allowed_roles": str(row.get("allowed_roles") or "admin,user"), "config": db.json_loads(row.get("config_json"), {}), "has_api_key": has_direct_key, "api_key_mode": "direct" if has_direct_key else "env"}
     last_test = {
         "status": str(row.get("last_test_status") or ""),
         "message": str(row.get("last_test_message") or ""),
@@ -2790,8 +2792,17 @@ def model_to_api(row: dict[str, Any]) -> dict[str, Any]:
 
 @app.get("/api/models")
 def list_models() -> list[dict[str, Any]]:
-    deterministic = {"id": "deterministic", "name": "离线确定性模型", "provider": "deterministic", "model": "deterministic-offline", "base_url": "", "api_key_env": "", "enabled": True, "config": {}, "has_api_key": False, "api_key_mode": "env", "last_test": {"status": "pass", "message": "内置模型无需连接测试", "tested_at": ""}, "capabilities": _model_capabilities({"provider": "deterministic"}), "readiness": _model_readiness({"provider": "deterministic", "enabled": True})}
-    return [deterministic] + [model_to_api(r) for r in db.query_all("SELECT * FROM model_configs ORDER BY name")]
+    deterministic = {"id": "deterministic", "name": "离线确定性模型", "provider": "deterministic", "model": "deterministic-offline", "base_url": "", "api_key_env": "", "enabled": True, "allowed_roles": "admin,user", "config": {}, "has_api_key": False, "api_key_mode": "env", "last_test": {"status": "pass", "message": "内置模型无需连接测试", "tested_at": ""}, "capabilities": _model_capabilities({"provider": "deterministic"}), "readiness": _model_readiness({"provider": "deterministic", "enabled": True})}
+    rows = db.query_all("SELECT * FROM model_configs ORDER BY name")
+    identity = auth_service.current_identity.get()
+    user_role = identity.get("role", "user") if identity else "admin"
+    results = [deterministic]
+    for r in rows:
+        item = model_to_api(r)
+        allowed = [role.strip() for role in (item.get("allowed_roles") or "admin,user").split(",") if role.strip()]
+        if user_role == "admin" or user_role in allowed:
+            results.append(item)
+    return results
 
 
 def _ensure_model_ready(model_id: str | None, *, label: str = "所选模型") -> None:
@@ -2838,8 +2849,8 @@ def create_model(payload: ModelConfigCreate) -> dict[str, Any]:
         api_key_env = payload.api_key_env if payload.api_key_mode == "env" else ""
 
     db.execute(
-        "INSERT INTO model_configs(id, name, provider, model, base_url, api_key_env, api_key_ciphertext, enabled, config_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (payload.id, payload.name, payload.provider, payload.model, base_url, api_key_env, encrypted, 1 if payload.enabled else 0, db.json_dumps(payload.config), now, now),
+        "INSERT INTO model_configs(id, name, provider, model, base_url, api_key_env, api_key_ciphertext, enabled, allowed_roles, config_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (payload.id, payload.name, payload.provider, payload.model, base_url, api_key_env, encrypted, 1 if payload.enabled else 0, payload.allowed_roles or "admin,user", db.json_dumps(payload.config), now, now),
     )
     return model_to_api(db.query_one("SELECT * FROM model_configs WHERE id = ?", (payload.id,)) or {})
 
@@ -2864,8 +2875,8 @@ def update_model(model_id: str, payload: ModelConfigUpdate) -> dict[str, Any]:
     elif not encrypted:
         raise HTTPException(status_code=400, detail="直接密钥模式必须填写 API Key")
     db.execute(
-        "UPDATE model_configs SET name = ?, provider = ?, model = ?, base_url = ?, api_key_env = ?, api_key_ciphertext = ?, enabled = ?, config_json = ?, updated_at = ? WHERE id = ?",
-        (merged["name"], merged["provider"], merged["model"], merged.get("base_url", ""), merged.get("api_key_env", "") if mode == "env" else "", encrypted, 1 if merged.get("enabled") else 0, db.json_dumps(merged.get("config", {})), db.utc_now(), model_id),
+        "UPDATE model_configs SET name = ?, provider = ?, model = ?, base_url = ?, api_key_env = ?, api_key_ciphertext = ?, enabled = ?, allowed_roles = ?, config_json = ?, updated_at = ? WHERE id = ?",
+        (merged["name"], merged["provider"], merged["model"], merged.get("base_url", ""), merged.get("api_key_env", "") if mode == "env" else "", encrypted, 1 if merged.get("enabled") else 0, merged.get("allowed_roles") or "admin,user", db.json_dumps(merged.get("config", {})), db.utc_now(), model_id),
     )
     return model_to_api(db.query_one("SELECT * FROM model_configs WHERE id = ?", (model_id,)) or {})
 
@@ -2974,9 +2985,34 @@ async def discover_remote_models(payload: ModelDiscoverRequest) -> dict[str, Any
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"连接模型接口失败：{exc}")
 
+@app.get("/api/system-settings")
+def get_system_settings() -> dict[str, Any]:
+    return {
+        "runner_idle_seconds": get_runner_idle_seconds(),
+    }
+
+
+@app.put("/api/system-settings")
+def update_system_settings(payload: SystemSettingsUpdate) -> dict[str, Any]:
+    val = set_runner_idle_seconds(payload.runner_idle_seconds)
+    return {
+        "runner_idle_seconds": val,
+    }
+
+
 @app.get("/api/execution-engines")
 def list_execution_engines() -> list[dict[str, Any]]:
-    return list_engines()
+    engines = list_engines()
+    identity = auth_service.current_identity.get()
+    user_role = identity.get("role", "user") if identity else "admin"
+    if user_role == "admin":
+        return engines
+    filtered = []
+    for eng in engines:
+        allowed = [r.strip() for r in (eng.get("allowed_roles") or "admin,user").split(",") if r.strip()]
+        if user_role in allowed:
+            filtered.append(eng)
+    return filtered
 
 
 @app.get("/api/execution-engines/{engine_id}")
@@ -5012,6 +5048,19 @@ async def create_task(payload: TaskCreate, request: Request = None) -> dict[str,
     selected_agent = db.query_one("SELECT * FROM agents WHERE id = ?", (selected_agent_id,))
     if identity and not auth_service.agent_access(selected_agent_id, identity, payload.workspace):
         raise HTTPException(status_code=403, detail='无权使用所选智能体')
+    if identity and identity.get("role") != "admin":
+        row = db.query_one("SELECT allowed_roles FROM model_configs WHERE id = ?", (payload.model_id or fallback_model_id,))
+        if row:
+            allowed = [r.strip() for r in (row.get("allowed_roles") or "admin,user").split(",") if r.strip()]
+            if identity.get("role") not in allowed:
+                raise HTTPException(status_code=403, detail="管理员未授权当前角色使用所选模型")
+    if payload.execution_engine in ("codex", "claude") and identity and identity.get("role") != "admin":
+        eng_row = db.query_one("SELECT allowed_roles FROM execution_engines WHERE id = ?", (payload.execution_engine,))
+        if eng_row:
+            allowed = [r.strip() for r in (eng_row.get("allowed_roles") or "admin,user").split(",") if r.strip()]
+            if identity.get("role") not in allowed:
+                raise HTTPException(status_code=403, detail="管理员未授权当前角色使用该第三方执行引擎")
+
     fallback_model_id = str((selected_agent or {}).get("model") or "")
     _ensure_model_ready(payload.model_id or fallback_model_id or "deterministic", label="所选模型")
     if payload.executor_type == "team":

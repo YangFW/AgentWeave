@@ -177,6 +177,7 @@ def engine_to_api(row: Mapping[str, Any]) -> dict[str, Any]:
         "created_at": str(row.get("created_at") or ""),
         "updated_at": str(row.get("updated_at") or ""),
         "managed": False,
+        "allowed_roles": str(row.get("allowed_roles") or "admin,user"),
         "readiness": engine_readiness(row),
     }
     return public
@@ -252,6 +253,8 @@ def update_engine(engine_id: str, changes: Mapping[str, Any]) -> dict[str, Any]:
         if not isinstance(incoming, Mapping):
             raise ExecutionEngineError("高级配置必须是对象")
         config = dict(incoming)
+    allowed_roles = str(changes.get("allowed_roles") or current_api.get("allowed_roles") or "admin,user").strip()
+
     if changes.get("model") is not None:
         model_name = str(changes.get("model") or "").strip()
         if model_name:
@@ -263,7 +266,7 @@ def update_engine(engine_id: str, changes: Mapping[str, Any]) -> dict[str, Any]:
         """
         UPDATE execution_engines
         SET enabled = ?, base_url = ?, api_key_env = ?, api_key_ciphertext = ?,
-            config_json = ?, updated_at = ?
+            config_json = ?, allowed_roles = ?, updated_at = ?
         WHERE id = ?
         """,
         (
@@ -272,6 +275,7 @@ def update_engine(engine_id: str, changes: Mapping[str, Any]) -> dict[str, Any]:
             api_key_env if mode == "env" else "",
             encrypted,
             db.json_dumps(config),
+            allowed_roles,
             db.utc_now(),
             engine_id,
         ),

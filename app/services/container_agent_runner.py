@@ -34,6 +34,34 @@ from app.services.workspace_path_manager import (
 logger = logging.getLogger(__name__)
 
 
+def get_runner_idle_seconds() -> int:
+    try:
+        from app import db
+        row = db.query_one("SELECT value FROM system_settings WHERE key = 'runner_idle_seconds'")
+        if row and str(row.get("value") or "").strip():
+            return max(0, int(str(row["value"]).strip()))
+    except Exception:
+        pass
+    return int(os.getenv("APP_RUNNER_IDLE_SECONDS", "300"))
+
+
+def set_runner_idle_seconds(seconds: int) -> int:
+    val = max(0, int(seconds))
+    try:
+        from app import db
+        now = db.utc_now()
+        db.execute(
+            """
+            INSERT INTO system_settings(key, value, updated_at) VALUES ('runner_idle_seconds', ?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+            """,
+            (str(val), now),
+        )
+    except Exception as e:
+        logger.warning("更新 system_settings runner_idle_seconds 失败: %s", e)
+    return val
+
+
 @dataclass
 class ContainerRunnerConfig:
     image_name: str = field(
@@ -49,7 +77,7 @@ class ContainerRunnerConfig:
     default_timeout: int = 600
     container_workspace: str = "/workspace"
     container_home: str = "/home/node"
-    idle_timeout: int = field(default_factory=lambda: int(os.getenv("APP_RUNNER_IDLE_SECONDS", "300")))
+    idle_timeout: int = field(default_factory=get_runner_idle_seconds)
 
 
 @dataclass
@@ -268,7 +296,8 @@ class ContainerAgentRunner:
             now = time.time()
             for c_name, last_act in list(self._warm_containers.items()):
                 if self._active_tasks_count.get(c_name, 0) == 0:
-                    if now - last_act > self.config.idle_timeout:
+                    idle_sec = get_runner_idle_seconds()
+                    if now - last_act > idle_sec:
                         self._warm_containers.pop(c_name, None)
                         try:
                             rm = await asyncio.create_subprocess_exec(
@@ -468,7 +497,8 @@ class ContainerAgentRunner:
 
         active_envs = resolve_runtime_env(engine, env_vars)
 
-        use_warm = self.config.idle_timeout > 0
+        idle_sec = get_runner_idle_seconds()
+        use_warm = idle_sec > 0
         if use_warm:
             clean_org = re.sub(r'[^a-zA-Z0-9_\-\.]', '_', organization_id)
             clean_usr = re.sub(r'[^a-zA-Z0-9_\-\.]', '_', user_id)

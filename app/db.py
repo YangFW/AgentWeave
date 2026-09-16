@@ -665,6 +665,38 @@ def _execution_engines_schema(conn: sqlite3.Connection) -> None:
         )
 
 
+def _system_settings_and_permissions_schema(conn: sqlite3.Connection) -> None:
+    """Store system settings and role permissions for execution engines and models."""
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS system_settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    now = utc_now()
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO system_settings(key, value, updated_at)
+        VALUES ('runner_idle_seconds', '300', ?)
+        """,
+        (now,),
+    )
+    engine_cols = {row[1] for row in conn.execute("PRAGMA table_info(execution_engines)").fetchall()}
+    if "allowed_roles" not in engine_cols:
+        conn.execute(
+            "ALTER TABLE execution_engines ADD COLUMN allowed_roles TEXT NOT NULL DEFAULT 'admin,user'"
+        )
+
+    model_cols = {row[1] for row in conn.execute("PRAGMA table_info(model_configs)").fetchall()}
+    if "allowed_roles" not in model_cols:
+        conn.execute(
+            "ALTER TABLE model_configs ADD COLUMN allowed_roles TEXT NOT NULL DEFAULT 'admin,user'"
+        )
+
+
 SCHEMA_MIGRATIONS: tuple[tuple[int, Any], ...] = (
     (1, _shared_scope_schema),
     (2, _expert_team_scope_schema),
@@ -676,6 +708,7 @@ SCHEMA_MIGRATIONS: tuple[tuple[int, Any], ...] = (
     (9, _tool_effect_journal_schema),
     (10, _automation_task_run_binding_schema),
     (11, _execution_engines_schema),
+    (12, _system_settings_and_permissions_schema),
 )
 
 # Keep retired version numbers reserved so existing databases do not

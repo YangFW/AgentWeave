@@ -882,6 +882,7 @@ function switchTab(tab) {
     loadAdminUsers().catch((err) => notify(err.message, 'error'));
   } else if (tab === 'engines') {
     loadExecutionEnginesOnly({ preserveSelection: true }).catch((err) => notify(`执行引擎刷新失败：${err.message || err}`, 'error'));
+    loadRunnerSettings();
   }
 }
 
@@ -5813,6 +5814,7 @@ function newModel() {
   $('modelApiKey').value = '';
   $('modelConfig').value = '{"temperature":0.2,"timeout":90}';
   $('modelEnabled').checked = true;
+  if ($('modelAllowedRoles')) $('modelAllowedRoles').value = 'admin,user';
   $('modelTestResult').textContent = '填写后保存，再测试连接。保存成功后会出现在左侧列表和工作台模型选择器。';
   toggleModelKeyMode();
 }
@@ -5838,6 +5840,7 @@ function selectModel(id) {
   $('modelApiKey').value = '';
   $('modelConfig').value = formatJson(m.config || {});
   $('modelEnabled').checked = !!m.enabled;
+  if ($('modelAllowedRoles')) $('modelAllowedRoles').value = m.allowed_roles || 'admin,user';
   const lastTest = modelLastTest(m);
   if (id === 'deterministic') {
     $('modelEditorTitle').textContent = '内置离线模型（只读）';
@@ -5867,7 +5870,7 @@ async function deleteModel() {
 async function saveModel() {
   const button = $('saveModelBtn'); setBusy(button, true);
   try {
-    const payload = { id: $('modelId').value.trim(), name: $('modelName').value.trim(), provider: $('modelProvider').value, model: $('modelNameValue').value.trim(), base_url: $('modelBaseUrl').value.trim(), api_key_mode: $('modelKeyMode').value, api_key_env: $('modelApiKeyEnv').value.trim(), config: JSON.parse($('modelConfig').value || '{}'), enabled: $('modelEnabled').checked };
+    const payload = { id: $('modelId').value.trim(), name: $('modelName').value.trim(), provider: $('modelProvider').value, model: $('modelNameValue').value.trim(), base_url: $('modelBaseUrl').value.trim(), api_key_mode: $('modelKeyMode').value, api_key_env: $('modelApiKeyEnv').value.trim(), config: JSON.parse($('modelConfig').value || '{}'), enabled: $('modelEnabled').checked, allowed_roles: $('modelAllowedRoles')?.value || 'admin,user' };
     if (payload.api_key_mode === 'direct' && $('modelApiKey').value) payload.api_key = $('modelApiKey').value;
     if (!payload.id || !payload.name || !payload.model) throw new Error('请填写 ID、名称和模型名');
     if (state.selectedModel?.id === 'deterministic') throw new Error('内置离线模型不能修改，请点击“添加模型”');
@@ -6001,7 +6004,7 @@ function renderExecutionEngines() {
     el.onclick = () => selectExecutionEngine(el.dataset.engine);
   });
   const canManage = canManageExecutionEngines();
-  ['engineBaseUrl', 'engineModel', 'engineKeyMode', 'engineApiKeyEnv', 'engineApiKey', 'engineEnabled', 'saveEngineBtn'].forEach((id) => {
+  ['engineBaseUrl', 'engineModel', 'engineKeyMode', 'engineApiKeyEnv', 'engineApiKey', 'engineAllowedRoles', 'engineEnabled', 'saveEngineBtn'].forEach((id) => {
     const node = $(id);
     if (node) node.disabled = !canManage || !state.selectedExecutionEngine;
   });
@@ -6035,9 +6038,10 @@ function selectExecutionEngine(id) {
   $('engineApiKeyEnv').value = engine.api_key_env || engine.default_api_key_env || '';
   $('engineApiKey').value = '';
   $('engineEnabled').checked = !!engine.enabled;
+  if ($('engineAllowedRoles')) $('engineAllowedRoles').value = engine.allowed_roles || 'admin,user';
   $('engineSaveResult').textContent = engine.readiness?.detail || '保存后，新的任务会使用这里的配置。';
   const canManage = canManageExecutionEngines();
-  ['engineBaseUrl', 'engineModel', 'engineKeyMode', 'engineApiKeyEnv', 'engineApiKey', 'engineEnabled', 'saveEngineBtn'].forEach((fieldId) => {
+  ['engineBaseUrl', 'engineModel', 'engineKeyMode', 'engineApiKeyEnv', 'engineApiKey', 'engineAllowedRoles', 'engineEnabled', 'saveEngineBtn'].forEach((fieldId) => {
     const node = $(fieldId);
     if (node) node.disabled = !canManage;
   });
@@ -6056,6 +6060,7 @@ async function saveExecutionEngine() {
       api_key_mode: $('engineKeyMode').value,
       api_key_env: $('engineApiKeyEnv').value.trim(),
       model: $('engineModel').value.trim(),
+      allowed_roles: $('engineAllowedRoles')?.value || 'admin,user',
     };
     if (payload.api_key_mode === 'direct' && $('engineApiKey').value) payload.api_key = $('engineApiKey').value;
     const saved = await api(`/api/execution-engines/${engine.id}`, { method: 'PUT', body: JSON.stringify(payload) });
@@ -6293,6 +6298,50 @@ async function discoverModelsForExecutionEngine() {
   } catch (err) {
     if (hint) hint.textContent = `获取模型失败：${err.message || err}`;
     notify(`获取可用模型失败：${err.message || err}`, 'error');
+  } finally {
+    setBusy(button, false);
+  }
+}
+
+
+async function loadRunnerSettings() {
+  if (!$('runnerIdleSecondsInput')) return;
+  try {
+    const res = await api('/api/system-settings');
+    $('runnerIdleSecondsInput').value = res.runner_idle_seconds ?? 300;
+  } catch (err) {
+    console.warn('获取系统容器设置失败:', err);
+  }
+}
+
+async function saveRunnerSettings() {
+  const input = $('runnerIdleSecondsInput');
+  const button = $('saveRunnerSettingsBtn');
+  const hint = $('runnerSettingsHint');
+  if (!input) return;
+  const val = parseInt(input.value, 10);
+  if (isNaN(val) || val < 0 || val > 86400) {
+    notify('保活时间必须在 0 到 86400 秒之间', 'error');
+    return;
+  }
+  setBusy(button, true, '正在保存…');
+  try {
+    const res = await api('/api/system-settings', {
+      method: 'PUT',
+      body: JSON.stringify({ runner_idle_seconds: val }),
+    });
+    input.value = res.runner_idle_seconds;
+    if (hint) {
+      hint.textContent = `✅ 设置已保存！当前容器闲置保留时间为 ${res.runner_idle_seconds} 秒，新任务立即生效。`;
+      hint.style.color = 'var(--success, #2ea44f)';
+    }
+    notify(`容器闲置时间已更新为 ${res.runner_idle_seconds} 秒`);
+  } catch (err) {
+    if (hint) {
+      hint.textContent = `保存失败：${err.message || err}`;
+      hint.style.color = 'var(--danger, #cb2431)';
+    }
+    notify(`保存容器保活设置失败：${err.message || err}`, 'error');
   } finally {
     setBusy(button, false);
   }
@@ -7040,6 +7089,7 @@ function bindEvents() {
   $('newModelBtn').onclick = newModel; $('saveModelBtn').onclick = saveModel; $('testModelBtn').onclick = testModel; $('deleteModelBtn').onclick = () => deleteModel().catch((err) => notify(`模型删除失败：${err.message || err}`, 'error'));
   $('modelKeyMode').onchange = toggleModelKeyMode;
   if ($('saveEngineBtn')) $('saveEngineBtn').onclick = () => saveExecutionEngine().catch((err) => notify(`执行引擎保存失败：${err.message || err}`, 'error'));
+  if ($('saveRunnerSettingsBtn')) $('saveRunnerSettingsBtn').onclick = () => saveRunnerSettings();
   if ($('engineKeyMode')) $('engineKeyMode').onchange = toggleEngineKeyMode;
   if ($('executionEngineSelect')) $('executionEngineSelect').onchange = (event) => {
     writePreference('execution-engine', event.target.value);
