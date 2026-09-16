@@ -183,7 +183,7 @@ async def authentication_middleware(request: Request, call_next: Any) -> Any:
             if audit_id:
                 auth_service.finish_audit(audit_id, "authentication_denied", 401)
             return JSONResponse({"detail": "需要登录"}, status_code=401)
-        management = {"users", "models", "agents", "skills", "mcp", "policies", "marketplace", "presentation", "execution-engines", "system-settings"}
+        management = {"users", "models", "agents", "skills", "mcp", "policies", "marketplace", "presentation", "execution-engines", "system-settings", "model-sources"}
         resource = request.url.path.split("/")[2]
         if identity:
             identity = {**identity, "request_method": request.method, "request_resource": resource}
@@ -1266,7 +1266,7 @@ def marketplace() -> dict[str, Any]:
                 "name": item["name"],
                 "description": item["description"],
                 "keywords": list(item.get("keywords") or []),
-                "source_label": item.get("source_label", "智枢内置目录"),
+                "source_label": item.get("source_label", "智织内置目录"),
                 "installed": bool(installed),
                 "enabled": bool(installed.get("enabled")) if installed else False,
                 "category": installed.get("category") if installed else item["id"],
@@ -1505,15 +1505,32 @@ def update_workspace(
 def list_workspace_codex_sessions(
     workspace_id: str,
     organization_id: str = "local-org",
-    user_id: str = "local-user",
+    user_id: str = "",
 ) -> list[dict[str, Any]]:
     _require_workspace_access(workspace_id)
-    paths = default_path_manager.get_paths(organization_id, user_id, workspace_id)
-    sessions_dir = paths.codex_state_dir / "sessions"
-    if not sessions_dir.exists():
+    identity = auth_service.current_identity.get()
+    effective_user = user_id or (identity.get("user_id") if identity else "local-user")
+    search_dirs: list[Path] = []
+    paths = default_path_manager.get_paths(organization_id, effective_user, workspace_id)
+    if paths.codex_state_dir.exists():
+        s_dir = paths.codex_state_dir / "sessions"
+        if s_dir.exists():
+            search_dirs.append(s_dir)
+    try:
+        for cand in default_path_manager.base_dir.glob(f"*/*/{workspace_id}/state/.codex/sessions"):
+            if cand.is_dir() and cand not in search_dirs:
+                search_dirs.append(cand)
+    except Exception:
+        pass
+    if not search_dirs:
         return []
     results = []
-    for f in sessions_dir.rglob("*.jsonl"):
+    seen_files: set[str] = set()
+    for s_dir in search_dirs:
+        for f in s_dir.rglob("*.jsonl"):
+            if f.name in seen_files:
+                continue
+            seen_files.add(f.name)
         try:
             stat = f.stat()
             session_id = ""
@@ -1530,39 +1547,43 @@ def list_workspace_codex_sessions(
                         t = entry.get("type")
                         p = entry.get("payload", {})
                         if t == "session_meta":
-                            session_id = str(p.get("id") or "") or session_id
+                            session_id = str(p.get("id") or p.get("session_id") or "") or session_id
                             model = str(p.get("model") or "") or model
                         elif t == "response_item":
                             role = p.get("role") or p.get("type")
                             content = p.get("content") or p.get("message")
-                            if role == "user":
-                                turn_count += 1
-                                if not first_prompt:
-                                    if isinstance(content, list) and content:
-                                        first_prompt = str(content[0].get("text") or "")
-                                    else:
-                                        first_prompt = str(content)
-                            elif role == "assistant":
-                                if isinstance(content, list) and content:
-                                    last_reply = str(content[-1].get("text") or "")
-                                else:
-                                    last_reply = str(content)
+                            text = ""
+                            if isinstance(content, list):
+                                parts = [str(item.get("text") or "") for item in content if isinstance(item, dict) and item.get("text")]
+                                text = "\n".join(parts)
+                            elif isinstance(content, str):
+                                text = content
+                            clean_text = re.sub(r"<environment_context>[\s\S]*?</environment_context>", "", text).strip()
+                            if clean_text.startswith("Previous conversation history:"):
+                                clean_text = clean_text.split("\n\n")[-1].strip()
+                                if clean_text.lower().startswith("user:"):
+                                    clean_text = clean_text[5:].strip()
+                            if role in ("user", "UserMessage"):
+                                if clean_text:
+                                    turn_count += 1
+                                    if not first_prompt:
+                                        first_prompt = clean_text
+                            elif role in ("assistant", "AssistantMessage"):
+                                if clean_text:
+                                    last_reply = clean_text
                     except Exception:
                         continue
             if not session_id:
                 session_id = f.stem.replace("rollout-", "")
-            clean_first = first_prompt
-            if "<environment_context>" in clean_first:
-                clean_first = clean_first.split("</environment_context>")[-1].strip()
             results.append({
                 "session_id": session_id,
                 "file_name": f.name,
                 "created_at": datetime.fromtimestamp(stat.st_ctime, timezone.utc).isoformat(),
                 "updated_at": datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat(),
                 "turn_count": turn_count,
-                "first_prompt": clean_first[:150],
+                "first_prompt": (first_prompt or f"Codex 会话 {session_id[:8]}")[:150],
                 "last_reply": last_reply[:150],
-                "model": model,
+                "model": model or "codex",
                 "size_bytes": stat.st_size,
             })
         except Exception:
@@ -1576,17 +1597,28 @@ def get_workspace_codex_session(
     workspace_id: str,
     session_id: str,
     organization_id: str = "local-org",
-    user_id: str = "local-user",
+    user_id: str = "",
 ) -> dict[str, Any]:
     _require_workspace_access(workspace_id)
-    paths = default_path_manager.get_paths(organization_id, user_id, workspace_id)
-    sessions_dir = paths.codex_state_dir / "sessions"
-    target_file = None
-    if sessions_dir.exists():
-        for f in sessions_dir.rglob("*.jsonl"):
-            if session_id in f.name:
-                target_file = f
-                break
+    identity = auth_service.current_identity.get()
+    effective_user = user_id or (identity.get("user_id") if identity else "local-user")
+    paths = default_path_manager.get_paths(organization_id, effective_user, workspace_id)
+    target_file: Path | None = None
+    if paths.codex_state_dir.exists():
+        s_dir = paths.codex_state_dir / "sessions"
+        if s_dir.exists():
+            for f in s_dir.rglob("*.jsonl"):
+                if session_id in f.name or session_id in f.stem:
+                    target_file = f
+                    break
+    if not target_file:
+        try:
+            for cand in default_path_manager.base_dir.glob(f"*/*/{workspace_id}/state/.codex/sessions/**/*.jsonl"):
+                if session_id in cand.name or session_id in cand.stem:
+                    target_file = cand
+                    break
+        except Exception:
+            pass
     if not target_file or not target_file.exists():
         raise HTTPException(status_code=404, detail="未找到该 Codex 会话记录")
 
@@ -2790,17 +2822,125 @@ def model_to_api(row: dict[str, Any]) -> dict[str, Any]:
     return {**public, "last_test": last_test, "capabilities": _model_capabilities(row), "readiness": _model_readiness(row)}
 
 
+from app.services import model_source_service
+
+@app.get("/api/model-sources")
+def list_model_sources() -> list[dict[str, Any]]:
+    identity = auth_service.current_identity.get()
+    user_role = identity.get("role", "user") if identity else "admin"
+    return model_source_service.list_sources(user_role)
+
+@app.get("/api/model-sources/{source_id}")
+def get_model_source(source_id: str) -> dict[str, Any]:
+    src = model_source_service.get_source(source_id)
+    if not src:
+        raise HTTPException(status_code=404, detail="模型源不存在")
+    return src
+
+@app.post("/api/model-sources")
+def create_model_source(payload: dict[str, Any]) -> dict[str, Any]:
+    return model_source_service.create_source(payload)
+
+@app.put("/api/model-sources/{source_id}")
+def update_model_source(source_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    try:
+        return model_source_service.update_source(source_id, payload)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+@app.delete("/api/model-sources/{source_id}")
+def delete_model_source(source_id: str) -> dict[str, Any]:
+    model_source_service.delete_source(source_id)
+    return {"ok": True}
+
+@app.post("/api/model-sources/discover-models")
+async def discover_model_source_models(payload: dict[str, Any]) -> dict[str, Any]:
+    base_url = str(payload.get("base_url") or "").strip()
+    api_key = str(payload.get("api_key") or "").strip() or None
+    api_key_env = str(payload.get("api_key_env") or "").strip() or None
+    source_id = str(payload.get("source_id") or "").strip() or None
+    try:
+        models = await model_source_service.discover_source_models(
+            base_url=base_url,
+            api_key=api_key,
+            api_key_env=api_key_env,
+            source_id=source_id,
+        )
+        return {"ok": True, "models": models, "count": len(models)}
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+@app.post("/api/model-sources/test-connection")
+async def test_model_source_connection_live(payload: dict[str, Any]) -> dict[str, Any]:
+    base_url = str(payload.get("base_url") or "").strip()
+    api_key = str(payload.get("api_key") or "").strip() or None
+    api_key_env = str(payload.get("api_key_env") or "").strip() or None
+    source_id = str(payload.get("source_id") or "").strip() or None
+    try:
+        return await model_source_service.test_source_connection_live(
+            base_url=base_url,
+            api_key=api_key,
+            api_key_env=api_key_env,
+            source_id=source_id,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+@app.post("/api/model-sources/{source_id}/test")
+async def test_model_source(source_id: str) -> dict[str, Any]:
+    try:
+        return await model_source_service.test_source_connection(source_id)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
 @app.get("/api/models")
 def list_models() -> list[dict[str, Any]]:
-    deterministic = {"id": "deterministic", "name": "离线确定性模型", "provider": "deterministic", "model": "deterministic-offline", "base_url": "", "api_key_env": "", "enabled": True, "allowed_roles": "admin,user", "config": {}, "has_api_key": False, "api_key_mode": "env", "last_test": {"status": "pass", "message": "内置模型无需连接测试", "tested_at": ""}, "capabilities": _model_capabilities({"provider": "deterministic"}), "readiness": _model_readiness({"provider": "deterministic", "enabled": True})}
-    rows = db.query_all("SELECT * FROM model_configs ORDER BY name")
+    deterministic = {
+        "id": "deterministic",
+        "name": "[系统内置] 离线确定性模型",
+        "provider": "deterministic",
+        "model": "deterministic-offline",
+        "source_id": "system",
+        "source_name": "系统内置",
+        "base_url": "",
+        "api_key_env": "",
+        "enabled": True,
+        "allowed_roles": "admin,user",
+        "config": {},
+        "has_api_key": False,
+        "api_key_mode": "env",
+        "last_test": {"status": "pass", "message": "内置模型无需连接测试", "tested_at": ""},
+        "capabilities": _model_capabilities({"provider": "deterministic"}),
+        "readiness": _model_readiness({"provider": "deterministic", "enabled": True}),
+    }
+    source_rows = db.query_all("SELECT id, name FROM model_sources")
+    source_map = {s["id"]: s["name"] for s in source_rows}
+
+    # Sort so composite IDs (source_id::model) come first
+    rows = db.query_all("SELECT * FROM model_configs ORDER BY (source_id != '' AND id LIKE '%::%') DESC, name ASC")
     identity = auth_service.current_identity.get()
     user_role = identity.get("role", "user") if identity else "admin"
     results = [deterministic]
+    seen = set()
     for r in rows:
         item = model_to_api(r)
+        src_id = str(r.get("source_id") or "").strip()
+        src_name = source_map.get(src_id) or ("系统内置" if item["id"] == "deterministic" else "其他源")
+        item["source_id"] = src_id
+        item["source_name"] = src_name
+
+        # Ensure display name has [source_name] prefix
+        clean_name = item["name"]
+        if clean_name.startswith("[") and "]" in clean_name:
+            clean_name = clean_name.split("]", 1)[1].strip()
+        item["name"] = f"[{src_name}] {clean_name}"
+
         allowed = [role.strip() for role in (item.get("allowed_roles") or "admin,user").split(",") if role.strip()]
         if user_role == "admin" or user_role in allowed:
+            key = (src_id or item["id"], r.get("model") or item["id"])
+            if key in seen:
+                continue
+            seen.add(key)
             results.append(item)
     return results
 
@@ -2809,6 +2949,12 @@ def _ensure_model_ready(model_id: str | None, *, label: str = "所选模型") ->
     if not model_id or model_id == "deterministic":
         return
     row = db.query_one("SELECT * FROM model_configs WHERE id = ?", (model_id,))
+    if not row and ("::" in model_id or ":" in model_id):
+        sep = "::" if "::" in model_id else ":"
+        src_id, m_name = model_id.split(sep, 1)
+        row = db.query_one("SELECT * FROM model_configs WHERE source_id = ? AND model = ?", (src_id, m_name))
+    if not row:
+        row = db.query_one("SELECT * FROM model_configs WHERE model = ? AND enabled = 1 ORDER BY updated_at DESC LIMIT 1", (model_id,))
     if not row or not row.get("enabled"):
         raise HTTPException(status_code=400, detail=f"{label}不存在或未启用")
     readiness = _model_readiness(row)
@@ -3764,6 +3910,7 @@ _PUBLIC_TASK_EVENT_TYPES = frozenset(
         "agent", "answer", "answer_delta", "answer_reset", "approval",
         "approval_required", "cancelled", "candidate_verified", "checkpoint",
         "clarification", "command_queued", "conversation_summary", "done", "error",
+        "execution_progress",
         "expert_selection", "goal_spec", "goal_spec_progress", "install", "intent", "knowledge",
         "interrupted", "memory", "memory_deleted", "memory_saved", "model", "notice",
         "output_check", "permissions", "plan", "plan_check", "plan_progress", "progress",
@@ -5206,6 +5353,31 @@ def get_conversation_messages(conversation_id: str) -> dict[str, Any]:
     return {"conversation_id": conversation_id, "messages": messages}
 
 
+@app.get("/api/workspaces/{workspace_id}/conversations")
+def list_workspace_conversations(workspace_id: str) -> dict[str, Any]:
+    _require_workspace_access(workspace_id)
+    identity = auth_service.current_identity.get()
+    owner_clause = " AND user_id=? AND organization_id='local-org'" if identity and identity["role"] != "admin" else ""
+    query = f"""
+        SELECT
+            conversation_id,
+            MIN(created_at) as created_at,
+            MAX(created_at) as updated_at,
+            COUNT(id) as message_count,
+            MIN(message) as preview,
+            MAX(id) as latest_task_id,
+            MAX(execution_engine) as execution_engine
+        FROM tasks
+        WHERE workspace = ? AND conversation_id != '' {owner_clause}
+        GROUP BY conversation_id
+        ORDER BY updated_at DESC
+        LIMIT 50
+    """
+    params = (workspace_id, identity["user_id"]) if owner_clause else (workspace_id,)
+    rows = db.query_all(query, params)
+    return {"workspace_id": workspace_id, "conversations": rows}
+
+
 @app.post("/api/uploads")
 async def upload_file(file: UploadFile = File(...)) -> dict[str, Any]:
     max_bytes = int(os.getenv("APP_MAX_UPLOAD_MB", "20")) * 1024 * 1024
@@ -5578,11 +5750,39 @@ def _artifact_row_to_public(row: dict[str, Any]) -> dict[str, Any]:
 
 
 def _artifact_path(row: dict[str, Any]) -> Path:
-    relative = str(row.get("relative_path") or "")
+    # 优先检查存储的物理路径 path（兼容平台产物与容器产物复制副本）
+    stored_path = str(row.get("path") or "").strip()
+    if stored_path:
+        try:
+            cand = Path(stored_path).resolve(strict=True)
+            artifact_root = ARTIFACT_DIR.resolve(strict=True)
+            from app.services.container_agent_runner import default_path_manager
+            workspace_root = default_path_manager.base_dir.resolve(strict=True)
+            # 安全限制：路径必须在 ARTIFACT_DIR 或 workspace 根目录下
+            if cand.is_file() and (cand.is_relative_to(artifact_root) or cand.is_relative_to(workspace_root)):
+                return cand
+        except Exception:
+            pass
+
+    # 检查宿主机上的项目挂载代码目录
+    ws_id = str(row.get("workspace_id") or "").strip()
+    rel = str(row.get("relative_path") or row.get("name") or "").strip()
+    if ws_id and rel:
+        try:
+            from app.services.container_agent_runner import default_path_manager
+            for code_dir in default_path_manager.base_dir.glob(f"*/*/{ws_id}/code"):
+                cand = (code_dir / rel).resolve(strict=True)
+                if cand.is_file():
+                    return cand
+        except Exception:
+            pass
+
+    # 其次通过 relative_path 尝试解析
+    relative = str(row.get("relative_path") or "").strip()
     try:
         if relative:
             return resolve_artifact_path(relative)
-        legacy = Path(str(row.get("path") or "")).resolve(strict=True)
+        legacy = Path(stored_path).resolve(strict=True)
         root = ARTIFACT_DIR.resolve(strict=True)
         derived = legacy.relative_to(root).as_posix()
         return resolve_artifact_path(derived)
@@ -5730,6 +5930,10 @@ def preview_artifact(artifact_id: str) -> dict[str, Any]:
             return {"artifact": public, "preview_kind": "slides", "slides": slides}
         if kind == "pdf":
             return {"artifact": public, "preview_kind": "pdf", "url": public["download_url"] + "?inline=true"}
+        if kind in {"png", "jpg", "jpeg", "webp", "gif", "svg", "bmp", "ico"}:
+            return {"artifact": public, "preview_kind": "image", "url": public["download_url"] + "?inline=true"}
+        if kind in {"py", "python", "js", "jsx", "ts", "tsx", "sh", "bash", "css", "sql", "xml", "toml", "ini", "env", "conf", "c", "cpp", "go", "rs", "java"}:
+            return {"artifact": public, "preview_kind": "code", "language": kind, "content": path.read_text(encoding="utf-8", errors="replace")[:500_000]}
         if kind in {"txt", "text", "json", "yaml", "yml"}:
             return {"artifact": public, "preview_kind": "text", "content": path.read_text(encoding="utf-8", errors="replace")[:500_000]}
     except Exception:

@@ -732,6 +732,11 @@ function updateAgentThinkingEvent(taskId, event = {}) {
     child.detail = event.content || child.detail;
     step.status = 'completed';
     setAgentThinkingCurrent(taskId, type === 'knowledge' ? '已检索相关资料' : '已应用平台记忆', event.content || '', type, 'knowledge');
+  } else if (type === 'execution_progress' || type === 'progress') {
+    const parentId = 'sandbox_exec';
+    const step = ensureThinkingStep(item, parentId, '沙箱执行', 'process', 'running');
+    step.detail = event.content || event.title || '正在执行沙箱命令或推导…';
+    setAgentThinkingCurrent(taskId, event.title || '沙箱运行中', event.content || '正在执行…', type, 'process');
   } else if (['verification_started', 'verification_result', 'output_check'].includes(type)) {
     const step = ensureThinkingStep(item, 'validate', '结果验收', 'verification', type === 'verification_result' || type === 'output_check' ? 'completed' : 'running');
     step.detail = event.content || step.detail;
@@ -880,6 +885,8 @@ function switchTab(tab) {
     loadLoopsOnly().catch((err) => notify(`自动化刷新失败：${err.message || err}`, 'error'));
   } else if (tab === 'users') {
     loadAdminUsers().catch((err) => notify(err.message, 'error'));
+  } else if (tab === 'models') {
+    loadModelSources().catch((err) => notify(`模型源刷新失败：${err.message || err}`, 'error'));
   } else if (tab === 'engines') {
     loadExecutionEnginesOnly({ preserveSelection: true }).catch((err) => notify(`执行引擎刷新失败：${err.message || err}`, 'error'));
     loadRunnerSettings();
@@ -963,8 +970,10 @@ async function loadAll() {
   renderAgents();
   renderTasks();
   renderModels();
+  loadModelSources().catch((e) => console.warn('加载模型源失败', e));
   renderExecutionEngines();
   renderExecutionEngineSelect();
+  updateWorkbenchContextBadges();
   renderLoops();
   renderCapabilities();
   renderMarketplace();
@@ -1027,7 +1036,7 @@ async function refreshExecutionMode() {
 function renderAgentsSelect() {
   const select = $('agentSelect');
   const previous = select.value || readPreference('agent') || 'general-agent';
-  select.innerHTML = state.agents.map((a) => `<option value="${escapeHtml(a.id)}">${escapeHtml(a.name)}</option>`).join('');
+  select.innerHTML = state.agents.map((a) => `<option value="${escapeHtml(a.id)}">智能体：${escapeHtml(a.name)}</option>`).join('');
   if (state.agents.some((a) => a.id === previous)) select.value = previous;
   else if (state.agents.some((a) => a.id === 'general-agent')) select.value = 'general-agent';
 }
@@ -1084,8 +1093,47 @@ function setWorkbenchMode(mode, { persist = true } = {}) {
   renderWorkbenchMode();
 }
 
+function buildGroupedModelOptionsHtml(models, { includeStatus = true } = {}) {
+  if (!models || !models.length) {
+    return '<option value="">暂无可用模型</option>';
+  }
+  const groups = new Map();
+  for (const m of models) {
+    let src = m.source_name;
+    if (!src) {
+      if (m.name && m.name.startsWith('[') && m.name.includes(']')) {
+        src = m.name.slice(1, m.name.indexOf(']')).trim();
+      } else if (m.id === 'deterministic') {
+        src = '系统内置';
+      } else {
+        src = '其他来源';
+      }
+    }
+    if (!groups.has(src)) groups.set(src, []);
+    groups.get(src).push(m);
+  }
+
+  let html = '';
+  for (const [sourceName, groupModels] of groups.entries()) {
+    html += `<optgroup label="来源：${escapeHtml(sourceName)}">`;
+    for (const m of groupModels) {
+      const readyState = m.readiness?.state || 'ready';
+      const statusSuffix = includeStatus ? ` · ${m.readiness?.label || (m.enabled ? '可用' : '停用')}` : '';
+      let cleanName = m.name;
+      if (cleanName.startsWith('[') && cleanName.includes(']')) {
+        cleanName = cleanName.split(']', 1)[1].trim();
+      }
+      const labelText = `[${sourceName}] ${cleanName}${statusSuffix}`;
+      html += `<option value="${escapeHtml(m.id)}" ${readyState !== 'ready' ? 'disabled' : ''}>${escapeHtml(labelText)}</option>`;
+    }
+    html += '</optgroup>';
+  }
+  return html;
+}
+
 function renderTaskModelSelect() {
   const select = $('taskModelSelect');
+  if (!select) return;
   const enabled = state.models.filter((m) => m.enabled);
   const ready = enabled.filter((m) => (m.readiness?.state || 'ready') === 'ready');
   const explicit = readPreference('model-explicit') === '1';
@@ -1096,11 +1144,8 @@ function renderTaskModelSelect() {
     : workspacePreferred && ready.some((m) => m.id === workspacePreferred)
       ? workspacePreferred
       : ready.find((m) => m.id !== 'deterministic')?.id || workspacePreferred || remembered || 'deterministic';
-  select.innerHTML = enabled.map((m) => {
-    const readyState = m.readiness?.state || 'ready';
-    const label = m.readiness?.label || (m.enabled ? '可用' : '停用');
-    return `<option value="${escapeHtml(m.id)}" ${readyState !== 'ready' ? 'disabled' : ''}>模型：${escapeHtml(m.name)} · ${escapeHtml(label)}</option>`;
-  }).join('');
+
+  select.innerHTML = buildGroupedModelOptionsHtml(enabled, { includeStatus: true });
   if (ready.some((m) => m.id === preferred)) select.value = preferred;
   else if (ready.length) select.value = ready[0].id;
   renderWorkbenchModelStatus();
@@ -3134,7 +3179,7 @@ function renderWorkspaceModelOptions() {
   const agentSelect = $('workspaceDefaultAgent');
   const modelSelect = $('workspaceDefaultModel');
   if (agentSelect) agentSelect.innerHTML = state.agents.map((item) => `<option value="${escapeHtml(item.id)}">${escapeHtml(item.name)}</option>`).join('');
-  if (modelSelect) modelSelect.innerHTML = state.models.filter((item) => item.enabled).map((item) => `<option value="${escapeHtml(item.id)}">${escapeHtml(item.name)}</option>`).join('');
+  if (modelSelect) modelSelect.innerHTML = buildGroupedModelOptionsHtml(state.models.filter((item) => item.enabled), { includeStatus: false });
 }
 
 function renderWorkspaces() {
@@ -3174,6 +3219,7 @@ function newWorkspace() {
   $('workspaceSettings').value = '{}';
   $('workspaceEnabled').checked = true;
   $('deleteWorkspaceBtn').classList.add('hidden');
+  $('enterWorkspaceWorkbenchBtn')?.classList.add('hidden');
 }
 
 function selectWorkspaceEditor(id, { activate = true } = {}) {
@@ -3197,6 +3243,13 @@ function selectWorkspaceEditor(id, { activate = true } = {}) {
   $('workspaceSettings').value = formatJson(item.settings || {});
   $('workspaceEnabled').checked = !!item.enabled;
   $('deleteWorkspaceBtn').classList.toggle('hidden', item.id === 'default' || !item.enabled);
+  if ($('enterWorkspaceWorkbenchBtn')) {
+    $('enterWorkspaceWorkbenchBtn').classList.toggle('hidden', !item.enabled);
+    $('enterWorkspaceWorkbenchBtn').onclick = async () => {
+      await switchWorkspace(item.id);
+      switchTab('chat');
+    };
+  }
   const canManage = state.currentUser && (state.currentUser.role === 'admin' || state.currentUser.user_id === item.owner_user_id);
   $('workspaceMembersPanel').classList.toggle('hidden', !canManage);
   if (canManage) loadWorkspaceMembers(item.id).catch((error) => { $('workspaceMembersError').textContent = error.message; });
@@ -3282,7 +3335,9 @@ async function saveWorkspace() {
     renderWorkspaceSelect();
     selectWorkspaceEditor(saved.id, { activate: true });
     await reloadWorkspaceScopedData();
-    notify(`项目“${saved.name}”已保存并切换`);
+    newConversation();
+    updateWorkbenchContextBadges();
+    notify(`项目“${saved.name}”已就绪，已开启新对话`);
   } catch (err) { notify(`项目保存失败：${err.message || err}`, 'error'); }
   finally { setBusy(button, false); }
 }
@@ -3327,6 +3382,20 @@ async function switchWorkspace(id) {
   $('taskMeta').className = 'meta empty';
   $('taskMeta').textContent = '尚未创建任务';
   await reloadWorkspaceScopedData();
+  try {
+    const convData = await api(`/api/workspaces/${encodeURIComponent(id)}/conversations`);
+    state.workspaceConversations = convData.conversations || [];
+    if (state.workspaceConversations.length > 0) {
+      state.conversationId = state.workspaceConversations[0].conversation_id;
+      writePreference('conversation', state.conversationId);
+      await renderConversation(state.conversationId);
+    } else {
+      newConversation();
+    }
+  } catch (err) {
+    newConversation();
+  }
+  updateWorkbenchContextBadges();
   notify(`已切换到项目“${workspace?.name || id}”`);
 }
 
@@ -5365,7 +5434,7 @@ function previewTable(rows) {
 
 function renderArtifactPreview(preview) {
   const box = $('artifactPreview');
-  const previewKind = ['markdown', 'html', 'pdf', 'spreadsheet', 'document', 'slides', 'text'].includes(preview?.preview_kind) ? preview.preview_kind : 'unknown';
+  const previewKind = ['markdown', 'html', 'pdf', 'spreadsheet', 'document', 'slides', 'text', 'image', 'code'].includes(preview?.preview_kind) ? preview.preview_kind : 'unknown';
   box.className = `artifact-preview ${previewKind}`;
   if (previewKind === 'markdown') {
     box.innerHTML = `<div class="artifact-markdown">${renderMarkdown(preview.content || '')}</div>`;
@@ -5411,8 +5480,13 @@ function renderArtifactPreview(preview) {
     box.innerHTML = slides ? `<div class="artifact-slides">${slides}</div>` : '<div class="artifact-preview-empty">演示文稿中没有可预览的页面。</div>';
     return;
   }
-  if (previewKind === 'text') {
-    box.innerHTML = `<pre>${escapeHtml(preview.content || '')}</pre>`;
+  if (previewKind === 'image') {
+    const source = safeArtifactDownloadUrl(preview.url, { inline: true });
+    box.innerHTML = `<div style="display:flex;justify-content:center;align-items:center;padding:16px;height:100%;"><img src="${escapeHtml(source)}" style="max-width:100%;max-height:100%;object-fit:contain;border-radius:8px;box-shadow:0 2px 10px rgba(0,0,0,0.08);" alt="${escapeHtml(preview.artifact?.name || '预览图')}" /></div>`;
+    return;
+  }
+  if (previewKind === 'code' || previewKind === 'text') {
+    box.innerHTML = `<pre class="code-block" style="padding:16px;margin:0;overflow:auto;max-height:100%;font-size:12px;font-family:var(--font-mono, monospace);"><code>${escapeHtml(preview.content || '')}</code></pre>`;
     return;
   }
   box.innerHTML = `<div class="artifact-preview-empty">${escapeHtml(preview.message || '该格式暂不支持预览，可下载原文件。')}</div>`;
@@ -5771,21 +5845,29 @@ function modelTestSummary(model) {
 }
 
 function renderModels() {
-  $('modelCount').textContent = state.models.length;
-  $('modelList').innerHTML = state.models.map((m) => {
-    const tags = modelCapabilityTags(m);
-    return `<div class="card model-card ${state.selectedModel?.id === m.id ? 'active' : ''}" data-model="${escapeHtml(m.id)}">
-      <div class="card-title"><span>${escapeHtml(m.name)}</span><span class="status ${escapeHtml(modelReadinessClass(m))}">${escapeHtml(modelReadinessLabel(m))}</span></div>
-      <div class="card-desc">${escapeHtml(m.provider)} · ${escapeHtml(m.model)}</div>
-      <div class="model-meta-row"><span>${escapeHtml(m.id)}</span>${modelTestBadge(m)}</div>
-      <div class="model-tags">${tags.map((tag) => `<span>${escapeHtml(tag)}</span>`).join('')}</div>
-      <div class="small">${escapeHtml(modelCredentialText(m))}</div>
-      <div class="model-test-summary">${escapeHtml(modelTestSummary(m))}</div>
-      ${m.readiness?.detail ? `<div class="model-readiness-detail">${escapeHtml(m.readiness.detail)}</div>` : ''}
-    </div>`;
-  }).join('') || '<div class="meta empty">尚未配置模型</div>';
-  $('agentModel').innerHTML = state.models.filter((m) => m.enabled).map((m) => `<option value="${escapeHtml(m.id)}">${escapeHtml(m.name)}</option>`).join('');
-  document.querySelectorAll('[data-model]').forEach((el) => el.onclick = () => selectModel(el.dataset.model));
+  if ($('modelCount')) $('modelCount').textContent = state.models.length;
+  if ($('modelList')) {
+    const listEl = $('modelList');
+    listEl.innerHTML = state.models.map((m) => {
+      const tags = modelCapabilityTags(m);
+      return `<div class="card model-card ${state.selectedModel?.id === m.id ? 'active' : ''}" data-model="${escapeHtml(m.id)}">
+        <div class="card-title"><span>${escapeHtml(m.name)}</span><span class="status ${escapeHtml(modelReadinessClass(m))}">${escapeHtml(modelReadinessLabel(m))}</span></div>
+        <div class="card-desc">${escapeHtml(m.provider)} · ${escapeHtml(m.model)}</div>
+        <div class="model-meta-row"><span>${escapeHtml(m.id)}</span>${modelTestBadge(m)}</div>
+        <div class="model-tags">${tags.map((tag) => `<span>${escapeHtml(tag)}</span>`).join('')}</div>
+        <div class="small">${escapeHtml(modelCredentialText(m))}</div>
+        <div class="model-test-summary">${escapeHtml(modelTestSummary(m))}</div>
+        ${m.readiness?.detail ? `<div class="model-readiness-detail">${escapeHtml(m.readiness.detail)}</div>` : ''}
+      </div>`;
+    }).join('') || '<div class="meta empty">尚未配置模型</div>';
+    listEl.querySelectorAll('[data-model]').forEach((el) => el.onclick = () => selectModel(el.dataset.model));
+  }
+  if ($('agentModel')) {
+    $('agentModel').innerHTML = buildGroupedModelOptionsHtml(state.models.filter((m) => m.enabled), { includeStatus: false });
+  }
+  renderTaskModelSelect();
+  renderWorkspaceModelOptions();
+  renderModelSources();
 }
 
 function toggleModelKeyMode() {
@@ -5947,17 +6029,23 @@ function syncExecutionEngineModelUi() {
   const pill = $('modelStatusPill');
   if (!engineSelect || !taskModelSelect) return;
   const val = engineSelect.value;
-  if (val === 'codex' || val === 'claude' || val === 'container') {
-    taskModelSelect.disabled = true;
-    taskModelSelect.title = `当前由 ${val.toUpperCase()} 独立容器沙箱执行，使用引擎自身独立配置的模型与环境。`;
+  taskModelSelect.disabled = false;
+  if (val === 'codex') {
+    taskModelSelect.title = '为 Codex 容器沙箱指定底座大模型（如不指定则使用默认模型）';
     if (pill) {
-      pill.textContent = val === 'codex' ? 'Codex (容器引擎)' : val === 'claude' ? 'Claude (容器引擎)' : '自定义容器引擎';
+      pill.textContent = 'Codex 沙箱';
       pill.className = 'model-status-pill ready';
-      pill.title = '当前由三方容器沙箱执行，模型在“执行引擎”标签页中配置';
+      pill.title = '当前任务将在 Codex 容器沙箱中运行，可自选底座大模型';
+    }
+  } else if (val === 'claude') {
+    taskModelSelect.title = '为 Claude Code 容器沙箱指定底座大模型';
+    if (pill) {
+      pill.textContent = 'Claude 沙箱';
+      pill.className = 'model-status-pill ready';
+      pill.title = '当前任务将在 Claude Code 容器沙箱中运行';
     }
   } else {
-    taskModelSelect.disabled = false;
-    taskModelSelect.title = '选择内置智能体模型';
+    taskModelSelect.title = '选择内置智能体底座模型';
     renderWorkbenchModelStatus();
   }
 }
@@ -6878,6 +6966,7 @@ async function openTask(id) {
 }
 
 async function renderConversation(conversationId) {
+  setTimeout(updateWorkbenchContextBadges, 50);
   const data = await api(`/api/conversations/${encodeURIComponent(conversationId)}/messages`);
   $('conversation').innerHTML = '';
   for (const message of data.messages || []) {
@@ -6943,6 +7032,10 @@ function initSidebar() {
 function bindEvents() {
   $('addWorkspaceMemberBtn').onclick = addWorkspaceMember;
   $('newUserBtn').onclick = () => selectAdminUser(null);
+  if ($('newUserTopBtn')) $('newUserTopBtn').onclick = () => selectAdminUser(null);
+  if ($('adminUserSearchInput')) $('adminUserSearchInput').oninput = renderAdminUsersList;
+  if ($('currentProjectBadge')) $('currentProjectBadge').onclick = () => switchTab('workspaces');
+  if ($('currentConversationBadge')) $('currentConversationBadge').onclick = openConversationsDialog;
   $('refreshUsersBtn').onclick = () => loadAdminUsers().catch((error) => notify(error.message, 'error'));
   $('adminUserForm').onsubmit = saveAdminUser;
   document.querySelectorAll('.nav').forEach((btn) => btn.onclick = () => switchTab(btn.dataset.tab));
@@ -6995,6 +7088,31 @@ function bindEvents() {
     if (button) openPptxConfigDialog().catch((err) => notify(`读取 PPTX 配置失败：${err.message || err}`, 'error'));
   });
   $('newConversationBtn').onclick = newConversation;
+  if ($('viewConversationsBtn')) $('viewConversationsBtn').onclick = openConversationsDialog;
+  if ($('closeConversationsBtn')) $('closeConversationsBtn').onclick = () => $('conversationsDialog').classList.add('hidden');
+  if ($('dialogNewConversationBtn')) $('dialogNewConversationBtn').onclick = () => {
+    newConversation();
+    $('conversationsDialog').classList.add('hidden');
+  };
+  if ($('conversationSearchInput')) $('conversationSearchInput').oninput = () => renderConversationsList(state.workspaceConversations);
+  if ($('conversationsDialog')) $('conversationsDialog').addEventListener('click', (event) => {
+    if (event.target === $('conversationsDialog')) $('conversationsDialog').classList.add('hidden');
+  });
+
+  if ($('newSourceBtn')) $('newSourceBtn').onclick = () => selectModelSource(null);
+  if ($('discoverSourceModelsBtn')) $('discoverSourceModelsBtn').onclick = discoverSourceModels;
+  if ($('saveSourceBtn')) $('saveSourceBtn').onclick = saveModelSource;
+  if ($('deleteSourceBtn')) $('deleteSourceBtn').onclick = deleteModelSource;
+  if ($('testSourceBtn')) $('testSourceBtn').onclick = testModelSourceConnection;
+  if ($('selectAllModelsBtn')) $('selectAllModelsBtn').onclick = () => selectAllSourceModels(true);
+  if ($('clearAllModelsBtn')) $('clearAllModelsBtn').onclick = () => selectAllSourceModels(false);
+  if ($('addCustomModelBtn')) $('addCustomModelBtn').onclick = addCustomSourceModel;
+  if ($('sourceModelSearch')) $('sourceModelSearch').oninput = () => renderCurrentSourceModels();
+  if ($('sourceKeyMode')) $('sourceKeyMode').onchange = () => {
+    const isEnv = $('sourceKeyMode').value === 'env';
+    $('sourceKeyEnvField').classList.toggle('hidden', !isEnv);
+    $('sourceKeyDirectField').classList.toggle('hidden', isEnv);
+  };
   $('agentSelect').onchange = (e) => {
     writePreference('agent', e.target.value);
     syncMemoryScopeId();
@@ -7086,8 +7204,11 @@ function bindEvents() {
   $('memoryStatusFilter').onchange = renderMemories;
   $('reloadArtifactsBtn').onclick = () => loadArtifactsOnly({ preserveSelection: true }).catch((err) => notify(`产物刷新失败：${err.message || err}`, 'error'));
   $('artifactKindFilter').onchange = () => loadArtifactsOnly({ preserveSelection: true }).catch((err) => notify(`产物筛选失败：${err.message || err}`, 'error'));
-  $('newModelBtn').onclick = newModel; $('saveModelBtn').onclick = saveModel; $('testModelBtn').onclick = testModel; $('deleteModelBtn').onclick = () => deleteModel().catch((err) => notify(`模型删除失败：${err.message || err}`, 'error'));
-  $('modelKeyMode').onchange = toggleModelKeyMode;
+  if ($('newModelBtn')) $('newModelBtn').onclick = newModel;
+  if ($('saveModelBtn')) $('saveModelBtn').onclick = saveModel;
+  if ($('testModelBtn')) $('testModelBtn').onclick = testModel;
+  if ($('deleteModelBtn')) $('deleteModelBtn').onclick = () => deleteModel().catch((err) => notify(`模型删除失败：${err.message || err}`, 'error'));
+  if ($('modelKeyMode')) $('modelKeyMode').onchange = toggleModelKeyMode;
   if ($('saveEngineBtn')) $('saveEngineBtn').onclick = () => saveExecutionEngine().catch((err) => notify(`执行引擎保存失败：${err.message || err}`, 'error'));
   if ($('saveRunnerSettingsBtn')) $('saveRunnerSettingsBtn').onclick = () => saveRunnerSettings();
   if ($('engineKeyMode')) $('engineKeyMode').onchange = toggleEngineKeyMode;
@@ -7130,30 +7251,106 @@ function bindEvents() {
 
 function selectAdminUser(user) {
   state.adminSelectedUser = user;
-  $('adminUserTitle').textContent = user ? `编辑用户：${user.username}` : '新建用户';
-  $('adminUsername').value = user?.username || '';
-  $('adminUsername').disabled = Boolean(user);
-  $('adminUserRole').value = user?.role || 'user';
-  $('adminUserPassword').value = '';
-  $('adminUserPassword').required = !user;
-  $('adminPasswordHint').textContent = user ? '留空保留当前密码；填写新密码将撤销已有会话。' : '新用户需设置至少 12 位密码。';
-  $('adminUserEnabled').checked = user ? Boolean(user.enabled) : true;
-  $('adminUserEnabled').disabled = !user;
-  $('adminUserError').textContent = '';
+  if ($('adminUserTitle')) $('adminUserTitle').textContent = user ? `编辑成员：${user.username}` : '新建平台成员';
+  if ($('adminUserSubtitle')) $('adminUserSubtitle').textContent = user ? '可修改成员角色权限、重置密码或停用账号' : '创建新成员账号，分配角色权限与初始密码';
+  if ($('adminUsername')) {
+    $('adminUsername').value = user?.username || '';
+    $('adminUsername').disabled = Boolean(user);
+  }
+  if ($('adminUserRole')) $('adminUserRole').value = user?.role || 'user';
+  if ($('adminUserPassword')) {
+    $('adminUserPassword').value = '';
+    $('adminUserPassword').required = !user;
+  }
+  if ($('adminPasswordHint')) $('adminPasswordHint').textContent = user ? '留空保留现有密码；输入新密码将重置并撤销已有会话。' : '新用户需设置至少 12 位安全密码。';
+  if ($('adminUserEnabled')) {
+    $('adminUserEnabled').checked = user ? Boolean(user.enabled) : true;
+    $('adminUserEnabled').disabled = !user;
+  }
+  if ($('adminUserError')) $('adminUserError').textContent = '';
+
+  document.querySelectorAll('.user-card-item').forEach((item) => {
+    item.classList.toggle('active', item.dataset.userId === user?.id);
+  });
 }
 
+
+function updateWorkbenchContextBadges() {
+  const wsId = currentWorkspaceId();
+  const ws = (state.workspaces || []).find((w) => w.id === wsId);
+  const wsName = ws ? ws.name : (wsId === 'default' ? '默认项目' : wsId);
+  if ($('workbenchWorkspaceName')) $('workbenchWorkspaceName').textContent = `项目: ${wsName}`;
+  if ($('workbenchConversationPreview')) {
+    const conv = (state.workspaceConversations || []).find((c) => c.conversation_id === state.conversationId);
+    let title = conv?.preview || '当前对话';
+    if (title.length > 20) title = title.slice(0, 18) + '…';
+    $('workbenchConversationPreview').textContent = title;
+  }
+}
 async function loadAdminUsers() {
   state.adminUsers = await api('/api/users');
+  renderAdminUsersMetrics();
+  renderAdminUsersList();
+}
+
+function renderAdminUsersMetrics() {
+  const users = state.adminUsers || [];
+  const total = users.length;
+  const admins = users.filter((u) => u.role === 'admin').length;
+  const active = users.filter((u) => u.enabled).length;
+
+  if ($('metricTotalUsers')) $('metricTotalUsers').textContent = total;
+  if ($('metricAdminUsers')) $('metricAdminUsers').textContent = admins;
+  if ($('metricActiveUsers')) $('metricActiveUsers').textContent = active;
+  if ($('metricAuthStatus')) $('metricAuthStatus').textContent = state.authEnabled ? '已启用' : '开发免登';
+}
+
+function renderAdminUsersList() {
   const list = $('adminUserList');
+  if (!list) return;
   list.replaceChildren();
-  for (const user of state.adminUsers) {
-    const button = document.createElement('button');
-    button.type = 'button';
-    button.className = 'secondary';
-    button.textContent = `${user.username} · ${user.role === 'admin' ? '管理员' : '普通用户'} · ${user.enabled ? '已启用' : '已停用'}`;
-    button.onclick = () => selectAdminUser(user);
-    list.appendChild(button);
+
+  const search = ($('adminUserSearchInput')?.value || '').toLowerCase().trim();
+  const filtered = (state.adminUsers || []).filter((u) => {
+    if (!search) return true;
+    return (u.username || '').toLowerCase().includes(search) || (u.role || '').toLowerCase().includes(search);
+  });
+
+  if (!filtered.length) {
+    list.innerHTML = `<div class="meta empty">${search ? '未找到匹配的用户' : '暂无用户数据'}</div>`;
+    return;
   }
+
+  for (const user of filtered) {
+    const isSelected = state.adminSelectedUser?.id === user.id;
+    const card = document.createElement('div');
+    card.className = `user-card-item ${isSelected ? 'active' : ''}`;
+    card.dataset.userId = user.id;
+
+    const initials = (user.username || 'U').slice(0, 2).toUpperCase();
+    const isAdmin = user.role === 'admin';
+    const isEnabled = Boolean(user.enabled);
+
+    card.innerHTML = `
+      <div class="user-avatar ${isAdmin ? 'admin-avatar' : ''}">${escapeHtml(initials)}</div>
+      <div class="user-card-body">
+        <div class="user-card-title-row">
+          <strong class="user-card-name">${escapeHtml(user.username)}</strong>
+          <div class="user-card-badges">
+            <span class="user-role-badge ${user.role}">${isAdmin ? '管理员' : '普通用户'}</span>
+            <span class="user-status-badge ${isEnabled ? 'enabled' : 'disabled'}">${isEnabled ? '● 已启用' : '● 已停用'}</span>
+          </div>
+        </div>
+        <div class="user-card-sub">
+          <span class="small user-id-mono">ID: ${escapeHtml((user.id || '').slice(0, 14))}</span>
+          ${user.created_at ? `<span class="small user-date">${escapeHtml(user.created_at.slice(0, 10))}</span>` : ''}
+        </div>
+      </div>
+    `;
+    card.onclick = () => selectAdminUser(user);
+    list.appendChild(card);
+  }
+
   const selected = state.adminUsers.find((user) => user.id === state.adminSelectedUser?.id);
   selectAdminUser(selected || null);
 }
@@ -7238,6 +7435,414 @@ async function initializeAuthentication() {
   }
   document.body.classList.remove('auth-pending');
   return true;
+}
+
+
+
+// ==========================================
+// 项目历史对话管理 (Project Conversations)
+// ==========================================
+
+async function openConversationsDialog() {
+  const dialog = $('conversationsDialog');
+  if (!dialog) return;
+  dialog.classList.remove('hidden');
+  const wsId = currentWorkspaceId();
+  if ($('conversationsCurrentWorkspaceName')) {
+    const ws = state.workspaces.find((w) => w.id === wsId);
+    $('conversationsCurrentWorkspaceName').textContent = ws ? ws.name : wsId;
+  }
+  const list = $('conversationsList');
+  list.innerHTML = '<div class="meta empty">正在加载当前项目的历史对话…</div>';
+  try {
+    const data = await api(`/api/workspaces/${encodeURIComponent(wsId)}/conversations`);
+    state.workspaceConversations = data.conversations || [];
+    renderConversationsList(state.workspaceConversations);
+  } catch (err) {
+    list.innerHTML = `<div class="meta empty">加载历史对话失败：${escapeHtml(err.message || err)}</div>`;
+  }
+}
+
+function renderConversationsList(conversations) {
+  const list = $('conversationsList');
+  if (!list) return;
+  const search = ($('conversationSearchInput')?.value || '').toLowerCase().trim();
+  const filtered = (conversations || []).filter((c) => !search || (c.preview || '').toLowerCase().includes(search) || (c.conversation_id || '').toLowerCase().includes(search));
+  if (!filtered.length) {
+    list.innerHTML = `<div class="meta empty">${search ? '未找到匹配的对话' : '当前项目暂无历史对话。发送任务后会自动记录。'}</div>`;
+    return;
+  }
+  list.innerHTML = filtered.map((c) => {
+    const isActive = c.conversation_id === state.conversationId;
+    const engine = c.execution_engine || 'builtin';
+    const engineLabel = engine === 'codex' ? 'Codex' : engine === 'claude' ? 'Claude' : '内置引擎';
+    const time = c.updated_at ? c.updated_at.slice(0, 16).replace('T', ' ') : '';
+    return `
+      <div class="conversation-item-card ${isActive ? 'active' : ''}" data-conv-id="${escapeHtml(c.conversation_id)}">
+        <div class="conversation-item-main">
+          <div class="conversation-item-preview">${escapeHtml(c.preview || '无标题对话')}</div>
+          <div class="conversation-item-meta">
+            <span class="engine-tag ${engine}">${escapeHtml(engineLabel)}</span>
+            <span>${c.message_count || 1} 条消息</span>
+            <span>更新于 ${escapeHtml(time)}</span>
+            ${isActive ? '<span style="color: var(--primary); font-weight: 700;">● 当前会话</span>' : ''}
+          </div>
+        </div>
+      </div>
+    `;
+  }).join('');
+
+  list.querySelectorAll('[data-conv-id]').forEach((item) => {
+    item.onclick = async () => {
+      const convId = item.dataset.convId;
+      state.conversationId = convId;
+      writePreference('conversation', convId);
+      await renderConversation(convId);
+      $('conversationsDialog').classList.add('hidden');
+      notify(`已切换至历史对话`);
+    };
+  });
+}
+
+// ==========================================
+// 模型源与多模型管理 (Model Sources & Models)
+// ==========================================
+
+state.modelSources = [];
+state.selectedModelSource = null;
+state.currentSourceModels = [];
+
+async function loadModelSources() {
+  try {
+    state.modelSources = await api('/api/model-sources');
+    renderModelSources();
+    if (state.modelSources.length && !state.selectedModelSource) {
+      selectModelSource(state.modelSources[0].id);
+    }
+  } catch (err) {
+    console.error('加载模型源失败:', err);
+  }
+}
+
+function renderModelSources() {
+  const list = $('sourceList');
+  const count = $('sourceCount');
+  if (count) count.textContent = state.modelSources.length;
+  if (!list) return;
+  if (!state.modelSources.length) {
+    list.innerHTML = '<div class="meta empty">尚未配置模型源，点击上方“添加模型源”配置。</div>';
+    return;
+  }
+  list.innerHTML = state.modelSources.map((s) => {
+    const isActive = state.selectedModelSource?.id === s.id;
+    const testClass = s.last_test_status === 'pass' ? 'ready' : s.last_test_status === 'error' ? 'failed' : '';
+    const testText = s.last_test_status === 'pass' ? '测试通过' : s.last_test_status === 'error' ? '连接失败' : '未测试';
+    const chips = (s.models || []).map((m) => {
+      const isDef = m.id === s.default_model;
+      return `<span class="source-model-chip ${isDef ? 'default' : ''}">${escapeHtml(m.name || m.id)}${isDef ? ' (默认)' : ''}</span>`;
+    }).join('');
+    return `
+      <div class="source-card ${isActive ? 'active' : ''}" data-source-id="${escapeHtml(s.id)}">
+        <div class="source-card-header">
+          <span class="source-card-title">${escapeHtml(s.name)}</span>
+          <span class="model-test-badge ${testClass}">${escapeHtml(testText)}</span>
+        </div>
+        <div style="font-size: 11px; color: var(--muted-2); word-break: break-all;">${escapeHtml(s.base_url || '未填 URL')}</div>
+        <div class="source-models-chips">${chips || '<span class="small" style="color: var(--muted-2);">未配置模型</span>'}</div>
+      </div>
+    `;
+  }).join('');
+
+  list.querySelectorAll('[data-source-id]').forEach((card) => {
+    card.onclick = () => selectModelSource(card.dataset.sourceId);
+  });
+}
+
+function selectModelSource(sourceId) {
+  const s = state.modelSources.find((item) => item.id === sourceId);
+  state.selectedModelSource = s || null;
+  renderModelSources();
+  if (!s) {
+    $('sourceEditorTitle').textContent = '添加模型源';
+    $('sourceName').value = '';
+    $('sourceProvider').value = 'openai_compatible';
+    $('sourceBaseUrl').value = '';
+    $('sourceKeyMode').value = 'direct';
+    $('sourceApiKeyEnv').value = '';
+    $('sourceApiKey').value = '';
+    $('sourceKeyEnvField').classList.add('hidden');
+    $('sourceKeyDirectField').classList.remove('hidden');
+    $('sourceAllowedRoles').value = 'admin,user';
+    $('sourceEnabled').checked = true;
+    $('deleteSourceBtn').classList.add('hidden');
+    $('sourceKeyStatus').textContent = '';
+    $('sourceTestResult').textContent = '填写 Base URL 和 API Key 后可拉取模型或测试连接';
+    state.currentSourceModels = [];
+    renderCurrentSourceModels();
+    return;
+  }
+  $('sourceEditorTitle').textContent = `编辑模型源 · ${s.name}`;
+  $('sourceName').value = s.name || '';
+  $('sourceProvider').value = s.provider || 'openai_compatible';
+  $('sourceBaseUrl').value = s.base_url || '';
+  $('sourceKeyMode').value = s.api_key_env ? 'env' : 'direct';
+  $('sourceApiKeyEnv').value = s.api_key_env || '';
+  $('sourceApiKey').value = '';
+  $('sourceKeyEnvField').classList.toggle('hidden', !s.api_key_env);
+  $('sourceKeyDirectField').classList.toggle('hidden', !!s.api_key_env);
+  $('sourceKeyStatus').textContent = s.has_api_key ? '● 密钥已在服务端安全加密保存，留空则保持原密钥不变' : '未设置密钥';
+  $('sourceAllowedRoles').value = s.allowed_roles || 'admin,user';
+  $('sourceEnabled').checked = s.enabled;
+  $('deleteSourceBtn').classList.remove('hidden');
+  $('sourceTestResult').textContent = s.last_test_message || (s.last_test_status ? `状态: ${s.last_test_status}` : '选择模型源后可测试连接');
+  state.currentSourceModels = (s.models || []).map((m) => ({
+    id: m.id,
+    name: m.name || m.id,
+    enabled: m.enabled !== false,
+    is_default: m.id === s.default_model,
+  }));
+  renderCurrentSourceModels();
+}
+
+function renderCurrentSourceModels() {
+  const container = $('sourceModelsList');
+  if (!container) return;
+  const search = ($('sourceModelSearch')?.value || '').toLowerCase().trim();
+  const models = state.currentSourceModels || [];
+  const filtered = models.filter((m) => !search || m.id.toLowerCase().includes(search) || m.name.toLowerCase().includes(search));
+  if (!filtered.length) {
+    container.innerHTML = `<div class="meta empty">${search ? '没有匹配搜索条件的模型' : '暂无模型。点击“拉取源可用模型”或下方输入手动添加。'}</div>`;
+    return;
+  }
+  container.innerHTML = filtered.map((m) => {
+    return `
+      <div class="source-model-item ${m.enabled ? '' : 'disabled'}" data-model-id="${escapeHtml(m.id)}">
+        <div class="source-model-left">
+          <input type="checkbox" class="model-enable-cb" data-model-id="${escapeHtml(m.id)}" ${m.enabled ? 'checked' : ''} />
+          <span class="source-model-name" title="${escapeHtml(m.id)}">${escapeHtml(m.name || m.id)}</span>
+        </div>
+        <div class="source-model-right">
+          <label class="default-radio-label" title="设为此模型源的默认模型">
+            <input type="radio" name="defaultModelRadio" class="model-default-radio" data-model-id="${escapeHtml(m.id)}" ${m.is_default ? 'checked' : ''} />
+            <span>默认</span>
+          </label>
+          <button type="button" class="icon-button secondary remove-model-btn" data-model-id="${escapeHtml(m.id)}" style="padding: 2px 6px; font-size: 11px; height: 24px; min-width: 24px;">×</button>
+        </div>
+      </div>
+    `;
+  }).join('');
+
+  container.querySelectorAll('.model-enable-cb').forEach((cb) => {
+    cb.onchange = () => {
+      const mid = cb.dataset.modelId;
+      const target = state.currentSourceModels.find((m) => m.id === mid);
+      if (target) target.enabled = cb.checked;
+      renderCurrentSourceModels();
+    };
+  });
+
+  container.querySelectorAll('.model-default-radio').forEach((rb) => {
+    rb.onchange = () => {
+      const mid = rb.dataset.modelId;
+      state.currentSourceModels.forEach((m) => {
+        m.is_default = (m.id === mid);
+      });
+      renderCurrentSourceModels();
+    };
+  });
+
+  container.querySelectorAll('.remove-model-btn').forEach((btn) => {
+    btn.onclick = () => {
+      const mid = btn.dataset.modelId;
+      state.currentSourceModels = state.currentSourceModels.filter((m) => m.id !== mid);
+      renderCurrentSourceModels();
+    };
+  });
+}
+
+function selectAllSourceModels(enabled) {
+  (state.currentSourceModels || []).forEach((m) => {
+    m.enabled = enabled;
+  });
+  renderCurrentSourceModels();
+}
+
+function addCustomSourceModel() {
+  const input = $('customModelInput');
+  const val = (input?.value || '').trim();
+  if (!val) return;
+  if (!state.currentSourceModels) state.currentSourceModels = [];
+  if (state.currentSourceModels.some((m) => m.id === val)) {
+    notify('该模型已存在', 'warning');
+    return;
+  }
+  state.currentSourceModels.push({
+    id: val,
+    name: val,
+    enabled: true,
+    is_default: state.currentSourceModels.length === 0,
+  });
+  input.value = '';
+  renderCurrentSourceModels();
+}
+
+async function discoverSourceModels() {
+  const baseUrl = $('sourceBaseUrl').value.trim();
+  const apiKey = $('sourceApiKey').value.trim();
+  const sourceId = state.selectedModelSource?.id || null;
+  if (!baseUrl) {
+    notify('请先填写 Base URL', 'error');
+    return;
+  }
+  const btn = $('discoverSourceModelsBtn');
+  setBusy(btn, true, '正在拉取…');
+  try {
+    const res = await api('/api/model-sources/discover-models', {
+      method: 'POST',
+      body: JSON.stringify({ base_url: baseUrl, api_key: apiKey, source_id: sourceId }),
+    });
+    const discovered = res.models || [];
+    if (!discovered.length) {
+      notify('未在该源找到任何可用模型', 'warning');
+      return;
+    }
+    const existingIds = new Set((state.currentSourceModels || []).map((m) => m.id));
+    for (const d of discovered) {
+      if (!existingIds.has(d.id)) {
+        state.currentSourceModels.push({
+          id: d.id,
+          name: d.name || d.id,
+          enabled: true,
+          is_default: false,
+        });
+      }
+    }
+    if (!state.currentSourceModels.some((m) => m.is_default) && state.currentSourceModels.length) {
+      state.currentSourceModels[0].is_default = true;
+    }
+    renderCurrentSourceModels();
+    notify(`成功拉取 ${discovered.length} 个模型！`);
+  } catch (err) {
+    notify(`拉取模型失败：${err.message || err}`, 'error');
+  } finally {
+    setBusy(btn, false);
+  }
+}
+
+async function saveModelSource() {
+  const name = $('sourceName').value.trim();
+  const baseUrl = $('sourceBaseUrl').value.trim();
+  if (!name || !baseUrl) {
+    notify('请填写来源名称和接口 Base URL', 'error');
+    return;
+  }
+  const btn = $('saveSourceBtn');
+  setBusy(btn, true, '正在保存…');
+  const keyMode = $('sourceKeyMode').value;
+  const payload = {
+    name: name,
+    provider: $('sourceProvider').value,
+    base_url: baseUrl,
+    api_key_env: keyMode === 'env' ? $('sourceApiKeyEnv').value.trim() : '',
+    allowed_roles: $('sourceAllowedRoles').value,
+    enabled: $('sourceEnabled').checked,
+    models: state.currentSourceModels || [],
+    default_model: (state.currentSourceModels || []).find((m) => m.is_default)?.id || '',
+  };
+  if (keyMode === 'direct' && $('sourceApiKey').value.trim()) {
+    payload.api_key = $('sourceApiKey').value.trim();
+  }
+
+  try {
+    let saved;
+    if (state.selectedModelSource) {
+      saved = await api(`/api/model-sources/${encodeURIComponent(state.selectedModelSource.id)}`, {
+        method: 'PUT',
+        body: JSON.stringify(payload),
+      });
+    } else {
+      saved = await api('/api/model-sources', {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      });
+    }
+    state.models = await api('/api/models');
+    renderTaskModelSelect();
+    await loadModelSources();
+    selectModelSource(saved.id);
+    notify(`已保存模型源“${saved.name}”`);
+  } catch (err) {
+    notify(`保存模型源失败：${err.message || err}`, 'error');
+  } finally {
+    setBusy(btn, false);
+  }
+}
+
+async function deleteModelSource() {
+  if (!state.selectedModelSource) return;
+  if (!confirm(`确定要删除模型源“${state.selectedModelSource.name}”吗？其下的所有模型将停止可用。`)) return;
+  const btn = $('deleteSourceBtn');
+  setBusy(btn, true, '正在删除…');
+  try {
+    await api(`/api/model-sources/${encodeURIComponent(state.selectedModelSource.id)}`, { method: 'DELETE' });
+    state.models = await api('/api/models');
+    renderTaskModelSelect();
+    await loadModelSources();
+    selectModelSource(null);
+    notify('模型源已删除');
+  } catch (err) {
+    notify(`删除失败：${err.message || err}`, 'error');
+  } finally {
+    setBusy(btn, false);
+  }
+}
+
+function toggleSourceKeyMode() {
+  const direct = $('sourceKeyMode')?.value === 'direct';
+  if ($('sourceKeyEnvField')) $('sourceKeyEnvField').classList.toggle('hidden', direct);
+  if ($('sourceKeyDirectField')) $('sourceKeyDirectField').classList.toggle('hidden', !direct);
+}
+
+async function testModelSourceConnection() {
+  const baseUrl = $('sourceBaseUrl').value.trim();
+  const keyMode = $('sourceKeyMode').value;
+  const apiKey = keyMode === 'direct' ? $('sourceApiKey').value.trim() : '';
+  const apiKeyEnv = keyMode === 'env' ? $('sourceApiKeyEnv').value.trim() : '';
+  const sourceId = state.selectedModelSource?.id || null;
+
+  if (!baseUrl && !sourceId) {
+    notify('请先填写接口 Base URL', 'error');
+    return;
+  }
+
+  const btn = $('testSourceBtn');
+  setBusy(btn, true, '正在测试…');
+  $('sourceTestResult').textContent = '正在发起测试连接请求并探查可用模型…';
+  try {
+    const res = await api('/api/model-sources/test-connection', {
+      method: 'POST',
+      body: JSON.stringify({
+        base_url: baseUrl,
+        api_key: apiKey,
+        api_key_env: apiKeyEnv,
+        source_id: sourceId,
+      }),
+    });
+    $('sourceTestResult').textContent = res.message;
+    if (res.ok) {
+      notify(`测试通过：${res.message}`);
+    } else {
+      notify(`测试失败：${res.message}`, 'error');
+    }
+    if (sourceId) {
+      await loadModelSources();
+    }
+  } catch (err) {
+    $('sourceTestResult').textContent = `连接失败：${err.message || err}`;
+    notify(`测试异常：${err.message || err}`, 'error');
+  } finally {
+    setBusy(btn, false);
+  }
 }
 
 (async function init() {

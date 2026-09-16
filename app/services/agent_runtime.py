@@ -1079,6 +1079,7 @@ class AgentRuntime:
             run_id=run_id,
             prompt=prompt,
             engine=engine,
+            model_id=task.get("model_id"),
             organization_id=org_id,
             user_id=user_id,
             workspace_id=workspace_id,
@@ -2573,7 +2574,7 @@ class AgentRuntime:
         if not row:
             row = db.query_one("SELECT * FROM agents WHERE id = ?", ("general-agent",))
         if not row:
-            return {"id": "general-agent", "name": "智枢助手", "skills": [], "mcp_servers": []}
+            return {"id": "general-agent", "name": "智织通用智能体", "skills": [], "mcp_servers": []}
         return {
             **row,
             "skills": db.json_loads(row.get("skills_json"), []),

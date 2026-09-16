@@ -9,7 +9,7 @@ BUILTIN_SKILL_CATALOG: tuple[dict[str, Any], ...] = (
         "name": "Mermaid 图表设计 Skill",
         "description": "生成流程图、时序图、架构图和状态图对应的 Mermaid 源码，便于复制到支持 Mermaid 的编辑器中使用。",
         "keywords": ("mermaid", "流程图", "时序图", "架构图", "状态图"),
-        "source_label": "智枢内置目录",
+        "source_label": "智织内置目录",
         "content": """---
 id: mermaid_diagram
 name: Mermaid 图表设计 Skill
@@ -32,7 +32,7 @@ version: 1.0.0
         "name": "产品需求文档 PRD Skill",
         "description": "将产品想法整理为背景、目标、用户故事、功能范围、验收标准和风险清单。",
         "keywords": ("prd", "产品需求文档", "用户故事", "验收标准"),
-        "source_label": "智枢内置目录",
+        "source_label": "智织内置目录",
         "content": """---
 id: product_requirement_document
 name: 产品需求文档 PRD Skill

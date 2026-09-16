@@ -9,7 +9,9 @@ AgentWeave（中文名“智织”）是一个现代化的多智能体与第三�
 - **第三方执行引擎沙箱**：支持由管理员在界面统一配置并调用 **Codex**、**Claude Code** 等专业外部智能体引擎；采用项目独立 Docker 沙箱隔离，支持 5 分钟暖容器保活与多轮会话恢复。
 - **普通智能体模式**：由平台内置智能体理解上下文，自动匹配已启用的本地 Skill 和 MCP 工具。
 - **专家团队模式**：从已配置的专家团中选择团队，成员并行分工处理后由主管汇总。
-- 模型管理：支持 OpenAI 和 OpenAI-compatible 接口，密钥可以来自环境变量，也可以在页面直接填写。
+- **模型源（Model Source）与多模型管理**：按模型源（Provider）集中管理 Base URL 与 API Key，支持一键实时拉取服务商支持的全部模型（如 DeepSeek、GPT、Gemini、GLM 等）；选择模型时自动带上来源名称（如 [豫江AI] gpt-5.5、[官方 OpenAI] gpt-4o），清晰区分不同渠道同名模型。
+- **项目历史对话与现场恢复**：会话与项目深度绑定，支持随时唤起项目对话抽屉快速检索并切换历史现场；Codex 与 Claude Code 任务自动延续该对话上下文。
+- **产物受控预览与下载**：支持代码文件（Python、JS 等）、图片（PNG、JPG 等）、表格、文档的实时在线安全渲染与即时下载。
 - Skill 管理：创建、编辑、导入、导出和通过 HTTPS 下载链接安装 Skill 包。
 - 工具接入：支持本地 stdio MCP、远程 Streamable HTTP MCP 和普通 HTTP 工具。
 - 文件处理：可读取常见文本、Office 文档和 PDF 的可提取正文，并生成可下载的 Word、PDF、Excel、Markdown、HTML 或 PPTX 文件；PPTX 默认推荐平台内置 Python 生成器。

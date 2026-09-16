@@ -7,7 +7,7 @@ from app.services.model_defaults import configured_default_model_id
 DEFAULT_AGENTS = (
     {
         "id": "general-agent",
-        "name": "智枢助手",
+        "name": "智织通用智能体",
         "description": "面向分析、总结、规划、文档生成和工具协作等常见任务的默认助手。",
         "model": "deterministic",
         "system_prompt": (

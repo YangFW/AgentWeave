@@ -123,6 +123,8 @@ class ContainerAgentRunner:
         *,
         command_override: str | list[str] | None = None,
         resume_session_id: str | None = None,
+        model_override: str | None = None,
+        base_url_override: str | None = None,
     ) -> list[str]:
         if command_override:
             if isinstance(command_override, list):
@@ -130,10 +132,11 @@ class ContainerAgentRunner:
             return ["/bin/bash", "-c", command_override]
 
         engine_id = normalize_engine_id(engine)
-        model_name = ""
+        model_name = model_override or ""
         row = get_engine_row(engine_id) if engine_id in {"codex", "claude"} else None
-        if row:
+        if not model_name and row:
             model_name = configured_model_name(row)
+        base_url = base_url_override or (str(row.get("base_url") or "").strip() if row else "")
         if engine_id == "codex":
             if resume_session_id:
                 command = [
@@ -143,6 +146,7 @@ class ContainerAgentRunner:
                     resume_session_id,
                     "--skip-git-repo-check",
                     "--dangerously-bypass-approvals-and-sandbox",
+                    "--json",
                 ]
             else:
                 command = [
@@ -150,18 +154,17 @@ class ContainerAgentRunner:
                     "exec",
                     "--skip-git-repo-check",
                     "--dangerously-bypass-approvals-and-sandbox",
+                    "--json",
                 ]
-            if row:
-                base_url = str(row.get("base_url") or "").strip()
-                if base_url:
-                    command.extend([
-                        "-c", 'model_provider="custom"',
-                        "-c", 'model_providers.custom.name="custom"',
-                        "-c", f'model_providers.custom.base_url="{base_url}"',
-                        "-c", 'model_providers.custom.env_key="OPENAI_API_KEY"',
-                        "-c", 'model_providers.custom.wire_api="responses"',
-                        "-c", 'model_providers.custom.requires_openai_auth=false',
-                    ])
+            if base_url:
+                command.extend([
+                    "-c", 'model_provider="custom"',
+                    "-c", 'model_providers.custom.name="custom"',
+                    "-c", f'model_providers.custom.base_url="{base_url}"',
+                    "-c", 'model_providers.custom.env_key="OPENAI_API_KEY"',
+                    "-c", 'model_providers.custom.wire_api="responses"',
+                    "-c", 'model_providers.custom.requires_openai_auth=false',
+                ])
             if model_name:
                 command.extend(["-m", model_name])
             command.append(prompt)
@@ -434,6 +437,7 @@ class ContainerAgentRunner:
         prompt: str,
         *,
         engine: str = "codex",
+        model_id: str | None = None,
         organization_id: str = "local-org",
         user_id: str = "local-user",
         workspace_id: str = "default",
@@ -463,12 +467,34 @@ class ContainerAgentRunner:
             )
 
         engine_id_norm = normalize_engine_id(engine)
+        c_model = None
+        c_base_url = None
+        c_api_key = None
+
+        if model_id and model_id != "deterministic":
+            m_row = db.query_one("SELECT * FROM model_configs WHERE id = ?", (model_id,))
+            if not m_row and ("::" in model_id or ":" in model_id):
+                sep = "::" if "::" in model_id else ":"
+                src_id, m_name = model_id.split(sep, 1)
+                m_row = db.query_one("SELECT * FROM model_configs WHERE source_id = ? AND model = ?", (src_id, m_name))
+            if not m_row:
+                m_row = db.query_one("SELECT * FROM model_configs WHERE model = ? AND enabled = 1 ORDER BY updated_at DESC LIMIT 1", (model_id,))
+            if m_row:
+                c_model = m_row.get("model")
+                c_base_url = str(m_row.get("base_url") or "").strip()
+                if m_row.get("api_key_ciphertext"):
+                    from app.services.secret_store import secret_store
+                    c_api_key = secret_store.decrypt(m_row["api_key_ciphertext"])
+                elif m_row.get("api_key_env"):
+                    c_api_key = os.getenv(m_row["api_key_env"], "")
+
         if engine_id_norm == "codex":
             engine_row = get_engine_row("codex")
-            if engine_row:
+            if not c_base_url and engine_row:
                 c_base_url = str(engine_row.get("base_url") or "").strip()
-                c_model = configured_model_name(engine_row) or "gpt-5.2"
-                if c_base_url:
+            if not c_model:
+                c_model = (configured_model_name(engine_row) if engine_row else None) or "gpt-5.2"
+            if c_base_url:
                     codex_dir = paths.state_dir / ".codex"
                     codex_dir.mkdir(parents=True, exist_ok=True)
                     config_toml = (
@@ -493,9 +519,13 @@ class ContainerAgentRunner:
             prompt,
             command_override=command_override,
             resume_session_id=resume_session_id,
+            model_override=c_model,
+            base_url_override=c_base_url,
         )
 
         active_envs = resolve_runtime_env(engine, env_vars)
+        if c_api_key:
+            active_envs["OPENAI_API_KEY"] = c_api_key
 
         idle_sec = get_runner_idle_seconds()
         use_warm = idle_sec > 0
@@ -566,13 +596,140 @@ class ContainerAgentRunner:
                 duration=time.time() - start_time,
             )
 
+        detected_session_id = resume_session_id or ""
+        accumulated_agent_message: list[str] = []
+
         async def read_stream(stream: asyncio.StreamReader, accumulator: list[str], stream_name: str) -> None:
+            nonlocal detected_session_id
             while True:
                 line = await stream.readline()
                 if not line:
                     break
                 decoded = line.decode("utf-8", errors="replace").rstrip("\r\n")
                 accumulator.append(decoded)
+
+                if stream_name == "stderr":
+                    match = re.search(r"session id:\s*([a-f0-9\-]+)", decoded)
+                    if match:
+                        detected_session_id = match.group(1)
+                    if decoded.strip() and not decoded.startswith("Reading additional input"):
+                        emit(
+                            task_id,
+                            "execution_progress",
+                            "沙箱运行",
+                            decoded,
+                            {"engine": engine, "stream": stream_name},
+                        )
+                    continue
+
+                if decoded.startswith("{") and decoded.endswith("}"):
+                    try:
+                        event_data = json.loads(decoded)
+                        ev_type = event_data.get("type")
+                        if ev_type in ("thread.started", "session_meta"):
+                            s_id = str(event_data.get("thread_id") or (event_data.get("payload") or {}).get("id") or "")
+                            if s_id:
+                                detected_session_id = s_id
+                            emit(
+                                task_id,
+                                "progress",
+                                "沙箱环境建立",
+                                f"会话已就绪 ({s_id[:8] if s_id else 'OK'})",
+                                {"engine": engine, "session_id": s_id},
+                            )
+                            continue
+                        if ev_type == "turn.started":
+                            emit(
+                                task_id,
+                                "progress",
+                                "开始执行",
+                                "Codex 正在分析任务要求并规划执行步骤...",
+                                {"engine": engine},
+                            )
+                            continue
+                        if ev_type == "item.started":
+                            item = event_data.get("item", {})
+                            itype = item.get("type")
+                            if itype in ("reasoning", "Reasoning"):
+                                emit(
+                                    task_id,
+                                    "progress",
+                                    "深度思考中",
+                                    "正在结合工作区上下文规划推导...",
+                                    {"engine": engine, "step": "reasoning"},
+                                )
+                            elif itype in ("command_execution", "CommandExecution"):
+                                cmd = item.get("command", "")
+                                if isinstance(cmd, list):
+                                    cmd = " ".join(cmd)
+                                emit(
+                                    task_id,
+                                    "tool_call",
+                                    "执行沙箱命令",
+                                    cmd[:300],
+                                    {"server_id": "sandbox", "tool_name": "bash", "call_id": item.get("id")},
+                                )
+                            elif itype in ("file_change", "FileChange"):
+                                emit(
+                                    task_id,
+                                    "tool_call",
+                                    "更新文件",
+                                    item.get("path", ""),
+                                    {"server_id": "sandbox", "tool_name": "apply_patch"},
+                                )
+                            continue
+                        if ev_type == "item.completed":
+                            item = event_data.get("item", {})
+                            itype = item.get("type")
+                            if itype in ("agent_message", "AgentMessage"):
+                                text = item.get("text") or item.get("content") or ""
+                                if text:
+                                    accumulated_agent_message.append(text)
+                                    emit(
+                                        task_id,
+                                        "answer_delta",
+                                        "实时回复",
+                                        text,
+                                        {"engine": engine},
+                                    )
+                            elif itype in ("command_execution", "CommandExecution"):
+                                exit_code = item.get("exit_code", 0)
+                                cmd = item.get("command", "")
+                                if isinstance(cmd, list):
+                                    cmd = " ".join(cmd)
+                                emit(
+                                    task_id,
+                                    "tool_result",
+                                    "命令完成",
+                                    f"退出码 {exit_code}: {cmd[:120]}",
+                                    {"server_id": "sandbox", "tool_name": "bash", "exit_code": exit_code},
+                                )
+                            elif itype in ("reasoning", "Reasoning"):
+                                r_text = item.get("text") or ""
+                                if isinstance(r_text, list):
+                                    r_text = "\n".join(r_text)
+                                if r_text:
+                                    emit(
+                                        task_id,
+                                        "progress",
+                                        "推导分析",
+                                        r_text[:200],
+                                        {"engine": engine},
+                                    )
+                            continue
+                        if ev_type == "turn.completed":
+                            usage = event_data.get("usage", {})
+                            emit(
+                                task_id,
+                                "progress",
+                                "执行完成",
+                                f"答复生成完毕 (输入 {usage.get('input_tokens', 0)} / 输出 {usage.get('output_tokens', 0)} tokens)",
+                                {"engine": engine, "usage": usage},
+                            )
+                            continue
+                    except Exception:
+                        pass
+
                 emit(
                     task_id,
                     "execution_progress",
@@ -621,17 +778,35 @@ class ContainerAgentRunner:
             summary = f"任务超时（超过 {timeout} 秒），容器 {container_name} 已强制终止。"
         elif exit_code == 0:
             status = "completed"
-            summary = stdout_full.strip() if stdout_full.strip() else f"{engine} 引擎执行完成。"
+            if accumulated_agent_message:
+                summary = "\n\n".join(accumulated_agent_message)
+            elif stdout_full.strip():
+                messages = []
+                for line in stdout_lines:
+                    if line.startswith("{") and line.endswith("}"):
+                        try:
+                            d = json.loads(line)
+                            if d.get("type") == "item.completed":
+                                item = d.get("item", {})
+                                if item.get("type") == "agent_message" and item.get("text"):
+                                    messages.append(item["text"])
+                        except Exception:
+                            pass
+                if messages:
+                    summary = "\n\n".join(messages)
+                else:
+                    summary = stdout_full.strip()
+            else:
+                summary = f"{engine} 引擎执行完成。"
         else:
             status = "failed"
             summary = f"{engine} 执行异常退出 (退出码 {exit_code})。"
 
-        session_id = ""
-        match = re.search(r"session id:\s*([a-f0-9\-]+)", stderr_full)
-        if match:
-            session_id = match.group(1)
-        elif resume_session_id:
-            session_id = resume_session_id
+        session_id = detected_session_id or resume_session_id or ""
+        if not session_id:
+            match = re.search(r"session id:\s*([a-f0-9\-]+)", stderr_full)
+            if match:
+                session_id = match.group(1)
 
         artifacts = self._register_artifacts(
             task_id=task_id,

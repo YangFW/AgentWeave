@@ -18,13 +18,25 @@ from app.services.secret_store import secret_store
 
 
 class ModelGateway:
+    def _find_model_row(self, model_config_id: str) -> dict[str, Any] | None:
+        if not model_config_id or model_config_id == "deterministic":
+            return None
+        row = db.query_one("SELECT * FROM model_configs WHERE id = ? AND enabled = 1", (model_config_id,))
+        if not row and ("::" in model_config_id or ":" in model_config_id):
+            sep = "::" if "::" in model_config_id else ":"
+            src_id, m_name = model_config_id.split(sep, 1)
+            row = db.query_one("SELECT * FROM model_configs WHERE source_id = ? AND model = ? AND enabled = 1", (src_id, m_name))
+        if not row:
+            row = db.query_one("SELECT * FROM model_configs WHERE model = ? AND enabled = 1 ORDER BY updated_at DESC LIMIT 1", (model_config_id,))
+        return row
+
     """Dispatch model requests to the configured provider or local fallback."""
 
     async def summarize(self, prompt: str, context: dict[str, Any] | None = None, model_config_id: str = "deterministic") -> str:
         model_budget.reserve_call()
         if not model_config_id or model_config_id == "deterministic":
             return self._deterministic_summary(prompt, context or {})
-        row = db.query_one("SELECT * FROM model_configs WHERE id = ? AND enabled = 1", (model_config_id,))
+        row = self._find_model_row(model_config_id)
         if not row:
             raise RuntimeError(f"模型配置不存在或未启用: {model_config_id}")
         if row["provider"] not in {"openai", "openai_compatible"}:
@@ -93,7 +105,7 @@ class ModelGateway:
         )
         raw = await self.summarize(
             prompt,
-            {"system_prompt": "你是智枢平台的上下文意图解析器。必须忠实还原用户当前真正要完成的任务，禁止执行任务。"},
+            {"system_prompt": "你是智织平台的上下文意图解析器。必须忠实还原用户当前真正要完成的任务，禁止执行任务。"},
             model_config_id=model_config_id,
         )
         parsed = self._json_object(raw)
@@ -227,7 +239,7 @@ class ModelGateway:
                     if delay_seconds and offset + chunk_size < len(result):
                         await asyncio.sleep(delay_seconds)
             return result
-        row = db.query_one("SELECT * FROM model_configs WHERE id = ? AND enabled = 1", (model_config_id,))
+        row = self._find_model_row(model_config_id)
         if not row:
             raise RuntimeError(f"模型配置不存在或未启用: {model_config_id}")
         require_outbound_network("在线模型调用")

@@ -697,6 +697,96 @@ def _system_settings_and_permissions_schema(conn: sqlite3.Connection) -> None:
         )
 
 
+def _model_sources_schema(conn: sqlite3.Connection) -> None:
+    """Store model sources (providers) and their multi-model configurations."""
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS model_sources (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            provider TEXT NOT NULL DEFAULT 'openai_compatible',
+            base_url TEXT NOT NULL DEFAULT '',
+            api_key_env TEXT NOT NULL DEFAULT '',
+            api_key_ciphertext TEXT NOT NULL DEFAULT '',
+            models_json TEXT NOT NULL DEFAULT '[]',
+            default_model TEXT NOT NULL DEFAULT '',
+            enabled INTEGER NOT NULL DEFAULT 1,
+            allowed_roles TEXT NOT NULL DEFAULT 'admin,user',
+            config_json TEXT NOT NULL DEFAULT '{}',
+            last_test_status TEXT NOT NULL DEFAULT '',
+            last_test_message TEXT NOT NULL DEFAULT '',
+            last_test_at TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(model_configs)").fetchall()}
+    if "source_id" not in cols:
+        conn.execute("ALTER TABLE model_configs ADD COLUMN source_id TEXT NOT NULL DEFAULT ''")
+
+    conn.execute(
+        """
+        UPDATE agents
+        SET name = '智织通用智能体',
+            description = '面向分析、总结、规划、文档生成和工具协作等常见任务的默认智能体。'
+        WHERE id = 'general-agent' AND (name = '智枢助手' OR name = '')
+        """
+    )
+
+    count = conn.execute("SELECT COUNT(*) FROM model_sources").fetchone()[0]
+    if count == 0:
+        rows = conn.execute(
+            """
+            SELECT id, name, provider, model, base_url, api_key_ciphertext, api_key_env, enabled, allowed_roles, config_json
+            FROM model_configs
+            """
+        ).fetchall()
+        if rows:
+            by_base_url = {}
+            for r in rows:
+                burl = r[4] or 'https://api.openai.com/v1'
+                by_base_url.setdefault(burl, []).append(r)
+
+            now = utc_now()
+            for idx, (burl, group) in enumerate(by_base_url.items(), start=1):
+                src_id = f'source-{idx:02d}'
+                if 'yujiang' in burl:
+                    src_name = '豫江AI'
+                elif 'openai.com' in burl:
+                    src_name = '官方 OpenAI'
+                else:
+                    src_name = f'模型源 {idx}'
+
+                models = []
+                default_model = ''
+                for item in group:
+                    mid = item[0]
+                    mname = item[1] or mid
+                    if mname.startswith('[') and ']' in mname:
+                        mname = mname.split(']', 1)[1].strip()
+                    m_enabled = bool(item[7])
+                    if not default_model:
+                        default_model = mid
+                    models.append({'id': mid, 'name': mname, 'enabled': m_enabled, 'is_default': mid == default_model})
+                first = group[0]
+                conn.execute(
+                    """
+                    INSERT INTO model_sources(
+                        id, name, provider, base_url, api_key_env, api_key_ciphertext,
+                        models_json, default_model, enabled, allowed_roles, config_json,
+                        created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
+                    """,
+                    (src_id, src_name, first[2] or 'openai_compatible', burl, first[6] or '', first[5] or '', json_dumps(models), default_model, first[8] or 'admin,user', first[9] or '{}', now, now),
+                )
+                for item in group:
+                    clean_name = item[1]
+                    if clean_name.startswith('[') and ']' in clean_name:
+                        clean_name = clean_name.split(']', 1)[1].strip()
+                    conn.execute('UPDATE model_configs SET source_id = ?, name = ? WHERE id = ?', (src_id, f'[{src_name}] {clean_name}', item[0]))
+
+
 SCHEMA_MIGRATIONS: tuple[tuple[int, Any], ...] = (
     (1, _shared_scope_schema),
     (2, _expert_team_scope_schema),
@@ -709,6 +799,7 @@ SCHEMA_MIGRATIONS: tuple[tuple[int, Any], ...] = (
     (10, _automation_task_run_binding_schema),
     (11, _execution_engines_schema),
     (12, _system_settings_and_permissions_schema),
+    (13, _model_sources_schema),
 )
 
 # Keep retired version numbers reserved so existing databases do not

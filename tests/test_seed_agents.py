@@ -25,7 +25,7 @@ class SeedAgentTests(unittest.TestCase):
         agents = db.query_all("SELECT * FROM agents ORDER BY id")
         self.assertEqual([item["id"] for item in agents], ["general-agent"])
         general = agents[0]
-        self.assertEqual(general["name"], "智枢助手")
+        self.assertEqual(general["name"], "智织通用智能体")
         self.assertIn("清晰、可核验的结果", general["system_prompt"])
         self.assertEqual(
             db.json_loads(general["skills_json"], []),
