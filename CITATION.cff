@@ -1,14 +1,14 @@
 cff-version: 1.2.0
-message: "If you use AgentNexus in your work, please cite it using the metadata below."
-title: AgentNexus
+message: "If you use AgentWeave in your work, please cite it using the metadata below."
+title: AgentWeave
 type: software
 authors:
   - family-names: "YangFW"
-repository-code: "https://github.com/YangFW/AgentNexus"
-url: "https://github.com/YangFW/AgentNexus"
+repository-code: "https://github.com/YangFW/AgentWeave"
+url: "https://github.com/YangFW/AgentWeave"
 license: MIT
 abstract: >-
-  AgentNexus is a browser-based platform for configuring and running AI agents,
+  AgentWeave is a browser-based platform for configuring and running AI agents,
   models, Skills, MCP tools, expert teams, task workflows, and generated files.
 keywords:
   - AI agents

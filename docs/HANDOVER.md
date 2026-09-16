@@ -1,4 +1,4 @@
-# AgentNexus（智枢）开发交接文档
+# AgentWeave（智织）开发交接文档
 
 更新时间：2026-09-15（Asia/Shanghai）
 
@@ -6,7 +6,7 @@
 
 ## 1. 当前状态
 
-当前工作区包含一套 FastAPI + SQLite 的单机智能体平台。前端位于 `web/`，后端入口是 `app/main.py`，标准 Python 文件名没有改成其他名称。项目目录名是 `AgentNexus`，产品中文名为“智枢”。
+当前工作区包含一套 FastAPI + SQLite 的单机智能体平台。前端位于 `web/`，后端入口是 `app/main.py`，标准 Python 文件名没有改成其他名称。项目目录名是 `AgentWeave`，产品中文名为“智织”。
 
 2026-09-16 已落地执行引擎管理页：管理员可在“执行引擎”中配置 Codex / Claude Code 的 Base URL、密钥方式（环境变量或加密直填）和可选模型名。配置写入 `execution_engines` 表，容器启动时优先注入这些值，其次才回退进程环境 / `.env.local`。页面为后续“新增执行引擎”留了占位，当前不提供增删引擎种类。密钥不要写入 `agentnexus-runner` 镜像。
 
@@ -53,7 +53,7 @@ data/workspaces/{org}/{user}/{workspace}/
 推荐使用：
 
 ```bash
-cd /Users/yangfw/Documents/AiCoding/AgentNexus
+cd /Users/yangfw/Documents/AiCoding/AgentWeave
 python3 -m venv .venv
 source .venv/bin/activate
 .venv/bin/pip install -r requirements.txt
@@ -69,7 +69,7 @@ cp .env.example .env.local       # 只需首次执行，并按需编辑
 curl http://127.0.0.1:8000/api/health
 ```
 
-应该得到包含 `"ok": true`、`"name": "AgentNexus"` 和 `"display_name": "智枢"` 的 JSON。若端口被旧进程占用，先查 `lsof -nP -iTCP:8000 -sTCP:LISTEN`，确认是本项目进程后再停止旧进程。
+应该得到包含 `"ok": true`、`"name": "AgentWeave"` 和 `"display_name": "智织"` 的 JSON。若端口被旧进程占用，先查 `lsof -nP -iTCP:8000 -sTCP:LISTEN`，确认是本项目进程后再停止旧进程。
 
 不要双击 `web/index.html` 或使用 `file://` 打开；这样没有后端连接，模型保存、任务、上传和下载都会失败。
 
@@ -197,7 +197,7 @@ git diff --check
 
 2026-08-19 在当前工作区和运行中的 `127.0.0.1:8000` 服务上完成：
 
-- `GET /api/health` 返回正常，产品名为 AgentNexus，中文名为智枢。
+- `GET /api/health` 返回正常，产品名为 AgentWeave，中文名为智织。
 - `GET /api/capabilities` 与代码一致：文件上传、知识库、记忆、专家团、自动化和基础文档产物可用；当前服务的 PPTX 通过内置 Python 生成器配置可用；搜索、stdio/远程 MCP 和远程安装按当前环境关闭。
 - 模型列表可见内置离线模型和已配置的 `gpt-5.5`，接口只返回密钥是否存在，不返回明文。
 - 通过 API 创建、查询并删除临时 Skill；通过 API 创建、查询并删除临时只读 HTTP MCP，管理链路正常。
@@ -230,3 +230,21 @@ git diff --check
 5. 将内置 stdio MCP 迁入同一套项目挂载容器，并继续用户电脑本地 Runner。
 6. 将知识库从关键词检索升级为带权限过滤和引用定位的可评测检索系统。
 7. 发布前补做测试文档 N-23～N-25 及第 14 节沙箱用例的页面边界验收。
+
+## 12. 2026-09-16 第三方执行引擎、会话上下文与多轮测试总结
+
+### 1. 容器保活与回收机制 (Idle Timeout)
+- **参数控制**：容器默认保活时间为 300 秒（5 分钟），由环境变量 `APP_RUNNER_IDLE_SECONDS` 统一控制，可以通过在 `.env.local` 中配置修改，设置为 `0` 则表示每次任务执行完毕即时销毁。
+- **作用对象**：当前保活机制作用于指定了第三方执行引擎（如 `codex` / `claude` / `container`）的任务容器。每个组织/用户/项目拥有独立的保持容器，在闲置 5 分钟内连续下发任务可直接复用已有容器，无需重复冷启动。
+- **普通智能体对话 (builtin 引擎)**：普通模式对话运行在平台原生进程内（结合模型网关、Skill 与 MCP），不启动 Docker 容器，因此不存在容器销毁开销。
+
+### 2. 对话上下文与 Codex 历史
+- **普通对话**：普通模式由平台管理全局多轮对话上下文（`conversation_id`），每轮都会自动带上历史对话。
+- **Codex / 第三方引擎对话**：平台不仅在调度时自动将同会话最近多轮历史组合成提示下发，且在后台利用 `codex exec resume <session_id>` 实现了会话状态原生级无缝续接。
+- **历史查看**：前端提供专属“Codex 历史”弹窗（接口 `/api/workspaces/{id}/codex-sessions`），可直接在界面上查验历史会话的完整问答记录与元数据。
+
+### 3. 今日排查与修复记录
+- **问题 1：调用 Codex 时偶发报错“任务未完成可以检查配置后重试”**
+  - **排查根因**：在容器内 Codex 首次运行或未信任目录时，Codex 会检查 git 仓库信任；已设置 `--skip-git-repo-check` 与 `--dangerously-bypass-approvals-and-sandbox`，并在项目目录生成 trusted 的 `config.toml`；今日测试中由于历史临时导入代码缺失 `import re` 导致异常退出，现已修复，且后续测试确认连续对话与代号记忆均已 100% 成功。
+- **问题 2：新增模型时 Base URL 和 API Key 获取上游模型列表**
+  - **现有实现**：平台已在“模型设置”与“执行引擎”页均提供了“获取可用模型”接口（`POST /api/models/discover`）。填入 Base URL 和 Key 后，点击按钮可自动拉取上游 `/models` 或 `/v1/models`，并在下拉框中列出所有模型供一键点击选择或批量加入。

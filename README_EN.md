@@ -1,8 +1,8 @@
-# AgentNexus (智枢)
+# AgentWeave (智织)
 
 [简体中文](README.md) | **English**
 
-AgentNexus is a browser-based agent work platform. It provides one place to manage models, agents, Skills, MCP tools, task history, and generated files. Users can start a conversation directly or configure workflows for their own work scenarios.
+AgentWeave (智织) is an advanced multi-agent and execution engine orchestration platform. It unifies the lifecycle of AI agents, expert teams, Skills, MCP tools, and external professional agent engines such as **Codex** and **Claude Code** within isolated container sandboxes.
 
 Its main capabilities include:
 
@@ -15,7 +15,7 @@ Its main capabilities include:
 - Task execution: an event stream reports the plan, selected Skills and model, tool calls, file generation, and final validation.
 - Memory and automation: retain explicit long-term preferences or trigger recurring tasks on a schedule or through a webhook.
 
-The built-in offline model requires no API key and is intended for checking the UI, task flow, and file pipeline. It is not a general-purpose language model. Configure a real model before using AgentNexus for content creation, complex analysis, or tool planning.
+The built-in offline model requires no API key and is intended for checking the UI, task flow, and file pipeline. It is not a general-purpose language model. Configure a real model before using AgentWeave for content creation, complex analysis, or tool planning.
 
 The current web UI is primarily in Chinese. This guide shows the corresponding Chinese menu names where needed.
 
@@ -37,7 +37,7 @@ cp .env.example .env.local
 
 `.env.local` stores machine-specific network switches, host allowlists, and optional environment-variable credentials. Git ignores this file, so it is not uploaded to the repository. Online models require `APP_ALLOW_OUTBOUND_NETWORK=true` and the model Base URL hostname in `APP_MODEL_HOST_ALLOWLIST`. If the API key is entered directly in the UI, it does not need to be duplicated in `.env.local`.
 
-For the built-in offline model only, you may omit `.env.local` and run `./start-local.sh`; AgentNexus then starts with its network-disabled secure defaults.
+For the built-in offline model only, you may omit `.env.local` and run `./start-local.sh`; AgentWeave then starts with its network-disabled secure defaults.
 
 Windows PowerShell:
 
@@ -87,7 +87,7 @@ Open “模型设置” (Model Settings), select “添加模型” (Add Model),
 - `openai`: an OpenAI Chat Completions-compatible endpoint.
 - `openai_compatible`: a service that exposes a `/v1/chat/completions`-compatible endpoint.
 
-To use an environment variable, define the key in the process that starts AgentNexus:
+To use an environment variable, define the key in the process that starts AgentWeave:
 
 ```bash
 cp .env.example .env.local
@@ -98,7 +98,7 @@ cp .env.example .env.local
 ./start-local.sh
 ```
 
-In the UI, select “环境变量” (Environment Variable) and enter `OPENAI_API_KEY`. Base URL must be the provider's OpenAI-compatible API root, such as `https://api.openai.com/v1`; AgentNexus appends `/chat/completions` when sending a request. Set `APP_MODEL_HOST_ALLOWLIST` to the allowed model hostnames, separated by commas and without schemes or paths.
+In the UI, select “环境变量” (Environment Variable) and enter `OPENAI_API_KEY`. Base URL must be the provider's OpenAI-compatible API root, such as `https://api.openai.com/v1`; AgentWeave appends `/chat/completions` when sending a request. Set `APP_MODEL_HOST_ALLOWLIST` to the allowed model hostnames, separated by commas and without schemes or paths.
 
 You may instead select “直接填写 API Key” (Enter API Key Directly). The key is encrypted with a local machine key before being stored in SQLite, and the UI never returns its plaintext value. This is a single-machine storage mechanism, not a replacement for a production Secret Manager or KMS.
 
@@ -129,11 +129,11 @@ Review this release plan from product, engineering, and security perspectives, a
 
 A Skill describes when it applies, how to execute the work, which tools it depends on, and what output it should produce. Under “技能中心” (Skills), you can create a Skill or import one from a `SKILL.md` file, ZIP package, or public HTTPS download link. Once installed, a Skill can be inspected, disabled, edited, or exported from the Skill list.
 
-MCP integrations are managed under “工具接入” (Tool Integrations). AgentNexus can import common `mcpServers` JSON, or you can configure a local stdio service, remote Streamable HTTP service, or regular HTTP tool manually. External processes and network tools are disabled by default; the deployer must explicitly enable them through environment variables and configure allowlists. After adding a service, bind its service ID to the relevant agent.
+MCP integrations are managed under “工具接入” (Tool Integrations). AgentWeave can import common `mcpServers` JSON, or you can configure a local stdio service, remote Streamable HTTP service, or regular HTTP tool manually. External processes and network tools are disabled by default; the deployer must explicitly enable them through environment variables and configure allowlists. After adding a service, bind its service ID to the relevant agent.
 
 Local stdio MCP requires at least `APP_ALLOW_STDIO_MCP`. List only reviewed executables in `APP_STDIO_COMMAND_ALLOWLIST`; absolute paths are recommended for shared deployments. Remote MCP and regular HTTP tools also require the outbound-network master switch and their capability-specific switches. Restrict destinations with `APP_REMOTE_HOST_ALLOWLIST`. Allowlists contain hostnames only, separated by commas.
 
-The MCP page masks common secret fields in the UI, but service configurations are still stored as JSON in SQLite and do not use the encrypted storage mechanism used for model keys. Do not place tokens directly in the configuration. Prefer `${ENV_NAME}` references, which AgentNexus resolves from its server process environment at call time, and protect the database as sensitive runtime data.
+The MCP page masks common secret fields in the UI, but service configurations are still stored as JSON in SQLite and do not use the encrypted storage mechanism used for model keys. Do not place tokens directly in the configuration. Prefer `${ENV_NAME}` references, which AgentWeave resolves from its server process environment at call time, and protect the database as sensitive runtime data.
 
 For complete installation methods, examples, and security controls, see the [Platform Guide (Chinese)](docs/PLATFORM_GUIDE.md).
 
@@ -141,7 +141,7 @@ For complete installation methods, examples, and security controls, see the [Pla
 
 File uploads are enabled by default. Extractable text from TXT, Markdown, CSV, JSON, YAML, common source-code files, DOCX, XLSX, PPTX, and PDF files can be added to task context. Scanned PDFs are not processed with OCR, and legacy Office formats are outside the default parsing scope.
 
-AgentNexus has built-in generation for DOCX, PDF, XLSX, Markdown, HTML, and PPTX through `python-pptx`. In the UI, open “模型设置 → 文档交付 → PPTX 配置向导” and choose the bundled Python generator. The equivalent setting is:
+AgentWeave has built-in generation for DOCX, PDF, XLSX, Markdown, HTML, and PPTX through `python-pptx`. In the UI, open “模型设置 → 文档交付 → PPTX 配置向导” and choose the bundled Python generator. The equivalent setting is:
 
 ```bash
 export APP_PPTX_GENERATOR='python'
@@ -162,7 +162,7 @@ Files are stored in runtime directories under `data/` and accessed through contr
 
 The implementation now includes optional login, administrator/member roles, workspace membership and resource checks, and Redis Streams/Worker execution. Authentication remains disabled for local development by default; the small-team configuration enables it. This does not provide enterprise multi-tenant RBAC, a sandbox per task, or a highly available cluster. Do not expose it to an untrusted public network without completing deployment validation.
 
-Installing a Skill does not execute scripts contained in its package. A local stdio MCP service starts a process on the AgentNexus server, not on the browser user's computer. Restrict commands, remote hosts, and tool permissions before enabling these capabilities.
+Installing a Skill does not execute scripts contained in its package. A local stdio MCP service starts a process on the AgentWeave server, not on the browser user's computer. Restrict commands, remote hosts, and tool permissions before enabling these capabilities.
 
 `APP_ALLOW_OUTBOUND_NETWORK` is disabled by default and acts as the master switch for online models, weather, web search, remote MCP, HTTP tools, remote policies, and installation from download links. It does not restrict network access initiated independently by stdio child processes. A strictly offline deployment must also enforce outbound restrictions through containers, host firewalls, or network policies.
 
@@ -181,15 +181,15 @@ docs/                      Usage and architecture documentation
 data/                      Local runtime data (not committed)
 ```
 
-See the [Architecture Guide (Chinese)](docs/ARCHITECTURE.md) for implementation details. Refer to [.env.example](.env.example) for the available environment variables. Restart the AgentNexus process after changing environment variables.
+See the [Architecture Guide (Chinese)](docs/ARCHITECTURE.md) for implementation details. Refer to [.env.example](.env.example) for the available environment variables. Restart the AgentWeave process after changing environment variables.
 
 ## Contributing
 
-Bug reports and pull requests are welcome through [Issues](https://github.com/YangFW/AgentNexus/issues). Before submitting a change, make sure it does not include `.env` files, API keys, databases, uploaded files, generated files, or other local runtime data. In a pull request, describe the purpose of the change, how to use it, and how it was verified.
+Bug reports and pull requests are welcome through [Issues](https://github.com/YangFW/AgentWeave/issues). Before submitting a change, make sure it does not include `.env` files, API keys, databases, uploaded files, generated files, or other local runtime data. In a pull request, describe the purpose of the change, how to use it, and how it was verified.
 
 ## References and acknowledgements
 
-AgentNexus is an independent open-source project. Its protocol implementation and infrastructure use or reference the following public specifications and projects:
+AgentWeave is an independent open-source project. Its protocol implementation and infrastructure use or reference the following public specifications and projects:
 
 - [Model Context Protocol](https://modelcontextprotocol.io/specification/latest) and the [MCP Python SDK](https://github.com/modelcontextprotocol/python-sdk): MCP service integration and tool invocation.
 - [OpenAI API Reference](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create): the Chat Completions-compatible model interface.
@@ -197,18 +197,18 @@ AgentNexus is an independent open-source project. Its protocol implementation an
 - [SQLite](https://www.sqlite.org/docs.html): local configuration and task-data storage.
 - [Open-Meteo](https://open-meteo.com/en/docs): data API for the built-in weather tool.
 
-These names are used only to identify compatible protocols, dependencies, or data sources. They do not imply endorsement of AgentNexus by the corresponding projects or organizations. Third-party components and external services remain subject to their own licenses and terms of service.
+These names are used only to identify compatible protocols, dependencies, or data sources. They do not imply endorsement of AgentWeave by the corresponding projects or organizations. Third-party components and external services remain subject to their own licenses and terms of service.
 
 ## Citation
 
-If AgentNexus is useful in your project or research, please consider giving it a Star ⭐. To cite the project in a paper, report, or other work, use:
+If AgentWeave is useful in your project or research, please consider giving it a Star ⭐. To cite the project in a paper, report, or other work, use:
 
 ```bibtex
-@software{YangFW_AgentNexus_2026,
+@software{YangFW_AgentWeave_2026,
   author  = {{YangFW}},
-  title   = {AgentNexus},
+  title   = {AgentWeave},
   year    = {2026},
-  url     = {https://github.com/YangFW/AgentNexus},
+  url     = {https://github.com/YangFW/AgentWeave},
   license = {MIT}
 }
 ```
@@ -217,4 +217,4 @@ The repository also provides a standard [`CITATION.cff`](CITATION.cff) for GitHu
 
 ## License
 
-The original AgentNexus source code is released under the [MIT License](LICENSE).
+The original AgentWeave source code is released under the [MIT License](LICENSE).
