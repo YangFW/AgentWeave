@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from unittest.mock import AsyncMock, patch
+import os
+from app.services import auth_service
 from pathlib import Path
 
 from app import db
@@ -33,6 +36,33 @@ class ChatInstallTests(unittest.IsolatedAsyncioTestCase):
                 ModelGateway(),
                 skill_url_installer=unsafe_install,
             )
+
+    async def test_member_cannot_install_platform_components_through_chat(self):
+        with patch.dict(os.environ, {'APP_AUTH_ENABLED':'true', 'APP_ADMIN_PASSWORD':'', 'APP_USER_PASSWORD':''}):
+            auth_service.init_schema()
+            member = auth_service.create_user('member', 'example-password')
+            loader = AsyncMock()
+            runtime = AgentRuntime(SkillRegistry(), McpGateway(), ModelGateway(), skill_url_loader=loader, mcp_url_loader=loader)
+            for message in ('安装 Skill https://example.com/SKILL.md', '安装 MCP https://example.com/mcp.json'):
+                task = create_task_record(message, 'general-agent', user_id=member['id'])
+                with self.assertRaises(PermissionError):
+                    await runtime._try_platform_command(task)
+            loader.assert_not_awaited()
+            self.assertFalse(runtime._can_manage_platform(task))
+
+    async def test_role_revoked_during_download_prevents_transactional_install(self):
+        with patch.dict(os.environ, {'APP_AUTH_ENABLED':'true', 'APP_ADMIN_PASSWORD':'', 'APP_USER_PASSWORD':''}):
+            auth_service.init_schema()
+            admin = auth_service.create_user('admin-test','example-password',role='admin')
+            async def download(url):
+                db.execute("UPDATE users SET role='user' WHERE id=?", (admin['id'],))
+                return {'files':{'SKILL.md':b'---\nid: revoked_skill\nname: Revoked\ndescription: Test\n---\nTest'},'fallback_id':'revoked_skill'}
+            registry = SkillRegistry()
+            runtime = AgentRuntime(registry,McpGateway(),ModelGateway(),skill_url_loader=download)
+            task = create_task_record('安装 Skill https://example.com/SKILL.md','general-agent',user_id=admin['id'])
+            await runtime.run_task(task['id'])
+            self.assertIsNone(registry.get_skill('revoked_skill'))
+            self.assertEqual(db.query_one('SELECT status FROM tasks WHERE id=?',(task['id'],))['status'],'failed')
 
     async def test_chat_installs_skill_from_market_url(self) -> None:
         seen: list[str] = []

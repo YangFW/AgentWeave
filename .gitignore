@@ -15,6 +15,7 @@
 .env
 .env.*
 !.env.example
+!.env.release.example
 *.pem
 *.key
 *.p12
@@ -65,6 +66,8 @@ dist/
 *.sqlite3-*
 /uploads/
 /artifacts/
+/backups/
+/restore-staging/
 /mcp-workspace/
 data/*
 !data/.gitkeep

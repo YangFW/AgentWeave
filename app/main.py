@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from app.services.workspace_path_manager import default_path_manager
+
 import asyncio
 import csv
 import hashlib
@@ -20,8 +22,8 @@ from typing import Any, Mapping
 from urllib.parse import urljoin, urlparse
 
 import httpx
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi import FastAPI, File, HTTPException, Request, Response, UploadFile
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from app import db
@@ -34,9 +36,10 @@ from app.schemas import (
     LoopCreate, LoopUpdate, MemoryCreate, MemoryUpdate, ModelConfigCreate,
     ModelConfigUpdate, RemoteInstall, SkillCreate, SkillFileUpdate,
     SkillPathInstall, SkillUpdate,
-    PresentationConfigureRequest,
+    PresentationConfigureRequest, ExecutionEngineUpdate, ModelDiscoverRequest,
     CheckpointRestoreRequest, PolicyRuleCreate, PolicyRuleUpdate, TaskCommandRequest,
     TaskCreate, TaskResumeRequest, ToolInvokeRequest, WorkspaceCreate, WorkspaceUpdate,
+    UserCreate, UserUpdate, WorkspaceMemberUpdate,
 )
 from app.seed import seed_agents
 from app.services.agent_runtime import AgentRuntime, create_task_record
@@ -48,6 +51,9 @@ from app.services.expert_team_service import (
     ExpertTeamService, ExpertValidationError,
 )
 from app.services.event_bus import emit
+from app.services import task_queue
+from app.services import event_notifications
+from app.services import auth_service
 from app.services.knowledge_base_service import (
     KnowledgeBaseError,
     KnowledgeBaseNotFoundError,
@@ -81,6 +87,15 @@ from app.services.network_policy import (
 )
 from app.services.policy_engine import PolicyConfigurationError, PolicyEngine, PolicyRule
 from app.services.secret_store import secret_store
+from app.services.execution_engine_service import (
+    ExecutionEngineError,
+    get_engine,
+    get_engine_row,
+    list_engines,
+    update_engine,
+    test_engine_connection,
+    resolve_runtime_env,
+)
 from app.services.skill_registry import SkillRegistry, referenced_package_files
 from app.services.task_state import (
     PublicationConflict,
@@ -141,7 +156,58 @@ def _load_local_env_file() -> None:
 _load_local_env_file()
 UPLOAD_DIR = Path(os.getenv("APP_UPLOAD_DIR", str(BASE_DIR / "data" / "uploads")))
 
-app = FastAPI(title="AgentNexus", version="0.1.0")
+app = FastAPI(title="AgentWeave", version="0.1.0")
+
+
+@app.middleware("http")
+async def authentication_middleware(request: Request, call_next: Any) -> Any:
+    identity = None
+    audit_id = None
+    if auth_service.enabled() and request.url.path.startswith("/api/"):
+        public = {"/api/health", "/api/readiness", "/api/auth/login", "/api/auth/me"}
+        signed_webhook = request.method == 'POST' and re.fullmatch(r'/api/loops/[A-Za-z0-9_-]{2,80}/webhook', request.url.path) is not None
+        identity = None if signed_webhook else auth_service.get_session(request.cookies.get(auth_service.SESSION_COOKIE))
+        mutating = request.method not in {"GET", "HEAD", "OPTIONS"}
+        if mutating or request.url.path.endswith(("/download", "/preview")):
+            audit_id = auth_service.start_audit(identity, request.method)
+        if mutating and not signed_webhook:
+            origin = request.headers.get("origin")
+            expected = f"{request.url.scheme}://{request.url.netloc}"
+            if (origin is not None and origin != expected) or request.headers.get("sec-fetch-site") == "cross-site":
+                if audit_id:
+                    auth_service.finish_audit(audit_id, "cross_origin_denied", 403)
+                return JSONResponse({"detail": "不允许跨站修改请求"}, status_code=403)
+        if request.url.path not in public and not signed_webhook and not identity:
+            if audit_id:
+                auth_service.finish_audit(audit_id, "authentication_denied", 401)
+            return JSONResponse({"detail": "需要登录"}, status_code=401)
+        management = {"users", "models", "agents", "skills", "mcp", "policies", "marketplace", "presentation", "execution-engines"}
+        resource = request.url.path.split("/")[2]
+        if identity:
+            identity = {**identity, "request_method": request.method, "request_resource": resource}
+        if identity and identity["role"] != "admin" and resource in management and request.method not in {"GET", "HEAD", "OPTIONS"}:
+            if audit_id:
+                auth_service.finish_audit(audit_id, "admin_required", 403)
+            return JSONResponse({"detail": "需要管理员权限"}, status_code=403)
+        shared_tables = {'memories': ('memory_entries', 'scope_type'), 'knowledge-bases': ('knowledge_bases', 'visibility')}
+        parts = request.url.path.split('/')
+        if identity and identity['role'] != 'admin' and mutating and resource in shared_tables and len(parts) > 3:
+            table, column = shared_tables[resource]
+            shared = db.query_one(f'SELECT {column} AS scope FROM {table} WHERE id=?', (parts[3],))
+            if shared and shared['scope'] == 'organization':
+                if audit_id:
+                    auth_service.finish_audit(audit_id, 'organization_write_denied', 403)
+                return JSONResponse({'detail': '修改组织共享资源需要管理员权限'}, status_code=403)
+    token = auth_service.current_identity.set(identity)
+    try:
+        response = await call_next(request)
+        if audit_id:
+            # 只保存路由模板，不保存 URL 参数、正文、Cookie 或用户输入的路径。
+            route = getattr(request.scope.get("route"), "path", "unmatched")
+            auth_service.finish_audit(audit_id, route, response.status_code, getattr(request.state, "audit_user_id", None))
+        return response
+    finally:
+        auth_service.current_identity.reset(token)
 
 skill_registry = SkillRegistry()
 mcp_gateway = McpGateway()
@@ -203,7 +269,7 @@ def _remote_install_url(url: str) -> str:
 async def _download_remote_install(url: str, max_bytes: int) -> tuple[bytes, str]:
     checked = _remote_install_url(url)
     async with httpx.AsyncClient(timeout=30, follow_redirects=False) as client:
-        response = await client.get(checked, headers={"User-Agent": "AgentNexus/0.1"})
+        response = await client.get(checked, headers={"User-Agent": "AgentWeave/0.1"})
         response.raise_for_status()
     if len(response.content) > max_bytes:
         raise ValueError("远程安装包超过大小限制")
@@ -319,6 +385,15 @@ def _schedule_runtime(
     *,
     activation_result: dict[str, Any] | None = None,
 ) -> asyncio.Task[Any]:
+    if activation_result is None and task_queue.enabled():
+        async def enqueue_runtime() -> None:
+            # 新运行已原子写入 outbox；兼容旧运行的恢复调度。
+            db.execute("INSERT OR IGNORE INTO dispatch_outbox(run_id,task_id,payload_json,created_at) VALUES(?,?,?,?)", (run_id, task_id, json.dumps({"task_id": task_id, "run_id": run_id}), db.utc_now()))
+
+        background = asyncio.create_task(enqueue_runtime())
+        _runtime_tasks.add(background)
+        background.add_done_callback(_runtime_tasks.discard)
+        return background
     continuation = (
         runtime.run_task(
             task_id,
@@ -335,6 +410,16 @@ def _schedule_runtime(
 
 
 def _schedule_team_run(team_run_id: str) -> asyncio.Task[Any]:
+    if task_queue.enabled():
+        async def enqueue_team() -> None:
+            row = db.query_one("SELECT parent_task_id,parent_run_id FROM team_runs WHERE id=?", (team_run_id,))
+            if not row:
+                raise RuntimeError("专家团运行不存在")
+            db.execute("INSERT OR IGNORE INTO dispatch_outbox(run_id,task_id,payload_json,created_at) VALUES(?,?,?,?)", (row['parent_run_id'], row['parent_task_id'], db.json_dumps({'task_id': row['parent_task_id'], 'run_id': row['parent_run_id'], 'kind': 'team', 'team_run_id': team_run_id}), db.utc_now()))
+        background = asyncio.create_task(enqueue_team())
+        _runtime_tasks.add(background)
+        background.add_done_callback(_runtime_tasks.discard)
+        return background
     background = asyncio.create_task(expert_team_service.run_team(team_run_id))
     _runtime_tasks.add(background)
     background.add_done_callback(_runtime_tasks.discard)
@@ -344,6 +429,17 @@ def _schedule_team_run(team_run_id: str) -> asyncio.Task[Any]:
 def _schedule_member_retry(
     team_run_id: str, member_run_id: str, scope: ExecutionScope
 ) -> asyncio.Task[Any]:
+    if task_queue.enabled():
+        row = db.query_one('SELECT parent_task_id,parent_run_id FROM team_runs WHERE id=?', (team_run_id,))
+        job_id = 'member_retry_' + uuid.uuid4().hex
+        message = {'kind':'member_retry', 'job_id':job_id, 'dispatch_id':job_id, 'team_run_id':team_run_id, 'member_run_id':member_run_id, 'task_id':row['parent_task_id'], 'run_id':row['parent_run_id'], 'scope':{'organization_id':scope.organization_id, 'workspace_id':scope.workspace_id, 'user_id':scope.user_id}}
+        try:
+            db.execute('INSERT INTO member_retry_dispatch(job_id,team_run_id,payload_json,created_at) VALUES(?,?,?,?)', (job_id,team_run_id,db.json_dumps(message),db.utc_now()))
+        except sqlite3.IntegrityError as exc:
+            raise HTTPException(status_code=409, detail='该专家团已有成员重试正在排队或运行') from exc
+        async def accepted():
+            return {'accepted':True, 'job_id':job_id}
+        return asyncio.create_task(accepted())
     background = asyncio.create_task(
         expert_team_service.retry_member(team_run_id, member_run_id, scope)
     )
@@ -423,6 +519,8 @@ def _persisted_run_executor(run: Mapping[str, Any]) -> tuple[str, str, bool]:
 
 
 def _ordinary_runtime_owned(run: Mapping[str, Any]) -> bool:
+    if (run.get("metadata") or {}).get("dispatch_backend") == "redis":
+        return False
     executor_type, _, consistent = _persisted_run_executor(run)
     return consistent and executor_type == "agent"
 
@@ -482,6 +580,8 @@ def _prepare_waiting_approval_recovery(
     continuations: list[dict[str, Any]] = []
     preserved = preserve_task_ids or set()
     for waiting_run in task_state.list_runs(status="waiting_approval", limit=1000):
+        if (waiting_run.get("metadata") or {}).get("dispatch_backend") == "redis":
+            continue
         task_id = str(waiting_run["task_id"])
         if task_id in preserved:
             continue
@@ -714,16 +814,39 @@ def _recover_interrupted_runs(
 @app.on_event("startup")
 async def on_startup() -> None:
     db.init_db()
+    auth_service.init_schema()
+    auth_service.validate_deployment_admin()
     workspace_service.init_schema()
     context_service.init_schema()
     knowledge_service.init_schema()
     task_state.init_schema()
+    if task_queue.enabled():
+        dispatcher = asyncio.create_task(task_queue.dispatch_forever())
+        _runtime_tasks.add(dispatcher)
+        dispatcher.add_done_callback(_runtime_tasks.discard)
+        relay = asyncio.create_task(event_notifications.relay_forever())
+        _runtime_tasks.add(relay)
+        relay.add_done_callback(_runtime_tasks.discard)
     runtime.tool_effect_journal.init_schema()
+    all_runs = db.query_all("SELECT id,task_id,metadata_json FROM task_runs")
+    worker_run_ids = {
+        row["id"] for row in all_runs
+        if db.json_loads(row["metadata_json"], {}).get("dispatch_backend") == "redis"
+    }
+    worker_task_ids = {row['task_id'] for row in all_runs if row['id'] in worker_run_ids}
+    task_parents = db.query_all('SELECT id,parent_task_id FROM tasks')
+    while True:
+        children = {row['id'] for row in task_parents if row['parent_task_id'] in worker_task_ids}
+        if children.issubset(worker_task_ids):
+            break
+        worker_task_ids.update(children)
+    worker_run_ids.update(row['id'] for row in all_runs if row['task_id'] in worker_task_ids)
     runtime.tool_effect_journal.recover_interrupted_executions(
-        reason="service_restart"
+        reason="service_restart", exclude_run_ids=worker_run_ids,
     )
-    interrupted_loop_tasks = loop_scheduler.recover_interrupted_runs()
-    queued_team_runs = expert_team_service.reconcile_interrupted_orchestrated_runs()
+    worker_loop_ids = {row['loop_id'] for row in db.query_all("SELECT loop_id FROM automation_dispatch WHERE status IN ('queued','running')")}
+    interrupted_loop_tasks = loop_scheduler.recover_interrupted_runs(exclude_loop_ids=worker_loop_ids)
+    queued_team_runs = expert_team_service.reconcile_interrupted_orchestrated_runs(exclude_task_ids=worker_task_ids)
     queued_team_task_ids = {item["parent_task_id"] for item in queued_team_runs}
     _migrate_legacy_model_keys()
     skill_registry.load_builtin_skills()
@@ -773,7 +896,104 @@ async def on_shutdown() -> None:
 
 @app.get("/api/health")
 def health() -> dict[str, Any]:
-    return {"ok": True, "name": "AgentNexus", "product": "AgentNexus", "display_name": "智枢"}
+    result: dict[str, Any] = {"ok": True, "name": "AgentWeave", "product": "AgentWeave", "display_name": "智织"}
+    if task_queue.enabled():
+        try:
+            import redis
+
+            client = redis.Redis.from_url(task_queue.redis_url(), socket_timeout=1)
+            client.ping()
+            client.close()
+            result["redis"] = {"ok": True}
+        except Exception:
+            result["ok"] = False
+            result["redis"] = {"ok": False}
+    else:
+        result["redis"] = {"ok": False, "configured": False}
+    return result
+
+
+@app.post("/api/auth/login")
+def auth_login(payload: dict[str, str], response: Response, request: Request) -> dict[str, Any]:
+    if not auth_service.enabled():
+        return {"authenticated": False, "enabled": False}
+    peer = request.client.host if request.client else "unknown"
+    if not auth_service.reserve_login_attempt(str(payload.get("username") or ""), peer):
+        raise HTTPException(status_code=429, detail="登录尝试过于频繁，请稍后重试", headers={"Retry-After": "60"})
+    result = auth_service.login(str(payload.get("username") or ""), str(payload.get("password") or ""))
+    if not result:
+        raise HTTPException(status_code=401, detail="用户名或密码错误")
+    token, user = result
+    request.state.audit_user_id = user["user_id"]
+    response.set_cookie(auth_service.SESSION_COOKIE, token, httponly=True, secure=request.url.scheme == "https", samesite="lax", max_age=86400)
+    return {"authenticated": True, "user": user}
+
+
+@app.get("/api/readiness")
+def readiness() -> JSONResponse:
+    status = task_queue.readiness()
+    try:
+        db.query_one("SELECT 1 FROM task_runs LIMIT 1")
+        status["database"] = True
+    except sqlite3.Error:
+        status.update(ready=False, database=False)
+    return JSONResponse(status, status_code=200 if status["ready"] else 503)
+
+
+@app.post("/api/auth/logout")
+def auth_logout(request: Request, response: Response) -> dict[str, bool]:
+    auth_service.logout(request.cookies.get(auth_service.SESSION_COOKIE))
+    response.delete_cookie(auth_service.SESSION_COOKIE)
+    return {"authenticated": False}
+
+
+@app.get("/api/auth/me")
+def auth_me(request: Request) -> dict[str, Any]:
+    session = auth_service.get_session(request.cookies.get(auth_service.SESSION_COOKIE))
+    return {"authenticated": bool(session), "enabled": auth_service.enabled(), "user": session or {}}
+
+
+def _require_admin(request: Request) -> dict[str, Any]:
+    if not auth_service.enabled():
+        raise HTTPException(status_code=403, detail="请先启用认证")
+    session = auth_service.get_session(request.cookies.get(auth_service.SESSION_COOKIE))
+    if not session:
+        raise HTTPException(status_code=401, detail="需要登录")
+    if session["role"] != "admin":
+        raise HTTPException(status_code=403, detail="需要管理员权限")
+    return session
+
+
+@app.get("/api/users")
+def list_users(request: Request) -> list[dict[str, Any]]:
+    _require_admin(request)
+    return auth_service.list_users()
+
+
+@app.get("/api/audit-events")
+def list_audit_events(request: Request, limit: int = 100) -> list[dict[str, Any]]:
+    _require_admin(request)
+    return db.query_all("SELECT * FROM audit_events ORDER BY id DESC LIMIT ?", (max(1, min(limit, 500)),))
+
+
+@app.post("/api/users", status_code=201)
+def create_user(payload: UserCreate, request: Request) -> dict[str, Any]:
+    _require_admin(request)
+    try:
+        return auth_service.create_user(payload.username, payload.password, payload.role)
+    except sqlite3.IntegrityError as exc:
+        raise HTTPException(status_code=409, detail="用户名已存在") from exc
+
+
+@app.put("/api/users/{user_id}")
+def update_user(user_id: str, payload: UserUpdate, request: Request) -> dict[str, Any]:
+    _require_admin(request)
+    try:
+        return auth_service.update_user(user_id, payload.model_dump(exclude_none=True))
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 def _presentation_env_file() -> Path:
@@ -1113,6 +1333,11 @@ def _api_scope(
     agent_id: str = "",
     conversation_id: str = "",
 ) -> ExecutionScope:
+    identity = auth_service.current_identity.get()
+    if identity:
+        organization_id, user_id = "local-org", identity["user_id"]
+        if identity.get("request_resource") != "workspaces":
+            _require_workspace_access(workspace_id, write=identity.get("request_method") not in {"GET", "HEAD", "OPTIONS"})
     try:
         return ExecutionScope(
             organization_id=organization_id,
@@ -1123,6 +1348,65 @@ def _api_scope(
         )
     except (TypeError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+def _actor_id(fallback: str) -> str:
+    identity = auth_service.current_identity.get()
+    return identity['user_id'] if identity else fallback
+
+
+def _require_shared_creation_scope(scope: str) -> None:
+    identity = auth_service.current_identity.get()
+    if identity and identity['role'] != 'admin' and scope in {'organization', 'public'}:
+        raise HTTPException(status_code=403, detail='发布组织共享资源需要管理员权限')
+
+
+def _require_workspace_access(workspace_id: str, *, write: bool = False, manage: bool = False) -> None:
+    identity = auth_service.current_identity.get()
+    if not identity:
+        return
+    access = auth_service.workspace_access(workspace_id, identity)
+    if not access or (write and access == "viewer") or (manage and access != "owner"):
+        raise HTTPException(status_code=403, detail="无权访问或修改此工作区")
+
+
+@app.get("/api/workspaces/{workspace_id}/members")
+def list_workspace_members(workspace_id: str) -> list[dict[str, Any]]:
+    _require_workspace_access(workspace_id, manage=True)
+    if not auth_service.current_identity.get():
+        raise HTTPException(status_code=403, detail="请先启用认证")
+    return db.query_all("SELECT m.user_id,u.username,m.role FROM workspace_members m JOIN users u ON u.id=m.user_id WHERE m.workspace_id=? ORDER BY u.username", (workspace_id,))
+
+
+@app.put("/api/workspaces/{workspace_id}/members/{user_id}")
+def set_workspace_member(workspace_id: str, user_id: str, payload: WorkspaceMemberUpdate) -> dict[str, Any]:
+    _require_workspace_access(workspace_id, manage=True)
+    if not auth_service.current_identity.get():
+        raise HTTPException(status_code=403, detail="请先启用认证")
+    if not db.query_one("SELECT id FROM users WHERE id=? AND enabled=1", (user_id,)):
+        raise HTTPException(status_code=404, detail="用户不存在或已停用")
+    db.execute("INSERT INTO workspace_members(workspace_id,user_id,role) VALUES(?,?,?) ON CONFLICT(workspace_id,user_id) DO UPDATE SET role=excluded.role", (workspace_id,user_id,payload.role))
+    return {"workspace_id": workspace_id, "user_id": user_id, "role": payload.role}
+
+
+@app.delete("/api/workspaces/{workspace_id}/members/{user_id}")
+def remove_workspace_member(workspace_id: str, user_id: str) -> dict[str, bool]:
+    _require_workspace_access(workspace_id, manage=True)
+    if not auth_service.current_identity.get():
+        raise HTTPException(status_code=403, detail="请先启用认证")
+    db.execute("DELETE FROM workspace_members WHERE workspace_id=? AND user_id=?", (workspace_id,user_id))
+    return {"removed": True}
+
+
+@app.put('/api/workspaces/{workspace_id}/members/by-username/{username}')
+def set_workspace_member_by_username(workspace_id: str, username: str, payload: WorkspaceMemberUpdate) -> dict[str, Any]:
+    _require_workspace_access(workspace_id, manage=True)
+    if not auth_service.current_identity.get():
+        raise HTTPException(status_code=403, detail='请先启用认证')
+    user = db.query_one('SELECT id FROM users WHERE username=? AND enabled=1', (username,))
+    if not user:
+        raise HTTPException(status_code=404, detail='用户不存在或已停用')
+    return set_workspace_member(workspace_id, user['id'], payload)
 
 
 def _expert_http_error(exc: Exception) -> HTTPException:
@@ -1142,10 +1426,12 @@ def list_workspaces(
     include_disabled: bool = False,
 ) -> list[dict[str, Any]]:
     try:
-        return workspace_service.list_workspaces(
+        items = workspace_service.list_workspaces(
             _api_scope(organization_id, "default", user_id),
             include_disabled=include_disabled,
         )
+        identity = auth_service.current_identity.get()
+        return [item for item in items if not identity or auth_service.workspace_access(item["id"], identity)]
     except (TypeError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -1175,6 +1461,7 @@ def get_workspace(
     organization_id: str = "local-org",
     user_id: str = "local-user",
 ) -> dict[str, Any]:
+    _require_workspace_access(workspace_id)
     try:
         item = workspace_service.get_workspace(
             workspace_id, _api_scope(organization_id, "default", user_id)
@@ -1193,6 +1480,7 @@ def update_workspace(
     organization_id: str = "local-org",
     user_id: str = "local-user",
 ) -> dict[str, Any]:
+    _require_workspace_access(workspace_id, manage=True)
     try:
         return workspace_service.update_workspace(
             workspace_id,
@@ -1210,12 +1498,142 @@ def update_workspace(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+
+@app.get("/api/workspaces/{workspace_id}/codex-sessions")
+def list_workspace_codex_sessions(
+    workspace_id: str,
+    organization_id: str = "local-org",
+    user_id: str = "local-user",
+) -> list[dict[str, Any]]:
+    _require_workspace_access(workspace_id)
+    paths = default_path_manager.get_paths(organization_id, user_id, workspace_id)
+    sessions_dir = paths.codex_state_dir / "sessions"
+    if not sessions_dir.exists():
+        return []
+    results = []
+    for f in sessions_dir.rglob("*.jsonl"):
+        try:
+            stat = f.stat()
+            session_id = ""
+            first_prompt = ""
+            last_reply = ""
+            turn_count = 0
+            model = ""
+            with open(f, "r", encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    if not line.strip():
+                        continue
+                    try:
+                        entry = json.loads(line)
+                        t = entry.get("type")
+                        p = entry.get("payload", {})
+                        if t == "session_meta":
+                            session_id = str(p.get("id") or "") or session_id
+                            model = str(p.get("model") or "") or model
+                        elif t == "response_item":
+                            role = p.get("role") or p.get("type")
+                            content = p.get("content") or p.get("message")
+                            if role == "user":
+                                turn_count += 1
+                                if not first_prompt:
+                                    if isinstance(content, list) and content:
+                                        first_prompt = str(content[0].get("text") or "")
+                                    else:
+                                        first_prompt = str(content)
+                            elif role == "assistant":
+                                if isinstance(content, list) and content:
+                                    last_reply = str(content[-1].get("text") or "")
+                                else:
+                                    last_reply = str(content)
+                    except Exception:
+                        continue
+            if not session_id:
+                session_id = f.stem.replace("rollout-", "")
+            clean_first = first_prompt
+            if "<environment_context>" in clean_first:
+                clean_first = clean_first.split("</environment_context>")[-1].strip()
+            results.append({
+                "session_id": session_id,
+                "file_name": f.name,
+                "created_at": datetime.fromtimestamp(stat.st_ctime, timezone.utc).isoformat(),
+                "updated_at": datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat(),
+                "turn_count": turn_count,
+                "first_prompt": clean_first[:150],
+                "last_reply": last_reply[:150],
+                "model": model,
+                "size_bytes": stat.st_size,
+            })
+        except Exception:
+            continue
+    results.sort(key=lambda x: x["updated_at"], reverse=True)
+    return results
+
+
+@app.get("/api/workspaces/{workspace_id}/codex-sessions/{session_id}")
+def get_workspace_codex_session(
+    workspace_id: str,
+    session_id: str,
+    organization_id: str = "local-org",
+    user_id: str = "local-user",
+) -> dict[str, Any]:
+    _require_workspace_access(workspace_id)
+    paths = default_path_manager.get_paths(organization_id, user_id, workspace_id)
+    sessions_dir = paths.codex_state_dir / "sessions"
+    target_file = None
+    if sessions_dir.exists():
+        for f in sessions_dir.rglob("*.jsonl"):
+            if session_id in f.name:
+                target_file = f
+                break
+    if not target_file or not target_file.exists():
+        raise HTTPException(status_code=404, detail="未找到该 Codex 会话记录")
+
+    messages = []
+    meta = {}
+    with open(target_file, "r", encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            try:
+                entry = json.loads(line)
+                t = entry.get("type")
+                p = entry.get("payload", {})
+                if t == "session_meta":
+                    meta = p
+                elif t == "response_item":
+                    role = p.get("role") or p.get("type")
+                    content = p.get("content") or p.get("message")
+                    text = ""
+                    if isinstance(content, list):
+                        parts = [str(item.get("text") or "") for item in content if isinstance(item, dict) and item.get("text")]
+                        text = "\n".join(parts)
+                    elif isinstance(content, str):
+                        text = content
+                    clean_text = text.strip()
+                    if role in ("user", "assistant") and clean_text:
+                        if clean_text.startswith("<environment_context>"):
+                            clean_text = clean_text.split("</environment_context>")[-1].strip()
+                        if clean_text:
+                            messages.append({
+                                "role": role,
+                                "content": clean_text,
+                                "timestamp": entry.get("timestamp"),
+                            })
+            except Exception:
+                continue
+    return {
+        "session_id": session_id,
+        "workspace_id": workspace_id,
+        "meta": meta,
+        "messages": messages,
+    }
+
+
 @app.delete("/api/workspaces/{workspace_id}")
 def delete_workspace(
     workspace_id: str,
     organization_id: str = "local-org",
     user_id: str = "local-user",
 ) -> dict[str, Any]:
+    _require_workspace_access(workspace_id, manage=True)
     try:
         return workspace_service.delete_workspace(
             workspace_id, _api_scope(organization_id, "default", user_id)
@@ -1283,8 +1701,12 @@ def list_expert_templates(
 
 @app.post("/api/expert-templates", status_code=201)
 def create_expert_template(payload: ExpertTemplateCreate) -> dict[str, Any]:
+    _require_shared_creation_scope(payload.visibility)
+    scope = _api_scope(payload.organization_id, payload.workspace_id, payload.owner_user_id)
+    values = payload.model_dump()
+    values.update(organization_id=scope.organization_id, owner_user_id=scope.user_id)
     try:
-        return expert_team_service.create_template(payload.model_dump())
+        return expert_team_service.create_template(values)
     except (ExpertConflictError, ExpertValidationError) as exc:
         raise _expert_http_error(exc) from exc
 
@@ -1312,6 +1734,7 @@ def update_expert_template(
     workspace_id: str = "default",
     user_id: str = "local-user",
 ) -> dict[str, Any]:
+    _require_shared_creation_scope(payload.visibility or '')
     try:
         return expert_team_service.update_template(
             template_id,
@@ -1392,8 +1815,12 @@ def list_expert_teams(
 
 @app.post("/api/expert-teams", status_code=201)
 def create_expert_team(payload: ExpertTeamCreate) -> dict[str, Any]:
+    _require_shared_creation_scope(payload.visibility)
+    scope = _api_scope(payload.organization_id, payload.workspace_id, payload.owner_user_id)
+    values = payload.model_dump()
+    values.update(organization_id=scope.organization_id, owner_user_id=scope.user_id)
     try:
-        return expert_team_service.create_team(payload.model_dump())
+        return expert_team_service.create_team(values)
     except (ExpertConflictError, ExpertValidationError) as exc:
         raise _expert_http_error(exc) from exc
 
@@ -1421,6 +1848,7 @@ def update_expert_team(
     workspace_id: str = "default",
     user_id: str = "local-user",
 ) -> dict[str, Any]:
+    _require_shared_creation_scope(payload.visibility or '')
     try:
         return expert_team_service.update_team(
             team_id,
@@ -1521,9 +1949,9 @@ async def retry_expert_team_member(
         "team_run_id": team_run_id,
         "member_run_id": member_run_id,
         "scope": {
-            "organization_id": organization_id,
-            "workspace_id": workspace_id,
-            "user_id": user_id,
+            "organization_id": scope.organization_id,
+            "workspace_id": scope.workspace_id,
+            "user_id": scope.user_id,
         },
     }
 
@@ -1552,6 +1980,7 @@ def list_memories(
 
 @app.post("/api/memories", status_code=201)
 def create_memory(payload: MemoryCreate) -> dict[str, Any]:
+    _require_shared_creation_scope(payload.scope_type)
     scope = _api_scope(
         payload.organization_id,
         payload.workspace_id,
@@ -1572,7 +2001,7 @@ def create_memory(payload: MemoryCreate) -> dict[str, Any]:
             trust_level=payload.trust_level,
             enabled=payload.enabled,
             expires_at=payload.expires_at,
-            created_by=payload.user_id,
+            created_by=_actor_id(payload.user_id),
         )
     except (TypeError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -1612,7 +2041,7 @@ def update_memory(
         return context_service.update_memory(
             memory_id,
             _api_scope(organization_id, workspace_id, user_id, agent_id, conversation_id),
-            actor_id=user_id,
+            actor_id=_actor_id(user_id),
             reason=reason,
             **changes,
         )
@@ -1635,7 +2064,7 @@ def enable_memory(
         return context_service.enable_memory(
             memory_id,
             _api_scope(organization_id, workspace_id, user_id, agent_id, conversation_id),
-            actor_id=user_id,
+            actor_id=_actor_id(user_id),
         )
     except MemoryNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -1654,7 +2083,7 @@ def disable_memory(
         return context_service.disable_memory(
             memory_id,
             _api_scope(organization_id, workspace_id, user_id, agent_id, conversation_id),
-            actor_id=user_id,
+            actor_id=_actor_id(user_id),
         )
     except MemoryNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -1673,7 +2102,7 @@ def delete_memory(
         return context_service.delete_memory(
             memory_id,
             _api_scope(organization_id, workspace_id, user_id, agent_id, conversation_id),
-            actor_id=user_id,
+            actor_id=_actor_id(user_id),
             reason="api_delete",
         )
     except MemoryNotFoundError as exc:
@@ -1726,6 +2155,7 @@ def list_knowledge_bases(
 
 @app.post("/api/knowledge-bases", status_code=201)
 def create_knowledge_base(payload: KnowledgeBaseCreate) -> dict[str, Any]:
+    _require_shared_creation_scope(payload.visibility)
     try:
         return knowledge_service.create_base(
             _api_scope(payload.organization_id, payload.workspace_id, payload.user_id),
@@ -1765,6 +2195,7 @@ def update_knowledge_base(
     workspace_id: str = "default",
     user_id: str = "local-user",
 ) -> dict[str, Any]:
+    _require_shared_creation_scope(payload.visibility)
     try:
         return knowledge_service.update_base(
             base_id,
@@ -1822,6 +2253,11 @@ def index_knowledge_upload(
     workspace_id: str = "default",
     user_id: str = "local-user",
 ) -> dict[str, Any]:
+    identity = auth_service.current_identity.get()
+    if identity and identity["role"] != "admin":
+        owner = db.query_one("SELECT user_id FROM upload_owners WHERE upload_id=?", (payload.upload_id,))
+        if not owner or owner["user_id"] != identity["user_id"]:
+            raise HTTPException(status_code=403, detail="无权使用此附件")
     upload = db.query_one("SELECT * FROM uploads WHERE id = ?", (payload.upload_id,))
     if not upload:
         raise HTTPException(status_code=404, detail="上传文件不存在")
@@ -2379,17 +2815,31 @@ def create_model(payload: ModelConfigCreate) -> dict[str, Any]:
     if payload.id == "deterministic" or db.query_one("SELECT id FROM model_configs WHERE id = ?", (payload.id,)):
         raise HTTPException(status_code=409, detail="Model config already exists")
     now = db.utc_now()
-    if payload.api_key_mode not in {"env", "direct"}:
-        raise HTTPException(status_code=400, detail="api_key_mode 必须是 env 或 direct")
-    if payload.api_key_mode == "direct" and not payload.api_key:
-        raise HTTPException(status_code=400, detail="直接密钥模式必须填写 API Key")
-    if payload.api_key_mode == "env" and not _is_env_name(payload.api_key_env):
-        raise HTTPException(status_code=400, detail="环境变量模式必须填写合法变量名，例如 OPENAI_API_KEY")
-    encrypted = secret_store.encrypt(payload.api_key) if payload.api_key_mode == "direct" and payload.api_key else ""
-    api_key_env = payload.api_key_env if payload.api_key_mode == "env" else ""
+    encrypted = ""
+    api_key_env = ""
+    base_url = payload.base_url
+
+    if payload.copy_credentials_from:
+        src = db.query_one("SELECT * FROM model_configs WHERE id = ?", (payload.copy_credentials_from,))
+        if src:
+            encrypted = src.get("api_key_ciphertext") or ""
+            api_key_env = src.get("api_key_env") or ""
+            if not base_url:
+                base_url = src.get("base_url") or ""
+
+    if not encrypted and not api_key_env:
+        if payload.api_key_mode not in {"env", "direct"}:
+            raise HTTPException(status_code=400, detail="api_key_mode 必须是 env 或 direct")
+        if payload.api_key_mode == "direct" and not payload.api_key:
+            raise HTTPException(status_code=400, detail="直接密钥模式必须填写 API Key")
+        if payload.api_key_mode == "env" and not _is_env_name(payload.api_key_env):
+            raise HTTPException(status_code=400, detail="环境变量模式必须填写合法变量名，例如 OPENAI_API_KEY")
+        encrypted = secret_store.encrypt(payload.api_key) if payload.api_key_mode == "direct" and payload.api_key else ""
+        api_key_env = payload.api_key_env if payload.api_key_mode == "env" else ""
+
     db.execute(
         "INSERT INTO model_configs(id, name, provider, model, base_url, api_key_env, api_key_ciphertext, enabled, config_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (payload.id, payload.name, payload.provider, payload.model, payload.base_url, api_key_env, encrypted, 1 if payload.enabled else 0, db.json_dumps(payload.config), now, now),
+        (payload.id, payload.name, payload.provider, payload.model, base_url, api_key_env, encrypted, 1 if payload.enabled else 0, db.json_dumps(payload.config), now, now),
     )
     return model_to_api(db.query_one("SELECT * FROM model_configs WHERE id = ?", (payload.id,)) or {})
 
@@ -2467,6 +2917,95 @@ async def test_model(model_id: str) -> dict[str, Any]:
         )
         raise HTTPException(status_code=400, detail=message) from exc
 
+
+
+
+@app.post("/api/models/discover")
+async def discover_remote_models(payload: ModelDiscoverRequest) -> dict[str, Any]:
+    base_url = payload.base_url.rstrip("/")
+    key = ""
+    if payload.api_key_mode == "direct" and payload.api_key:
+        key = payload.api_key
+    elif payload.api_key_mode == "env" and payload.api_key_env:
+        key = os.getenv(payload.api_key_env, "")
+    elif payload.api_key:
+        key = payload.api_key
+
+    if not key and payload.engine_id:
+        engine_env = resolve_runtime_env(payload.engine_id)
+        key = engine_env.get("OPENAI_API_KEY") or engine_env.get("ANTHROPIC_API_KEY") or ""
+    if not key and payload.model_id:
+        model_row = db.query_one("SELECT * FROM model_configs WHERE id = ?", (payload.model_id,))
+        if model_row:
+            if model_row.get("api_key_ciphertext"):
+                try:
+                    key = secret_store.decrypt(model_row["api_key_ciphertext"])
+                except Exception:
+                    pass
+            elif model_row.get("api_key_env"):
+                key = os.getenv(model_row["api_key_env"], "")
+
+    headers = {}
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+
+    url = f"{base_url}/models"
+    try:
+        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+            resp = await client.get(url, headers=headers)
+            if resp.status_code == 404 and not base_url.endswith("/v1"):
+                url = f"{base_url}/v1/models"
+                resp = await client.get(url, headers=headers)
+            if resp.status_code == 401:
+                raise HTTPException(status_code=400, detail="获取失败：密钥无效或未授权 (401 Unauthorized)")
+            if resp.status_code != 200:
+                raise HTTPException(status_code=400, detail=f"上游服务返回状态码 {resp.status_code}：{resp.text[:200]}")
+            data = resp.json()
+            items = data.get("data", [])
+            if isinstance(items, list):
+                models = sorted({str(m.get("id") or m) for m in items if isinstance(m, dict) and m.get("id") or isinstance(m, str)})
+            else:
+                models = []
+            if not models:
+                raise HTTPException(status_code=400, detail="上游服务返回成功但未包含任何可用模型")
+            return {"ok": True, "models": models, "count": len(models)}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"连接模型接口失败：{exc}")
+
+@app.get("/api/execution-engines")
+def list_execution_engines() -> list[dict[str, Any]]:
+    return list_engines()
+
+
+@app.get("/api/execution-engines/{engine_id}")
+def get_execution_engine(engine_id: str) -> dict[str, Any]:
+    engine = get_engine(engine_id)
+    if not engine:
+        raise HTTPException(status_code=404, detail="执行引擎不存在")
+    return engine
+
+
+@app.put("/api/execution-engines/{engine_id}")
+def update_execution_engine(engine_id: str, payload: ExecutionEngineUpdate) -> dict[str, Any]:
+    try:
+        return update_engine(engine_id, payload.model_dump(exclude_unset=True))
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ExecutionEngineError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+
+@app.post("/api/execution-engines/{engine_id}/test")
+async def test_execution_engine(engine_id: str) -> dict[str, Any]:
+    try:
+        return await test_engine_connection(engine_id)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ExecutionEngineError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 @app.post("/api/mcp/{server_id}/tools/{tool_name}/invoke")
 async def invoke_mcp_tool(server_id: str, tool_name: str, payload: ToolInvokeRequest) -> dict[str, Any]:
@@ -2546,8 +3085,12 @@ async def invoke_mcp_tool(server_id: str, tool_name: str, payload: ToolInvokeReq
 
 
 @app.get("/api/agents")
-def list_agents() -> list[dict[str, Any]]:
+def list_agents(workspace_id: str = 'default') -> list[dict[str, Any]]:
+    _require_workspace_access(workspace_id)
     rows = db.query_all("SELECT * FROM agents ORDER BY name")
+    identity = auth_service.current_identity.get()
+    if identity:
+        rows = [row for row in rows if auth_service.agent_access(row['id'], identity, workspace_id)]
     return [
         {
             **r,
@@ -2621,8 +3164,14 @@ def update_agent(agent_id: str, payload: AgentUpdate) -> dict[str, Any]:
 
 @app.get("/api/tasks")
 def list_tasks(workspace_id: str = "", organization_id: str = "", user_id: str = "") -> list[dict[str, Any]]:
+    identity = auth_service.current_identity.get()
+    if identity and identity["role"] != "admin":
+        organization_id, user_id = "local-org", identity["user_id"]
     clauses: list[str] = []
     params: list[Any] = []
+    if identity and identity["role"] != "admin":
+        clauses.append("workspace IN (SELECT w.id FROM workspaces w LEFT JOIN workspace_members m ON m.workspace_id=w.id AND m.user_id=? WHERE w.organization_id='local-org' AND (w.owner_user_id=? OR (w.enabled=1 AND m.user_id IS NOT NULL)))")
+        params.extend([identity["user_id"], identity["user_id"]])
     for column, value in (
         ("workspace", workspace_id),
         ("organization_id", organization_id),
@@ -3250,6 +3799,7 @@ def _public_event(value: dict[str, Any]) -> dict[str, Any]:
     if content is not None:
         result["content"] = content
     result["data"] = _public_event_data(event_type, raw_data)
+    result['schema_version'] = 1
     if error_code:
         result["data"]["error_code"] = error_code
     return result
@@ -3657,6 +4207,7 @@ def _public_task(
     """Return the stable public task shape and remove internal JSON/path fields."""
     internal_fields = {"result_json", "artifacts_json", "attachments_json"}
     result = {key: item for key, item in value.items() if key not in internal_fields}
+    result['schema_version'] = 1
     if include_result:
         stored_result = db.json_loads(value.get("result_json"), {})
         if str(value.get("status") or "") == "failed":
@@ -3684,10 +4235,14 @@ def _public_task(
     return result
 
 
-def _task_or_404(task_id: str) -> dict[str, Any]:
+def _task_or_404(task_id: str, *, write: bool = False) -> dict[str, Any]:
     task = db.query_one("SELECT * FROM tasks WHERE id = ?", (task_id,))
     if not task:
         raise HTTPException(status_code=404, detail="任务不存在")
+    identity = auth_service.current_identity.get()
+    if identity and identity["role"] != "admin" and (task.get("user_id") != identity["user_id"] or task.get("organization_id") != "local-org"):
+        raise HTTPException(status_code=403, detail="无权访问此任务")
+    _require_workspace_access(task.get("workspace") or "default", write=write)
     return task
 
 
@@ -3820,11 +4375,11 @@ def _complete_control_command(
 
 
 async def _retry_task(task_id: str) -> dict[str, Any]:
-    task = _task_or_404(task_id)
+    task = _task_or_404(task_id, write=True)
     _ensure_no_active_run(task_id)
     if task.get("status") not in {"failed", "cancelled", "completed"}:
         raise HTTPException(status_code=409, detail="只有已结束的任务才能重试")
-    run = task_state.create_run(task_id, metadata={"trigger": "retry"})
+    run = task_state.create_run(task_id, metadata={"trigger": "retry", "dispatch_backend": "redis" if task_queue.enabled() else "local"})
     command = _complete_control_command(
         task_id,
         "retry",
@@ -3858,7 +4413,7 @@ async def _resume_task_from_checkpoint(
     *,
     trigger: str,
 ) -> dict[str, Any]:
-    _task_or_404(task_id)
+    _task_or_404(task_id, write=True)
     _ensure_no_active_run(task_id)
     checkpoint = (
         task_state.get_checkpoint(checkpoint_id, include_state=False)
@@ -3876,7 +4431,7 @@ async def _resume_task_from_checkpoint(
     run = task_state.create_run(
         task_id,
         resumed_from_checkpoint_id=checkpoint["id"],
-        metadata={"trigger": trigger, "checkpoint_restore_audited": True},
+        metadata={"trigger": trigger, "checkpoint_restore_audited": True, "dispatch_backend": "redis" if task_queue.enabled() else "local"},
     )
     command = _complete_control_command(
         task_id,
@@ -3915,7 +4470,7 @@ def get_task_runtime(task_id: str) -> dict[str, Any]:
 
 @app.post("/api/tasks/{task_id}/commands", status_code=202)
 async def send_task_command(task_id: str, payload: TaskCommandRequest) -> dict[str, Any]:
-    _task_or_404(task_id)
+    _task_or_404(task_id, write=True)
     command_type = payload.type.strip().lower()
     if command_type not in {"message", "cancel", "retry", "resume", "restore_checkpoint"}:
         raise HTTPException(status_code=400, detail=f"不支持的任务指令：{command_type}")
@@ -3936,6 +4491,7 @@ async def send_task_command(task_id: str, payload: TaskCommandRequest) -> dict[s
                 reason=str(payload.payload.get("reason") or "用户请求取消"),
                 requested_by="user",
             )
+            await task_queue.request_cancel(str(active["id"]))
         except RunIntakeClosed as exc:
             raise HTTPException(
                 status_code=409,
@@ -3988,6 +4544,7 @@ async def send_task_command(task_id: str, payload: TaskCommandRequest) -> dict[s
 
 @app.post("/api/tasks/{task_id}/cancel", status_code=202)
 async def cancel_task(task_id: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    _task_or_404(task_id, write=True)
     active = _active_run_or_409(task_id)
     values = payload or {}
     try:
@@ -3997,6 +4554,7 @@ async def cancel_task(task_id: str, payload: dict[str, Any] | None = None) -> di
             reason=str(values.get("reason") or "用户请求取消"),
             requested_by="user",
         )
+        await task_queue.request_cancel(active['id'])
     except RunIntakeClosed as exc:
         raise HTTPException(
             status_code=409,
@@ -4048,7 +4606,10 @@ async def restore_task_checkpoint(
     )
 
 
-def _validate_loop_bindings(agent_id: str, model_id: str) -> None:
+def _validate_loop_bindings(agent_id: str, model_id: str, workspace_id: str = 'default') -> None:
+    identity = auth_service.current_identity.get()
+    if identity and not auth_service.agent_access(agent_id, identity, workspace_id):
+        raise HTTPException(status_code=403, detail='无权使用所选智能体')
     if not db.query_one("SELECT id FROM agents WHERE id = ?", (agent_id,)):
         raise HTTPException(status_code=400, detail="所选智能体不存在")
     _ensure_model_ready(model_id, label="所选模型")
@@ -4072,19 +4633,22 @@ def list_loops(
     workspace_id: str = "default",
     user_id: str = "local-user",
 ) -> list[dict[str, Any]]:
+    scope = _api_scope(organization_id, workspace_id, user_id)
     return [
         serialize_loop(row)
         for row in db.query_all(
             """SELECT * FROM loops WHERE organization_id = ? AND workspace_id = ? AND user_id = ?
                ORDER BY created_at DESC""",
-            (organization_id, workspace_id, user_id),
+            (scope.organization_id, scope.workspace_id, scope.user_id),
         )
     ]
 
 
 @app.post("/api/loops")
 def create_loop(payload: LoopCreate) -> dict[str, Any]:
-    _validate_loop_bindings(payload.agent_id, payload.model_id)
+    scope = _api_scope(payload.organization_id, payload.workspace_id, payload.user_id)
+    payload = payload.model_copy(update={"organization_id": scope.organization_id, "user_id": scope.user_id})
+    _validate_loop_bindings(payload.agent_id, payload.model_id, payload.workspace_id)
     loop_id = (payload.id or ("loop_" + uuid.uuid4().hex[:12])).strip()
     if not re.fullmatch(r"[A-Za-z0-9_-]{2,80}", loop_id):
         raise HTTPException(status_code=400, detail="Loop ID 只能包含字母、数字、下划线和连字符")
@@ -4121,9 +4685,24 @@ def create_loop(payload: LoopCreate) -> dict[str, Any]:
     return serialize_loop(db.query_one("SELECT * FROM loops WHERE id = ?", (loop_id,)) or {})
 
 
+def _require_owned_resource(row: dict[str, Any]) -> None:
+    identity = auth_service.current_identity.get()
+    if identity and identity["role"] != "admin" and (row.get("user_id") != identity["user_id"] or row.get("organization_id") != "local-org"):
+        raise HTTPException(status_code=403, detail="无权访问此资源")
+    _require_workspace_access(row.get("workspace_id") or "default", write=bool(identity and identity.get("request_method") not in {"GET", "HEAD", "OPTIONS"}))
+
+
+def _loop_or_404(loop_id: str) -> dict[str, Any]:
+    row = db.query_one("SELECT * FROM loops WHERE id=?", (loop_id,))
+    if not row:
+        raise HTTPException(status_code=404, detail="Loop not found")
+    _require_owned_resource(row)
+    return row
+
+
 @app.get("/api/loops/{loop_id}")
 def get_loop(loop_id: str) -> dict[str, Any]:
-    row = db.query_one("SELECT * FROM loops WHERE id = ?", (loop_id,))
+    row = _loop_or_404(loop_id)
     if not row:
         raise HTTPException(status_code=404, detail="Loop not found")
     result = serialize_loop(row)
@@ -4139,14 +4718,14 @@ def get_loop(loop_id: str) -> dict[str, Any]:
 
 @app.put("/api/loops/{loop_id}")
 def update_loop(loop_id: str, payload: LoopUpdate) -> dict[str, Any]:
-    current = db.query_one("SELECT * FROM loops WHERE id = ?", (loop_id,))
+    current = _loop_or_404(loop_id)
     if not current:
         raise HTTPException(status_code=404, detail="Loop not found")
     incoming = payload.model_dump(exclude_unset=True)
     webhook_secret = incoming.pop("webhook_secret", None)
     state = incoming.pop("state", None)
     merged = {**current, **incoming}
-    _validate_loop_bindings(merged["agent_id"], merged["model_id"])
+    _validate_loop_bindings(merged["agent_id"], merged["model_id"], merged.get('workspace_id') or 'default')
     encrypted_secret = str(current.get("webhook_secret_ciphertext") or "")
     if webhook_secret is not None:
         encrypted_secret = secret_store.encrypt(webhook_secret)
@@ -4178,7 +4757,7 @@ def update_loop(loop_id: str, payload: LoopUpdate) -> dict[str, Any]:
 
 @app.delete("/api/loops/{loop_id}")
 def delete_loop(loop_id: str) -> dict[str, bool]:
-    current = db.query_one("SELECT status FROM loops WHERE id = ?", (loop_id,))
+    current = _loop_or_404(loop_id)
     if not current:
         raise HTTPException(status_code=404, detail="Loop not found")
     if current["status"] == "running":
@@ -4191,7 +4770,7 @@ def delete_loop(loop_id: str) -> dict[str, bool]:
 
 @app.post("/api/loops/{loop_id}/start")
 def start_loop(loop_id: str) -> dict[str, Any]:
-    current = db.query_one("SELECT * FROM loops WHERE id = ?", (loop_id,))
+    current = _loop_or_404(loop_id)
     if not current:
         raise HTTPException(status_code=404, detail="Loop not found")
     if current["status"] == "running":
@@ -4215,6 +4794,7 @@ def start_loop(loop_id: str) -> dict[str, Any]:
 
 @app.post("/api/loops/{loop_id}/pause")
 def pause_loop(loop_id: str) -> dict[str, Any]:
+    _loop_or_404(loop_id)
     if not db.query_one("SELECT id FROM loops WHERE id = ?", (loop_id,)):
         raise HTTPException(status_code=404, detail="Loop not found")
     db.execute("UPDATE loops SET status = 'paused', next_run_at = '', updated_at = ? WHERE id = ?", (db.utc_now(), loop_id))
@@ -4223,6 +4803,7 @@ def pause_loop(loop_id: str) -> dict[str, Any]:
 
 @app.post("/api/loops/{loop_id}/run", status_code=202)
 async def run_loop_now(loop_id: str) -> dict[str, Any]:
+    _loop_or_404(loop_id)
     if not db.query_one("SELECT id FROM loops WHERE id = ?", (loop_id,)):
         raise HTTPException(status_code=404, detail="Loop not found")
     try:
@@ -4236,6 +4817,7 @@ async def run_loop_now(loop_id: str) -> dict[str, Any]:
 
 @app.get("/api/loops/{loop_id}/runs")
 def list_loop_runs(loop_id: str) -> list[dict[str, Any]]:
+    _loop_or_404(loop_id)
     if not db.query_one("SELECT id FROM loops WHERE id = ?", (loop_id,)):
         raise HTTPException(status_code=404, detail="Loop not found")
     return [
@@ -4249,6 +4831,7 @@ def list_loop_runs(loop_id: str) -> list[dict[str, Any]]:
 
 @app.get("/api/loops/{loop_id}/trigger-events")
 def list_loop_trigger_events(loop_id: str) -> list[dict[str, Any]]:
+    _loop_or_404(loop_id)
     if not db.query_one("SELECT id FROM loops WHERE id = ?", (loop_id,)):
         raise HTTPException(status_code=404, detail="Loop not found")
     return [
@@ -4275,7 +4858,7 @@ def _webhook_timestamp(value: str) -> float:
 
 @app.post("/api/loops/{loop_id}/webhook", status_code=202)
 async def trigger_loop_webhook(loop_id: str, request: Request) -> dict[str, Any]:
-    loop = db.query_one("SELECT * FROM loops WHERE id = ?", (loop_id,))
+    loop = _loop_or_404(loop_id)
     if not loop:
         raise HTTPException(status_code=404, detail="Loop not found")
     if (loop.get("trigger_type") or "interval") != "webhook":
@@ -4308,6 +4891,11 @@ async def trigger_loop_webhook(loop_id: str, request: Request) -> dict[str, Any]
     supplied = provided_signature.removeprefix("sha256=").strip().lower()
     if not hmac.compare_digest(expected, supplied):
         raise HTTPException(status_code=401, detail="Webhook 签名验证失败")
+    if auth_service.enabled():
+        owner = db.query_one('SELECT id AS user_id,role FROM users WHERE id=? AND enabled=1', (loop['user_id'],))
+        if not owner or loop['organization_id'] != 'local-org' or auth_service.workspace_access(loop['workspace_id'], owner) not in {'owner', 'member'}:
+            raise HTTPException(status_code=403, detail='自动化所属用户已失去执行权限')
+        request.state.audit_user_id = owner['user_id']
     try:
         event, duplicate = create_webhook_event(loop, idempotency_key, raw_body)
     except IdempotencyConflictError as exc:
@@ -4334,12 +4922,13 @@ def list_notifications(
     status: str = "",
     limit: int = 100,
 ) -> list[dict[str, Any]]:
+    scope = _api_scope(organization_id, workspace_id, user_id)
     if status and status not in {"unread", "read"}:
         raise HTTPException(status_code=400, detail="通知状态只能是 unread 或 read")
     capped_limit = max(1, min(int(limit), 500))
     sql = """SELECT * FROM notifications
              WHERE organization_id = ? AND workspace_id = ? AND user_id = ?"""
-    params: list[Any] = [organization_id, workspace_id, user_id]
+    params: list[Any] = [scope.organization_id, scope.workspace_id, scope.user_id]
     if status:
         sql += " AND status = ?"
         params.append(status)
@@ -4353,6 +4942,7 @@ def read_notification(notification_id: str) -> dict[str, Any]:
     current = db.query_one("SELECT * FROM notifications WHERE id = ?", (notification_id,))
     if not current:
         raise HTTPException(status_code=404, detail="Notification not found")
+    _require_owned_resource(current)
     now = db.utc_now()
     db.execute(
         "UPDATE notifications SET status = 'read', read_at = ? WHERE id = ?",
@@ -4364,12 +4954,33 @@ def read_notification(notification_id: str) -> dict[str, Any]:
 
 
 @app.post("/api/tasks")
-async def create_task(payload: TaskCreate) -> dict[str, Any]:
+async def create_task(payload: TaskCreate, request: Request = None) -> dict[str, Any]:
+    _require_workspace_access(payload.workspace, write=True)
+    identity = auth_service.current_identity.get()
+    if identity:
+        payload = payload.model_copy(update={"user_id": identity["user_id"], "organization_id": "local-org"})
+        if payload.parent_task_id:
+            _task_or_404(payload.parent_task_id)
+    submission_key = request.headers.get('idempotency-key', '') if request is not None else ''
+    if len(submission_key) > 200:
+        raise HTTPException(status_code=400, detail='Idempotency-Key 不能超过 200 字符')
+    key_hash = hashlib.sha256(submission_key.encode()).hexdigest() if submission_key else ''
+    payload_hash = hashlib.sha256(payload.model_dump_json().encode()).hexdigest()
     attachments = []
-    for upload_id in payload.attachment_ids[:10]:
+    total_attachment_bytes = 0
+    max_attachment_bytes = int(os.getenv('APP_MAX_TASK_ATTACHMENTS_MB', '40')) * 1024 * 1024
+    for upload_id in payload.attachment_ids:
         upload = db.query_one("SELECT * FROM uploads WHERE id = ?", (upload_id,))
-        if upload:
-            attachments.append(upload)
+        if identity and identity["role"] != "admin":
+            owner = db.query_one("SELECT user_id FROM upload_owners WHERE upload_id=?", (upload_id,))
+            if not owner or owner["user_id"] != identity["user_id"]:
+                raise HTTPException(status_code=403, detail="无权使用此附件")
+        if not upload:
+            raise HTTPException(status_code=404, detail='附件不存在，请重新上传')
+        total_attachment_bytes += int(upload.get('size') or 0)
+        if total_attachment_bytes > max_attachment_bytes:
+            raise HTTPException(status_code=413, detail='本次任务的附件总大小超过限制')
+        attachments.append(upload)
     if payload.executor_type == "agent" and not db.query_one(
         "SELECT id FROM agents WHERE id = ?", (payload.agent_id,)
     ):
@@ -4399,6 +5010,8 @@ async def create_task(payload: TaskCreate) -> dict[str, Any]:
             recommendation=recommendation,
         )
     selected_agent = db.query_one("SELECT * FROM agents WHERE id = ?", (selected_agent_id,))
+    if identity and not auth_service.agent_access(selected_agent_id, identity, payload.workspace):
+        raise HTTPException(status_code=403, detail='无权使用所选智能体')
     fallback_model_id = str((selected_agent or {}).get("model") or "")
     _ensure_model_ready(payload.model_id or fallback_model_id or "deterministic", label="所选模型")
     if payload.executor_type == "team":
@@ -4411,10 +5024,13 @@ async def create_task(payload: TaskCreate) -> dict[str, Any]:
                 conversation_id=payload.conversation_id,
                 attachments=attachments,
                 parent_task_id=payload.parent_task_id or "",
+                submission_key=key_hash,
+                submission_hash=payload_hash,
             )
         except (ExpertNotFoundError, ExpertConflictError, ExpertValidationError) as exc:
             raise _expert_http_error(exc) from exc
-        if expert_selection:
+        reused_submission = task.pop('_submission_reused', False)
+        if expert_selection and not reused_submission:
             emit(
                 task["id"],
                 "expert_selection",
@@ -4427,7 +5043,8 @@ async def create_task(payload: TaskCreate) -> dict[str, Any]:
                 + f"由 {len(expert_selection['members'])} 位专家并行分析，再由主管汇总。",
                 expert_selection,
             )
-        _schedule_team_run(team_run["id"])
+        if not reused_submission:
+            _schedule_team_run(team_run["id"])
         return {
             **_public_task(task),
             "result": {},
@@ -4436,32 +5053,50 @@ async def create_task(payload: TaskCreate) -> dict[str, Any]:
             "team_run": _public_runtime_record(team_run),
             "expert_selection": expert_selection,
         }
-    task = create_task_record(
-        payload.message,
-        selected_agent_id,
-        payload.workspace,
-        attachments=attachments,
-        model_id=payload.model_id,
-        conversation_id=payload.conversation_id,
-        organization_id=payload.organization_id,
-        user_id=payload.user_id,
-        parent_task_id=payload.parent_task_id or "",
-        executor_type=payload.executor_type,
-        executor_id=executor_id,
-    )
-    run = task_state.create_run(
-        task["id"],
-        metadata={
-            "trigger": "user",
-            "agent_id": selected_agent_id,
-            "workspace": payload.workspace,
-            "organization_id": payload.organization_id,
-            "user_id": payload.user_id,
-            "executor_type": payload.executor_type,
-            "executor_id": executor_id,
-        },
-    )
-    _schedule_runtime(task["id"], run["id"])
+    duplicate = False
+    with task_state.transaction(write=True) as conn:
+        previous = conn.execute('SELECT * FROM task_submissions WHERE organization_id=? AND user_id=? AND key_hash=?', (payload.organization_id,payload.user_id,key_hash)).fetchone() if key_hash else None
+        if previous:
+            if previous['payload_hash'] != payload_hash:
+                raise HTTPException(status_code=409, detail='相同 Idempotency-Key 已用于不同任务内容')
+            task = dict(conn.execute('SELECT * FROM tasks WHERE id=?', (previous['task_id'],)).fetchone())
+            run = task_state._serialize_run(dict(conn.execute('SELECT * FROM task_runs WHERE id=?', (previous['run_id'],)).fetchone()))
+            duplicate = True
+        else:
+            task = create_task_record(
+                payload.message,
+                selected_agent_id,
+                payload.workspace,
+                connection=conn,
+                attachments=attachments,
+                model_id=payload.model_id,
+                conversation_id=payload.conversation_id,
+                organization_id=payload.organization_id,
+                user_id=payload.user_id,
+                parent_task_id=payload.parent_task_id or "",
+                executor_type=payload.executor_type,
+                executor_id=executor_id,
+                execution_engine=payload.execution_engine,
+            )
+            run = task_state.create_run_in_transaction(
+                conn,
+                task["id"],
+                metadata={
+                    "trigger": "user",
+                    "dispatch_backend": "redis" if task_queue.enabled() else "local",
+                    "agent_id": selected_agent_id,
+                    "workspace": payload.workspace,
+                    "organization_id": payload.organization_id,
+                    "user_id": payload.user_id,
+                    "executor_type": payload.executor_type,
+                    "executor_id": executor_id,
+                    "execution_engine": payload.execution_engine,
+                },
+            )
+            if key_hash:
+                conn.execute('INSERT INTO task_submissions(organization_id,user_id,key_hash,payload_hash,task_id,run_id) VALUES(?,?,?,?,?,?)', (payload.organization_id,payload.user_id,key_hash,payload_hash,task['id'],run['id']))
+    if not duplicate:
+        _schedule_runtime(task["id"], run["id"])
     return {
         **_public_task(task),
         "result": {},
@@ -4472,9 +5107,7 @@ async def create_task(payload: TaskCreate) -> dict[str, Any]:
 
 @app.get("/api/tasks/{task_id}")
 def get_task(task_id: str) -> dict[str, Any]:
-    task = db.query_one("SELECT * FROM tasks WHERE id = ?", (task_id,))
-    if not task:
-        raise HTTPException(status_code=404, detail="Task not found")
+    task = _task_or_404(task_id)
     events = db.query_all("SELECT * FROM task_events WHERE task_id = ? AND type != 'answer_delta' ORDER BY id", (task_id,))
     return {
         **_public_task(task),
@@ -4485,10 +5118,14 @@ def get_task(task_id: str) -> dict[str, Any]:
 
 @app.get("/api/conversations/{conversation_id}/messages")
 def get_conversation_messages(conversation_id: str) -> dict[str, Any]:
+    identity = auth_service.current_identity.get()
+    owner_clause = " AND user_id=? AND organization_id='local-org'" if identity and identity["role"] != "admin" else ""
     rows = db.query_all(
-        "SELECT * FROM tasks WHERE conversation_id = ? ORDER BY created_at, id LIMIT 100",
-        (conversation_id,),
+        f"SELECT * FROM tasks WHERE conversation_id = ?{owner_clause} ORDER BY created_at, id LIMIT 100",
+        (conversation_id, identity["user_id"]) if owner_clause else (conversation_id,),
     )
+    if identity:
+        rows = [row for row in rows if auth_service.workspace_access(row.get("workspace") or "default", identity)]
     messages: list[dict[str, Any]] = []
     for task in rows:
         messages.append({"role": "user", "content": task["message"], "task_id": task["id"]})
@@ -4534,6 +5171,9 @@ async def upload_file(file: UploadFile = File(...)) -> dict[str, Any]:
     path.write_bytes(raw)
     record = {"id": upload_id, "name": original, "content_type": file.content_type or "application/octet-stream", "size": len(raw), "path": str(path), "created_at": db.utc_now()}
     db.execute("INSERT INTO uploads(id, name, content_type, size, path, created_at) VALUES (?, ?, ?, ?, ?, ?)", tuple(record.values()))
+    identity = auth_service.current_identity.get()
+    if identity:
+        db.execute("INSERT INTO upload_owners(upload_id,user_id) VALUES(?,?)", (upload_id, identity["user_id"]))
     return _public_attachment(record)
 
 
@@ -4557,35 +5197,43 @@ async def stream_task_events(
     initial_cursor = _task_event_cursor(request, cursor=cursor, after_id=after_id)
 
     async def event_generator():
-        last_id = initial_cursor
-        idle_rounds = 0
-        while True:
-            if await request.is_disconnected():
-                break
-            events = db.query_all("SELECT * FROM task_events WHERE task_id = ? AND id > ? ORDER BY id", (task_id, last_id))
-            for event in events:
-                last_id = int(event["id"])
-                if not _is_public_task_event(event):
-                    continue
-                payload = _public_event(event)
-                yield f"id: {last_id}\nevent: task_event\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
-            task = db.query_one("SELECT status FROM tasks WHERE id = ?", (task_id,))
-            status = str((task or {}).get("status") or "")
-            should_close = status in _TASK_STREAM_TERMINAL_STATUSES or status == "waiting_approval"
-            if should_close and not events:
-                idle_rounds += 1
-                if idle_rounds > 1:
-                    payload = {
-                        "task_id": task_id,
-                        "status": status,
-                        "terminal": status in _TASK_STREAM_TERMINAL_STATUSES,
-                        "cursor": last_id,
-                    }
-                    yield f"event: task_status\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+        async with event_notifications.notification_waiter(task_id) as wait_for_event:
+            last_id = initial_cursor
+            idle_rounds = 0
+            while True:
+                if await request.is_disconnected():
                     break
-            else:
-                idle_rounds = 0
-            await asyncio.sleep(0.1)
+                if auth_service.enabled():
+                    if not auth_service.get_session(request.cookies.get(auth_service.SESSION_COOKIE)):
+                        return
+                    try:
+                        _task_or_404(task_id)
+                    except HTTPException:
+                        return
+                events = db.query_all("SELECT * FROM task_events WHERE task_id = ? AND id > ? ORDER BY id", (task_id, last_id))
+                for event in events:
+                    last_id = int(event["id"])
+                    if not _is_public_task_event(event):
+                        continue
+                    payload = _public_event(event)
+                    yield f"id: {last_id}\nevent: task_event\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+                task = db.query_one("SELECT status FROM tasks WHERE id = ?", (task_id,))
+                status = str((task or {}).get("status") or "")
+                should_close = status in _TASK_STREAM_TERMINAL_STATUSES or status == "waiting_approval"
+                if should_close and not events:
+                    idle_rounds += 1
+                    if idle_rounds > 1:
+                        payload = {
+                            "task_id": task_id,
+                            "status": status,
+                            "terminal": status in _TASK_STREAM_TERMINAL_STATUSES,
+                            "cursor": last_id,
+                        }
+                        yield f"event: task_status\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+                        break
+                else:
+                    idle_rounds = 0
+                await wait_for_event()
     return StreamingResponse(
         event_generator(),
         media_type="text/event-stream",
@@ -4712,6 +5360,11 @@ def _schedule_approval_continuation(
     payload: ApprovalRequest,
     command_id: str,
 ) -> None:
+    command = task_state.get_command(command_id)
+    run = task_state.get_run(command["run_id"]) if command and command.get("run_id") else None
+    if run and (run.get("metadata") or {}).get("dispatch_backend") == "redis":
+        db.execute("INSERT OR IGNORE INTO approval_dispatch(command_id,task_id,run_id,created_at) VALUES(?,?,?,?)", (command_id, task_id, run["id"], db.utc_now()))
+        return
     background = asyncio.create_task(
         _resume_after_approval_safely(
             task_id,
@@ -4726,7 +5379,7 @@ def _schedule_approval_continuation(
 
 @app.post("/api/tasks/{task_id}/approve")
 async def approve_task(task_id: str, payload: ApprovalRequest) -> dict[str, Any]:
-    task = _task_or_404(task_id)
+    task = _task_or_404(task_id, write=True)
     if task.get("status") != "waiting_approval":
         previous = _latest_approval_command(task_id)
         if previous and previous.get("status") == "completed":
@@ -4892,6 +5545,8 @@ def _artifact_or_404(artifact_id: str) -> dict[str, Any]:
     artifact = db.query_one("SELECT * FROM artifacts WHERE id = ?", (artifact_id,))
     if not artifact:
         raise HTTPException(status_code=404, detail="Artifact not found")
+    if auth_service.current_identity.get():
+        _task_or_404(artifact["task_id"])
     if str(artifact.get("delivery_status") or "") != "published":
         raise HTTPException(
             status_code=409,
@@ -4911,6 +5566,10 @@ def list_artifacts(
     limit = max(1, min(int(limit), 1000))
     clauses: list[str] = ["delivery_status = 'published'"]
     params: list[Any] = []
+    identity = auth_service.current_identity.get()
+    if identity and identity["role"] != "admin":
+        clauses.append("task_id IN (SELECT t.id FROM tasks t JOIN workspaces w ON w.id=t.workspace LEFT JOIN workspace_members m ON m.workspace_id=w.id AND m.user_id=? WHERE t.user_id=? AND t.organization_id='local-org' AND w.organization_id='local-org' AND (w.owner_user_id=? OR (w.enabled=1 AND m.user_id IS NOT NULL)))")
+        params.extend([identity["user_id"]] * 3)
     for column, value in (
         ("task_id", task_id),
         ("run_id", run_id),

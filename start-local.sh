@@ -17,7 +17,7 @@ AGENTNEXUS_HOST=${AGENTNEXUS_HOST:-127.0.0.1}
 AGENTNEXUS_PORT=${AGENTNEXUS_PORT:-8000}
 
 if [ -f "$AGENTNEXUS_ENV_FILE" ]; then
-  echo "使用本机配置 $AGENTNEXUS_ENV_FILE 启动 AgentNexus"
+  echo "使用本机配置 $AGENTNEXUS_ENV_FILE 启动 AgentWeave"
   exec .venv/bin/uvicorn app.main:app \
     --env-file "$AGENTNEXUS_ENV_FILE" \
     --host "$AGENTNEXUS_HOST" \

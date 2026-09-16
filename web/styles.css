@@ -100,6 +100,35 @@ button { border: 0; cursor: pointer; }
 .workspace-switcher > div { display: grid; grid-template-columns: minmax(0, 1fr) 32px; gap: 7px; align-items: center; }
 .workspace-switcher select { width: 100%; min-width: 0; height: 32px; padding: 0 8px; color: #eef0f7; background: #202231; border-color: rgba(255,255,255,.08); font-size: 10px; }
 .workspace-switcher .icon-button { width: 32px; height: 32px; color: #b7bdcc; background: rgba(255,255,255,.06); border-color: rgba(255,255,255,.08); }
+.workspace-list-toolbar { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; align-items: center; margin: 0 0 10px; }
+.workspace-list-toolbar input[type="search"] { min-width: 0; height: 34px; padding: 0 10px; }
+.workspace-show-disabled { margin: 0; white-space: nowrap; font-size: 11px; }
+.workspace-list { max-height: calc(100vh - 230px); overflow-y: auto; padding: 4px; overscroll-behavior: contain; }
+.workspace-editor { display: flex; flex-direction: column; gap: 12px; padding: 18px; }
+.workspace-editor .editor-header { margin-bottom: 0; padding-bottom: 11px; border-bottom: 1px solid var(--border); }
+.workspace-basic-fields { gap: 8px; }
+.workspace-basic-fields label, .workspace-detail-section label { gap: 4px; }
+.workspace-detail-section { padding: 10px 11px; background: #fafbfe; border: 1px solid #e7e9f0; border-radius: 10px; }
+.workspace-detail-section h3 { margin-bottom: 7px; font-size: 11px; }
+.workspace-detail-section textarea { width: 100%; min-height: 58px; }
+.workspace-description-section { background: #fff; }
+.workspace-enabled { margin: -2px 0 0; }
+.workspace-editor #workspaceMembersPanel { margin-top: 1px; padding-top: 12px; border-top: 1px solid var(--border); }
+.workspace-section-heading { display: flex; align-items: center; justify-content: space-between; margin-bottom: 7px; }
+.workspace-section-heading span { color: var(--muted-2); font-size: 9px; }
+.workspace-editor #workspaceMembersPanel > p { margin: 0 0 9px; font-size: 10px; }
+.main:has(#tab-agents.active) { height: 100vh; overflow: hidden; }
+.main:has(#tab-agents.active) .topbar { flex: 0 0 auto; margin-bottom: 14px; }
+.main:has(#tab-agents.active) #tab-agents.active { height: calc(100vh - 86px); display: flex; flex-direction: column; }
+.main:has(#tab-agents.active) .agent-admin-layout { flex: 1 1 auto; min-height: 0; align-items: stretch; }
+.agent-list-column { min-height: 0; display: flex; flex-direction: column; }
+.agent-list { flex: 1 1 auto; min-height: 0; max-height: none; overflow-y: auto; padding: 4px; overscroll-behavior: contain; }
+.agent-editor { min-height: 0; max-height: 100%; overflow-y: auto; }
+.agent-editor .editor-header { margin-bottom: 0; padding-bottom: 11px; border-bottom: 1px solid var(--border); }
+.agent-basic-fields, .agent-capability-fields { gap: 8px; }
+.agent-detail-section { padding: 10px 11px; background: #fafbfe; border: 1px solid #e7e9f0; border-radius: 10px; }
+.agent-detail-section h3 { margin-bottom: 7px; font-size: 11px; }
+.agent-detail-section textarea { width: 100%; min-height: 72px; }
 nav { display: flex; flex-direction: column; gap: 5px; }
 .sidebar-nav { flex: 1 1 auto; min-height: 0; margin: 0 -6px; padding: 0 6px 8px; overflow-x: hidden; overflow-y: auto; scrollbar-width: thin; scrollbar-color: rgba(255,255,255,.18) transparent; }
 .sidebar-nav::-webkit-scrollbar { width: 5px; }
@@ -133,6 +162,29 @@ nav { display: flex; flex-direction: column; gap: 5px; }
 .sidebar.collapsed .sidebar-toggle svg { transform: rotate(180deg); }
 
 .main { flex: 1; min-width: 0; padding: 38px 42px 48px; overflow: auto; }
+/* 项目页使用视口内的双栏滚动，避免浏览器整体出现第二条纵向滚动条。 */
+.main:has(#tab-workspaces.active) { height: 100vh; overflow: hidden; }
+.main:has(#tab-workspaces.active) .topbar { flex: 0 0 auto; margin-bottom: 14px; }
+.main:has(#tab-workspaces.active) #tab-workspaces.active { height: calc(100vh - 86px); display: flex; flex-direction: column; }
+.main:has(#tab-workspaces.active) .workspace-admin-layout { flex: 1 1 auto; min-height: 0; align-items: stretch; }
+.main:has(#tab-workspaces.active) .workspace-admin-layout > :first-child { min-height: 0; display: flex; flex-direction: column; }
+.main:has(#tab-workspaces.active) .workspace-list { flex: 1 1 auto; min-height: 0; max-height: none; overflow-y: auto; }
+.main:has(#tab-workspaces.active) .workspace-editor { min-height: 0; max-height: 100%; overflow-y: auto; }
+/* 技能中心沿用项目页的管理布局：列表与编辑器各自滚动，操作栏保持可见。 */
+.main:has(#tab-skills.active) { height: 100vh; overflow: hidden; }
+.main:has(#tab-skills.active) .topbar { flex: 0 0 auto; margin-bottom: 14px; }
+.main:has(#tab-skills.active) #tab-skills.active { height: calc(100vh - 86px); display: flex; flex-direction: column; }
+.main:has(#tab-skills.active) #tab-skills.active > .download-bar { flex: 0 0 auto; }
+.main:has(#tab-skills.active) .skill-admin-layout { flex: 1 1 auto; min-height: 0; align-items: stretch; }
+.skill-list-column { min-height: 0; display: flex; flex-direction: column; }
+.skill-admin-layout .section-heading { margin-top: 0; }
+.skill-list-toolbar { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; align-items: center; margin: 0 0 10px; }
+.skill-list-toolbar input[type="search"] { min-width: 0; height: 34px; padding: 0 10px; }
+.skill-show-disabled { margin: 0; white-space: nowrap; font-size: 11px; }
+.skill-list { flex: 1 1 auto; min-height: 0; max-height: none; overflow-y: auto; padding: 4px; overscroll-behavior: contain; }
+.skill-card.disabled { opacity: .58; }
+.skill-editor { min-height: 0; max-height: 100%; overflow-y: auto; display: flex; flex-direction: column; gap: 12px; }
+.skill-editor .editor-header { margin-bottom: 0; padding-bottom: 11px; border-bottom: 1px solid var(--border); }
 .connection-banner { max-width: 1440px; margin: 0 auto 18px; padding: 12px 14px; display: flex; align-items: center; justify-content: space-between; gap: 16px; color: #72500d; background: #fff8e8; border: 1px solid #f0dfb9; border-radius: 11px; font-size: 12px; }
 .connection-banner strong { margin-right: 9px; }
 .connection-banner span { color: #8b7040; }
@@ -1506,4 +1558,52 @@ label input, label textarea, label select { margin-top: 6px; font-weight: 430; }
   .automation-diff-row strong { grid-column: 2; }
   .automation-event-item > div:first-child, .automation-notice > div:first-child { flex-wrap: wrap; }
   .automation-event-item time, .automation-notice time { width: 100%; padding-left: 12px; }
+}
+/* 完成会话检查前不展示上次会话的业务内容。 */
+body.auth-pending #app { display: none; }
+.login-panel { min-height: 100vh; display: grid; place-items: center; padding: 24px; }
+.login-card { width: min(100%, 380px); display: grid; gap: 16px; }
+.login-card label { display: grid; gap: 8px; }
+.login-card input { width: 100%; }
+#loginError { color: #b42318; min-height: 1.5em; }
+.account-panel { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 4px; flex-shrink: 0; }
+#accountName { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+#logoutButton { white-space: nowrap; flex-shrink: 0; padding: 6px 8px; }
+.sidebar.collapsed #accountName { display: none; }
+@media (max-width: 900px) { #accountName { display: none; } }
+.user-admin-layout { display: grid; grid-template-columns: minmax(240px, 1fr) minmax(300px, 1fr); gap: 24px; }
+.user-admin-form { display: grid; gap: 12px; align-content: start; }
+.user-admin-form label:not(.checkbox) { display: grid; gap: 6px; }
+#adminUserError { color: #b42318; }
+@media (max-width: 760px) { .user-admin-layout { grid-template-columns: 1fr; } }
+
+.engine-coming-soon {
+  margin-top: 16px;
+  padding: 16px 18px;
+  color: var(--muted-2);
+  background: #fafbfc;
+  border: 1px dashed #dfe3e9;
+  border-radius: 12px;
+}
+.engine-coming-soon strong { display: block; color: var(--text); font-size: 13px; margin-bottom: 6px; }
+.engine-coming-soon p { margin: 0; font-size: 12px; line-height: 1.55; }
+
+.field-with-button {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+.field-with-button input {
+  flex: 1;
+}
+.small-btn {
+  padding: 6px 12px;
+  font-size: 11px;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+.field-hint {
+  font-size: 11px;
+  color: var(--muted-2);
+  margin-top: 3px;
 }

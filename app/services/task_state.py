@@ -13,6 +13,8 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
 
 from app import db
+from app.services import model_budget
+from app.services.task_queue import OUTBOX_SCHEMA, APPROVAL_OUTBOX_SCHEMA, AUTOMATION_SCHEMA, MEMBER_RETRY_SCHEMA
 from app.services.runtime_contract_service import canonical_json_hash
 from app.services.verification_service import CandidateOutput, VerificationReport
 
@@ -379,6 +381,17 @@ def init_schema(conn: sqlite3.Connection | None = None) -> None:
     try:
         connection.execute("PRAGMA foreign_keys = ON")
         connection.executescript(TASK_STATE_SCHEMA_SQL)
+        connection.execute(OUTBOX_SCHEMA)
+        connection.execute(model_budget.SCHEMA)
+        connection.execute(APPROVAL_OUTBOX_SCHEMA)
+        connection.execute(AUTOMATION_SCHEMA)
+        connection.execute(MEMBER_RETRY_SCHEMA)
+        connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_active_member_retry_dispatch ON member_retry_dispatch(team_run_id) WHERE status IN ('queued','running')")
+        connection.execute("""CREATE TABLE IF NOT EXISTS task_submissions (
+            organization_id TEXT NOT NULL, user_id TEXT NOT NULL, key_hash TEXT NOT NULL,
+            payload_hash TEXT NOT NULL, task_id TEXT NOT NULL, run_id TEXT NOT NULL,
+            PRIMARY KEY(organization_id,user_id,key_hash))""")
+        connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_active_automation_dispatch ON automation_dispatch(loop_id) WHERE status IN ('queued','running')")
         verification_columns = {
             row[1]
             for row in connection.execute(
@@ -600,31 +613,52 @@ class TaskStateService:
         metadata: Mapping[str, Any] | None = None,
         resumed_from_checkpoint_id: str | None = None,
     ) -> dict[str, Any]:
+        with self._connection(write=True) as conn:
+            return self.create_run_in_transaction(
+                conn, task_id, run_id=run_id, metadata=metadata,
+                resumed_from_checkpoint_id=resumed_from_checkpoint_id,
+            )
+
+    def create_run_in_transaction(
+        self,
+        conn: sqlite3.Connection,
+        task_id: str,
+        *,
+        run_id: str | None = None,
+        metadata: Mapping[str, Any] | None = None,
+        resumed_from_checkpoint_id: str | None = None,
+    ) -> dict[str, Any]:
+        if not conn.in_transaction:
+            raise TaskStateError("创建运行需要活动写事务")
         if not task_id.strip():
             raise ValueError("task_id cannot be empty")
         run_id = run_id or _new_id("trun")
         now = self._now()
         metadata_json = serialize_checkpoint_state(_json_object(metadata, field="metadata"))
-        with self._connection(write=True) as conn:
-            checkpoint_id = self._validate_resume_checkpoint(
-                conn, task_id, resumed_from_checkpoint_id
-            )
-            attempt = int(
-                conn.execute(
-                    "SELECT COALESCE(MAX(attempt), 0) + 1 FROM task_runs WHERE task_id = ?",
-                    (task_id,),
-                ).fetchone()[0]
-            )
+        checkpoint_id = self._validate_resume_checkpoint(
+            conn, task_id, resumed_from_checkpoint_id
+        )
+        attempt = int(
             conn.execute(
-                """
-                INSERT INTO task_runs(
-                    id, task_id, attempt, status, resumed_from_checkpoint_id,
-                    metadata_json, created_at, updated_at
-                ) VALUES (?, ?, ?, 'queued', ?, ?, ?, ?)
-                """,
-                (run_id, task_id, attempt, checkpoint_id, metadata_json, now, now),
+                "SELECT COALESCE(MAX(attempt), 0) + 1 FROM task_runs WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()[0]
+        )
+        conn.execute(
+            """
+            INSERT INTO task_runs(
+                id, task_id, attempt, status, resumed_from_checkpoint_id,
+                metadata_json, created_at, updated_at
+            ) VALUES (?, ?, ?, 'queued', ?, ?, ?, ?)
+            """,
+            (run_id, task_id, attempt, checkpoint_id, metadata_json, now, now),
+        )
+        if (metadata or {}).get("dispatch_backend") == "redis":
+            conn.execute(
+                "INSERT INTO dispatch_outbox(run_id,task_id,payload_json,created_at) VALUES(?,?,?,?)",
+                (run_id, task_id, json.dumps({"task_id": task_id, "run_id": run_id}), now),
             )
-            row = conn.execute("SELECT * FROM task_runs WHERE id = ?", (run_id,)).fetchone()
+        row = conn.execute("SELECT * FROM task_runs WHERE id = ?", (run_id,)).fetchone()
         return self._serialize_run(_row_dict(row) or {})
 
     def begin_run(
@@ -1595,6 +1629,7 @@ class TaskStateService:
                         "executor_id",
                         "effective_permissions",
                         "permission_source",
+                        "dispatch_backend",
                     }
                     or key.endswith("_decision")
                     or key.endswith("_decisions")
@@ -1665,6 +1700,9 @@ class TaskStateService:
                     now,
                 ),
             )
+
+            if durable_metadata.get("dispatch_backend") == "redis":
+                conn.execute("INSERT INTO dispatch_outbox(run_id,task_id,payload_json,created_at) VALUES(?,?,?,?)", (new_run_id, task_id, json.dumps({"task_id": task_id, "run_id": new_run_id}), now))
 
             conn.execute(
                 """
@@ -6258,6 +6296,8 @@ class TaskStateService:
                     now,
                 ),
             )
+            if command_type == "approval" and run_id and run_metadata.get("dispatch_backend") == "redis":
+                conn.execute("INSERT INTO approval_dispatch(command_id,task_id,run_id,created_at) VALUES(?,?,?,?)", (command_id, task_id, run_id, now))
             has_event_table = conn.execute(
                 "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'task_events'"
             ).fetchone() is not None

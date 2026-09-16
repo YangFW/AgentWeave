@@ -11,6 +11,8 @@ from typing import Any, Awaitable, Callable
 import httpx
 
 from app import db
+from app.services import model_budget
+from app.services.call_limits import call_limits, call_timeout
 from app.services.network_policy import require_outbound_network, validate_outbound_http_url
 from app.services.secret_store import secret_store
 
@@ -19,6 +21,7 @@ class ModelGateway:
     """Dispatch model requests to the configured provider or local fallback."""
 
     async def summarize(self, prompt: str, context: dict[str, Any] | None = None, model_config_id: str = "deterministic") -> str:
+        model_budget.reserve_call()
         if not model_config_id or model_config_id == "deterministic":
             return self._deterministic_summary(prompt, context or {})
         row = db.query_one("SELECT * FROM model_configs WHERE id = ? AND enabled = 1", (model_config_id,))
@@ -36,11 +39,22 @@ class ModelGateway:
             "messages": [{"role": "system", "content": system}, {"role": "user", "content": prompt}],
             "temperature": config.get("temperature", 0.2),
         }
-        timeout = float(config.get("timeout", 90))
-        async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
-            response = await client.post(f"{base_url}/chat/completions", json=payload, headers={"Authorization": f"Bearer {api_key}"})
-            response.raise_for_status()
-            data = response.json()
+        limits = call_limits('model', config)
+        async with httpx.AsyncClient(timeout=limits.timeout, follow_redirects=False) as client:
+            for attempt in range(limits.max_retries + 1):
+                if attempt:
+                    model_budget.reserve_call()
+                async with call_timeout('model', limits.timeout):
+                    response = await client.post(f"{base_url}/chat/completions", json=payload, headers={"Authorization": f"Bearer {api_key}"})
+                try:
+                    response.raise_for_status()
+                except httpx.HTTPStatusError:
+                    if attempt == limits.max_retries or (response.status_code != 429 and response.status_code < 500):
+                        raise
+                    await asyncio.sleep(limits.backoff * (2 ** attempt))
+                    continue
+                data = response.json()
+                break
         return str(data["choices"][0]["message"]["content"])
 
     async def resolve_intent(
@@ -192,6 +206,7 @@ class ModelGateway:
         history: list[dict[str, str]] | None = None,
     ) -> str:
         if not model_config_id or model_config_id == "deterministic":
+            model_budget.reserve_call()
             result = self._deterministic_response(prompt)
             if on_delta:
                 try:
@@ -237,8 +252,8 @@ class ModelGateway:
             if item.get("role") in {"user", "assistant"} and item.get("content")
         )
         messages.append({"role": "user", "content": prompt})
-        timeout = float(config.get("timeout", 90))
-        async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
+        limits = call_limits('model', config)
+        async with httpx.AsyncClient(timeout=limits.timeout, follow_redirects=False) as client:
             for _ in range(max(1, min(max_steps, 20))):
                 payload: dict[str, Any] = {"model": row["model"], "messages": messages, "temperature": config.get("temperature", 0.2)}
                 if api_tools:
@@ -246,29 +261,39 @@ class ModelGateway:
                     payload["tool_choice"] = "auto"
                 message = None
                 last_status_error: httpx.HTTPStatusError | None = None
-                for attempt in range(3):
+                # 最后一次可用重试留给非流式兼容请求；它也计入总重试次数。
+                stream_attempts = max(1, limits.max_retries)
+                for attempt in range(stream_attempts):
                     try:
-                        message = await self._stream_completion(
-                            client,
-                            f"{base_url}/chat/completions",
-                            payload,
-                            {"Authorization": f"Bearer {api_key}"},
-                            on_delta,
-                        )
+                        async with call_timeout('model', limits.timeout):
+                            message = await self._stream_completion(
+                                client,
+                                f"{base_url}/chat/completions",
+                                payload,
+                                {"Authorization": f"Bearer {api_key}"},
+                                on_delta,
+                            )
                         break
                     except httpx.HTTPStatusError as exc:
                         retryable = exc.response.status_code == 429 or exc.response.status_code >= 500
                         if not retryable:
                             raise
                         last_status_error = exc
-                        if attempt < 2:
-                            await asyncio.sleep(0.6 * (2 ** attempt))
+                        if attempt < stream_attempts - 1:
+                            await asyncio.sleep(limits.backoff * (2 ** attempt))
                 if message is None:
-                    fallback = await client.post(
-                        f"{base_url}/chat/completions",
-                        json=payload,
-                        headers={"Authorization": f"Bearer {api_key}"},
-                    )
+                    if limits.max_retries == 0:
+                        if last_status_error:
+                            raise last_status_error
+                        raise RuntimeError('模型未返回有效响应，且已禁用重试')
+                    # 备用非流式请求也是一次模型调用，发出前必须占用预算。
+                    model_budget.reserve_call()
+                    async with call_timeout('model', limits.timeout):
+                        fallback = await client.post(
+                            f"{base_url}/chat/completions",
+                            json=payload,
+                            headers={"Authorization": f"Bearer {api_key}"},
+                        )
                     try:
                         fallback.raise_for_status()
                     except httpx.HTTPStatusError:
@@ -340,6 +365,7 @@ class ModelGateway:
         on_delta: Callable[[str], Awaitable[None] | None] | None,
     ) -> dict[str, Any]:
         """Read OpenAI-compatible SSE while forwarding text deltas and assembling tool calls."""
+        model_budget.reserve_call()
         content_parts: list[str] = []
         tool_calls: dict[int, dict[str, Any]] = {}
         plain_response_lines: list[str] = []

@@ -3,12 +3,41 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>AgentNexus · 工作台</title>
+  <title>AgentWeave · 工作台</title>
   <link rel="icon" href="./favicon.svg?v=20260817-1" type="image/svg+xml" />
-  <link rel="stylesheet" href="./styles.css?v=20260826-2" />
+  <link rel="stylesheet" href="./styles.css?v=20260916-execution-engines-5" />
 </head>
-<body>
+<body class="auth-pending">
+  <section id="loginPanel" class="login-panel hidden" aria-labelledby="loginTitle">
+    <form id="loginForm" class="login-card">
+      <h1 id="loginTitle">登录智织</h1>
+      <p>使用管理员为你创建的账号登录。</p>
+      <label>用户名<input id="loginUsername" name="username" autocomplete="username" maxlength="80" required /></label>
+      <label>密码<input id="loginPassword" name="password" type="password" autocomplete="current-password" maxlength="256" required /></label>
+      <p id="loginError" role="alert"></p>
+      <button id="loginSubmit" type="submit">登录</button>
+    </form>
+  </section>
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
+    <div id="codexSessionsDialog" class="config-dialog hidden" role="dialog" aria-modal="true" aria-labelledby="codexSessionsTitle">
+    <div class="config-dialog-card" style="max-width: 760px; max-height: 85vh; display: flex; flex-direction: column;">
+      <div class="config-dialog-head">
+        <div>
+          <div class="eyebrow">Codex 历史记录</div>
+          <h2 id="codexSessionsTitle">当前项目的 Codex 历史会话</h2>
+        </div>
+        <button id="closeCodexSessionsBtn" class="icon-button secondary" type="button" aria-label="关闭">×</button>
+      </div>
+      <div id="codexSessionsListContainer" style="overflow-y: auto; flex: 1; min-height: 240px; margin-top: 10px;">
+        <div id="codexSessionsList" class="card-list"></div>
+      </div>
+      <div id="codexSessionDetailContainer" class="hidden" style="overflow-y: auto; flex: 1; min-height: 240px; margin-top: 10px;">
+        <button id="backToCodexSessionsBtn" class="secondary small-btn" style="margin-bottom: 10px;">← 返回会话列表</button>
+        <div id="codexSessionDetailMeta" class="small" style="margin-bottom: 10px; color: var(--muted);"></div>
+        <div id="codexSessionDetailMessages" style="display: flex; flex-direction: column; gap: 10px;"></div>
+      </div>
+    </div>
+  </div>
   <div id="pptxConfigDialog" class="config-dialog hidden" role="dialog" aria-modal="true" aria-labelledby="pptxConfigTitle">
     <div class="config-dialog-card">
       <div class="config-dialog-head"><div><div class="eyebrow">PPTX 生成能力</div><h2 id="pptxConfigTitle">配置 PowerPoint 生成器</h2></div><button id="closePptxConfigBtn" class="icon-button secondary" type="button" aria-label="关闭配置向导">×</button></div>
@@ -28,13 +57,15 @@
   </div>
   <div id="app">
     <aside id="sidebar" class="sidebar">
+      <div id="accountPanel" class="account-panel hidden"><span id="accountName"></span><button id="logoutButton" type="button" class="secondary" aria-label="退出登录" title="退出登录">退出</button></div>
+      <button id="usersNav" class="nav hidden" data-tab="users" title="用户管理" aria-label="用户管理"><span class="nav-icon"><svg viewBox="0 0 24 24"><circle cx="12" cy="8" r="3"/><path d="M5 20v-2a7 7 0 0 1 14 0v2"/></svg></span><span class="nav-label">用户管理</span></button>
       <div class="brand">
         <div class="logo" aria-hidden="true">
           <svg viewBox="0 0 36 36"><path class="logo-shell" d="M18 7.5 27 12.7v10.6L18 28.5 9 23.3V12.7Z"/><path class="logo-link" d="M18 14.4V9.8M14.7 20l-4 2.3M21.3 20l4 2.3"/><circle class="logo-core" cx="18" cy="18" r="4"/><circle class="logo-node" cx="18" cy="9.2" r="1.35"/><circle class="logo-node" cx="10.2" cy="22.7" r="1.35"/><circle class="logo-node" cx="25.8" cy="22.7" r="1.35"/></svg>
         </div>
         <div class="brand-copy">
-          <div class="brand-title">AgentNexus</div>
-          <div class="brand-subtitle">智枢 · 智能工作平台</div>
+          <div class="brand-title">AgentWeave</div>
+          <div class="brand-subtitle">智织 · 智能工作平台</div>
         </div>
         <button id="sidebarToggle" class="sidebar-toggle" type="button" aria-label="收起侧边栏" title="收起侧边栏">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m14 7-5 5 5 5"/><path d="M19 4v16"/></svg>
@@ -57,6 +88,7 @@
         <button class="nav" data-tab="diagnostics" title="自检"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M12 3.5 19 6v5.2c0 4.4-2.7 7.9-7 9.3-4.3-1.4-7-4.9-7-9.3V6l7-2.5Z"/><path d="m8.8 12.2 2.1 2.1 4.5-5"/></svg></span><span class="nav-label">自检</span></button>
         <button class="nav" data-tab="memory" title="记忆"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M7.5 5.5A3.5 3.5 0 0 1 14 3.8a3.6 3.6 0 0 1 4.2 4.9A3.6 3.6 0 0 1 18 15a3.7 3.7 0 0 1-6 3.6A3.7 3.7 0 0 1 6 15a3.6 3.6 0 0 1-.2-6.3A3.5 3.5 0 0 1 7.5 5.5Z"/><path d="M9 8.5c1.5.2 2.5 1.2 3 2.5m3-4c-1.5.4-2.5 1.5-3 3m-3 5c1.4-.2 2.5-1 3-2.2m3 2.2c-1.4-.2-2.5-1-3-2.2M12 5v14"/></svg></span><span class="nav-label">记忆</span></button>
         <button class="nav" data-tab="models" title="模型设置"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M12 3 4.5 7 12 11l7.5-4L12 3Z"/><path d="m4.5 12 7.5 4 7.5-4M4.5 17l7.5 4 7.5-4"/></svg></span><span class="nav-label">模型设置</span></button>
+        <button id="enginesNav" class="nav hidden" data-tab="engines" title="执行引擎" aria-label="执行引擎"><span class="nav-icon"><svg viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2.5"/><path d="M8 9h8M8 12.5h5M8 16h3"/></svg></span><span class="nav-label">执行引擎</span></button>
         <button class="nav" data-tab="loops" title="自动化"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M19 7.5A8 8 0 0 0 5.4 6L3 8.5"/><path d="M3 4v4.5h4.5M5 16.5A8 8 0 0 0 18.6 18l2.4-2.5"/><path d="M21 20v-4.5h-4.5"/></svg></span><span class="nav-label">自动化</span></button>
         <button class="nav" data-tab="artifacts" title="产物"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M5 3.5h9l5 5V20H5V3.5Z"/><path d="M14 3.5V9h5M8 13h8M8 16.5h6"/></svg></span><span class="nav-label">产物</span></button>
         <button class="nav" data-tab="tasks" title="运行记录"><span class="nav-icon"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2M6 4.5 4 7"/></svg></span><span class="nav-label">运行记录</span></button>
@@ -69,6 +101,7 @@
     </aside>
 
     <main class="main">
+      <p id="runtimeModeNotice" class="small" role="status"></p>
       <div id="connectionBanner" class="connection-banner hidden">
         <div><strong>当前是静态预览</strong><span>配置和任务功能需要连接平台服务后才能使用。</span></div>
         <span>请先启动服务，再访问启动命令显示的 HTTP 地址。</span>
@@ -88,7 +121,14 @@
                 <span id="expertTeamHint">根据目标与已启用团队的匹配规则选择</span>
               </div>
               <select id="taskModelSelect" aria-label="选择模型"></select>
+              <select id="executionEngineSelect" aria-label="选择执行引擎" title="选择执行引擎">
+                <option value="builtin">内置智能体引擎</option>
+                <option value="codex">Codex 容器沙箱</option>
+                <option value="claude">Claude Code 容器沙箱</option>
+                <option value="container">自定义容器沙箱</option>
+              </select>
               <button id="modelStatusPill" class="model-status-pill" type="button" title="打开模型设置">未检查</button>
+              <button id="viewCodexSessionsBtn" class="secondary" type="button" title="查看当前项目的 Codex 容器历史会话记录">Codex 历史</button>
               <button id="newConversationBtn" class="secondary">新对话</button>
               <button id="refreshBtn" class="icon-button secondary" type="button" aria-label="刷新平台数据" title="刷新"><svg viewBox="0 0 24 24"><path d="M20 6v5h-5"/><path d="M18.2 15.5a7.5 7.5 0 1 1 .8-7L20 11"/></svg></button>
             </div>
@@ -184,6 +224,11 @@
         <div class="split workspace-admin-layout">
           <div>
             <div class="section-heading"><h2>项目列表</h2><span id="workspaceCount">0</span></div>
+            <div class="workspace-list-toolbar">
+              <label class="sr-only" for="workspaceSearch">查询项目</label>
+              <input id="workspaceSearch" type="search" placeholder="按名称、ID或描述查询" autocomplete="off" />
+              <label class="checkbox workspace-show-disabled"><input id="workspaceShowDisabled" type="checkbox" /> 显示已停用</label>
+            </div>
             <div id="workspaceList" class="card-list workspace-list"></div>
           </div>
           <div class="editor-card workspace-editor">
@@ -191,15 +236,26 @@
               <div><h2 id="workspaceEditorTitle">新建项目</h2><div id="workspaceEditorMeta" class="small">保存后可在左侧切换当前项目</div></div>
               <div class="toolbar"><button id="deleteWorkspaceBtn" class="secondary hidden">停用</button><button id="saveWorkspaceBtn">保存项目</button></div>
             </div>
-            <div class="form-grid two">
+            <div class="form-grid two workspace-basic-fields">
               <label>ID<input id="workspaceId" placeholder="project-alpha" /></label>
               <label>名称<input id="workspaceName" placeholder="例如：产品官网改版" /></label>
               <label>默认智能体<select id="workspaceDefaultAgent"></select></label>
               <label>默认模型<select id="workspaceDefaultModel"></select></label>
             </div>
-            <label>描述<textarea id="workspaceDescription" rows="4" placeholder="说明这个项目的目标、资料范围和协作边界。"></textarea></label>
-            <label>设置 JSON<textarea id="workspaceSettings" class="code" rows="6">{}</textarea></label>
-            <label class="checkbox"><input id="workspaceEnabled" type="checkbox" checked /> 启用项目</label>
+            <div class="workspace-detail-section workspace-description-section"><h3>项目说明</h3><label><textarea id="workspaceDescription" rows="3" placeholder="说明这个项目的目标、资料范围和协作边界。"></textarea></label></div>
+            <div class="workspace-detail-section"><h3>高级设置</h3><label><textarea id="workspaceSettings" class="code" rows="3">{}</textarea></label></div>
+            <label class="checkbox workspace-enabled"><input id="workspaceEnabled" type="checkbox" checked /> 启用项目</label>
+            <section id="workspaceMembersPanel" class="hidden">
+              <div class="workspace-section-heading"><h3>项目成员</h3><span>权限</span></div>
+              <p>所有者可管理项目；成员可执行任务，只读成员只能查看其有权访问的资料。</p>
+              <div id="workspaceMembersList" class="card-list"></div>
+              <div class="form-grid two">
+                <label>添加用户名<input id="workspaceMemberUsername" autocomplete="off" placeholder="输入已有账号的用户名" /></label>
+                <label>权限<select id="workspaceMemberRole"><option value="member">成员</option><option value="viewer">只读</option></select></label>
+              </div>
+              <button id="addWorkspaceMemberBtn" type="button">添加成员</button>
+              <p id="workspaceMembersError" role="alert"></p>
+            </section>
             <div class="memory-note"><strong>当前边界</strong><span>项目切换会影响后续任务、记忆、知识库、专家团、自动化和产物查询；Skill、MCP、模型配置仍是本机平台级配置。</span></div>
           </div>
         </div>
@@ -214,9 +270,17 @@
           <div class="toolbar"><label class="file-button">导入技能包<input id="skillPackageInput" type="file" accept=".md,.zip" /></label><button id="newSkillBtn">新建技能</button></div>
         </div>
         <div class="download-bar"><div><strong>从下载链接安装</strong><span>支持公开的 SKILL.md 或 ZIP 直链</span></div><input id="skillDownloadUrl" placeholder="https://raw.githubusercontent.com/.../SKILL.md" /><button id="installSkillUrlBtn">安装</button></div>
-        <div class="split">
-          <div id="skillList" class="card-list"></div>
-          <div class="editor-card">
+        <div class="split skill-admin-layout">
+          <div class="skill-list-column">
+            <div class="section-heading"><h2>技能列表</h2><span id="skillCount">0</span></div>
+            <div class="skill-list-toolbar">
+              <label class="sr-only" for="skillSearch">查询技能</label>
+              <input id="skillSearch" type="search" placeholder="按名称、ID或描述查询" autocomplete="off" />
+              <label class="checkbox skill-show-disabled"><input id="skillShowDisabled" type="checkbox" /> 显示已停用</label>
+            </div>
+            <div id="skillList" class="card-list skill-list"></div>
+          </div>
+          <div class="editor-card skill-editor">
             <div class="editor-header">
               <h2 id="skillEditorTitle">选择一个技能</h2>
               <div class="toolbar"><button id="deleteSkillBtn" class="secondary hidden">卸载</button><button id="saveSkillBtn" class="secondary">保存</button></div>
@@ -309,12 +373,16 @@
             <p>为不同工作场景配置模型、技能、工具和操作权限。</p>
           </div><button id="newAgentBtn">新建智能体</button>
         </div>
-        <div class="split"><div id="agentList" class="card-list"></div><div class="editor-card">
-          <h2 id="agentEditorTitle">新建或选择智能体</h2>
-          <div class="form-grid two"><label>ID<input id="agentId" /></label><label>名称<input id="agentName" /></label><label>模型<select id="agentModel"></select></label><label>描述<input id="agentDescription" /></label></div>
-          <label>系统提示词<textarea id="agentPrompt" rows="5"></textarea></label>
-          <label>技能 ID（逗号分隔）<input id="agentSkills" /></label><label>工具服务 ID（逗号分隔）<input id="agentMcps" /></label>
-          <label>权限配置 JSON<textarea id="agentPermissions" class="code" rows="5">{}</textarea></label><button id="saveAgentBtn">保存智能体</button>
+        <div class="split agent-admin-layout"><div class="agent-list-column">
+          <div class="section-heading"><h2>智能体列表</h2><span id="agentCount">0</span></div>
+          <div class="workspace-list-toolbar"><label class="sr-only" for="agentSearch">查询智能体</label><input id="agentSearch" type="search" placeholder="按名称、ID或描述查询" autocomplete="off" /><label class="checkbox workspace-show-disabled"><input id="agentShowDisabled" type="checkbox" /> 显示已停用</label></div>
+          <div id="agentList" class="card-list agent-list"></div>
+        </div><div class="editor-card agent-editor">
+          <div class="editor-header"><div><h2 id="agentEditorTitle">新建或选择智能体</h2><div class="small">配置模型、技能、工具和权限边界</div></div><button id="saveAgentBtn">保存智能体</button></div>
+          <div class="form-grid two agent-basic-fields"><label>ID<input id="agentId" /></label><label>名称<input id="agentName" /></label><label>模型<select id="agentModel"></select></label><label>描述<input id="agentDescription" /></label></div>
+          <div class="agent-detail-section"><h3>系统提示词</h3><label><textarea id="agentPrompt" rows="4"></textarea></label></div>
+          <div class="form-grid two agent-capability-fields"><label>技能 ID（逗号分隔）<input id="agentSkills" /></label><label>工具服务 ID（逗号分隔）<input id="agentMcps" /></label></div>
+          <div class="agent-detail-section"><h3>权限配置 JSON</h3><label><textarea id="agentPermissions" class="code" rows="5">{}</textarea></label></div>
         </div></div>
       </section>
 
@@ -586,9 +654,67 @@
       <section id="tab-models" class="tab">
         <div class="topbar"><div><div class="eyebrow">推理服务</div><h1>模型设置</h1><p>管理模型连接。密钥由服务端读取或在本机加密存储，页面不会回显明文。</p></div><button id="newModelBtn">添加模型</button></div>
         <div class="split"><div><div id="capabilities" class="editor-card"></div><div class="section-heading"><h2>已配置模型</h2><span id="modelCount">0</span></div><div id="modelList" class="card-list model-list"></div></div><div class="editor-card">
-          <h2 id="modelEditorTitle">添加模型配置</h2><div class="form-grid two"><label>ID<input id="modelId" /></label><label>名称<input id="modelName" /></label><label>Provider<select id="modelProvider"><option value="openai_compatible">OpenAI Compatible</option><option value="openai">OpenAI</option></select></label><label>模型名<input id="modelNameValue" placeholder="gpt-5.2" /></label></div>
+          <h2 id="modelEditorTitle">添加模型配置</h2><div class="form-grid two"><label>ID<input id="modelId" /></label><label>名称<input id="modelName" /></label><label>Provider<select id="modelProvider"><option value="openai_compatible">OpenAI Compatible</option><option value="openai">OpenAI</option></select></label><label>模型名
+              <div class="field-with-button">
+                <input id="modelNameValue" placeholder="例如 gpt-5.2" list="discoveredModelsList" autocomplete="off" />
+                <button id="discoverModelsBtn" type="button" class="secondary small-btn" title="根据当前 Base URL 和密钥获取上游支持的模型">获取可用模型</button>
+              </div>
+              <select id="modelPickerSelect" class="small-select hidden" style="margin-top: 6px; width: 100%;">
+                <option value="">-- 点击直接选择已发现的模型 --</option>
+              </select>
+              <button id="addDiscoveredModelBtn" type="button" class="secondary small-btn hidden" style="margin-top: 6px; width: 100%;">➕ 将所选模型添加为新可用模型</button>
+              <datalist id="discoveredModelsList"></datalist>
+              <div id="discoveredModelsHint" class="field-hint"></div>
+            </label></div>
           <label>Base URL<input id="modelBaseUrl" placeholder="https://api.openai.com/v1" /></label><label>密钥方式<select id="modelKeyMode"><option value="env">环境变量</option><option value="direct">直接填写 API Key</option></select></label><label id="modelKeyEnvField">API Key 环境变量名<input id="modelApiKeyEnv" placeholder="OPENAI_API_KEY" /></label><label id="modelKeyDirectField" class="hidden">API Key<input id="modelApiKey" type="password" autocomplete="new-password" placeholder="密钥在本机加密保存，页面不会回显" /></label><div id="modelKeyStatus" class="secret-status"></div><label>高级配置 JSON<textarea id="modelConfig" class="code" rows="6">{"temperature":0.2,"timeout":90}</textarea></label><label class="checkbox"><input id="modelEnabled" type="checkbox" checked /> 启用</label><div class="toolbar"><button id="deleteModelBtn" class="secondary hidden">删除模型</button><button id="saveModelBtn">保存模型</button><button id="testModelBtn" class="secondary">测试连接</button></div><pre id="modelTestResult" class="result-box compact">选择模型后可测试连接</pre>
         </div></div>
+      </section>
+
+      <section id="tab-engines" class="tab">
+        <div class="topbar">
+          <div>
+            <div class="eyebrow">第三方引擎</div>
+            <h1>执行引擎</h1>
+            <p>由管理员配置 Codex、Claude Code 的接口地址和密钥。密钥只保存在本机，页面不会显示明文。后续可在此接入更多引擎。</p>
+          </div>
+        </div>
+        <div class="split">
+          <div>
+            <div class="section-heading"><h2>已接入引擎</h2><span id="engineCount">0</span></div>
+            <div id="engineList" class="card-list model-list"></div>
+            <div class="engine-coming-soon" aria-disabled="true">
+              <strong>新增执行引擎（即将提供）</strong>
+              <p>后续管理员可以在这里接入更多第三方执行引擎。当前只开放 Codex 和 Claude Code 的账号与模型配置。</p>
+            </div>
+          </div>
+          <div class="editor-card">
+            <h2 id="engineEditorTitle">选择一个执行引擎</h2>
+            <p id="engineEditorHint" class="small">选择左侧引擎后，可修改接口地址、密钥和是否启用。</p>
+            <label>名称<input id="engineName" disabled /></label>
+            <label>接口地址（选填）<input id="engineBaseUrl" placeholder="例如 https://api.openai.com/v1" /></label>
+            <label>模型名称（选填）
+              <div class="field-with-button">
+                <input id="engineModel" placeholder="留空则使用引擎默认模型" list="discoveredEngineModelsList" autocomplete="off" />
+                <button id="discoverEngineModelsBtn" type="button" class="secondary small-btn" title="根据当前接口地址和密钥获取可用模型">获取可用模型</button>
+              </div>
+              <select id="engineModelPickerSelect" class="small-select hidden" style="margin-top: 6px; width: 100%;">
+                <option value="">-- 点击直接选择已发现的模型 --</option>
+              </select>
+              <datalist id="discoveredEngineModelsList"></datalist>
+              <div id="discoveredEngineModelsHint" class="field-hint"></div>
+            </label>
+            <label>密钥方式<select id="engineKeyMode"><option value="env">环境变量</option><option value="direct">直接填写密钥</option></select></label>
+            <label id="engineKeyEnvField">密钥环境变量名<input id="engineApiKeyEnv" placeholder="OPENAI_API_KEY" /></label>
+            <label id="engineKeyDirectField" class="hidden">API Key<input id="engineApiKey" type="password" autocomplete="new-password" placeholder="密钥在本机加密保存，页面不会回显" /></label>
+            <div id="engineKeyStatus" class="secret-status">选择引擎后查看密钥状态</div>
+            <label class="checkbox"><input id="engineEnabled" type="checkbox" checked /> 启用此引擎</label>
+            <div class="toolbar">
+              <button id="testEngineBtn" class="secondary" type="button">测试连接</button>
+              <button id="saveEngineBtn">保存配置</button>
+            </div>
+            <pre id="engineSaveResult" class="result-box compact">尚未选择引擎</pre>
+          </div>
+        </div>
       </section>
 
       <section id="tab-loops" class="tab">
@@ -707,10 +833,27 @@
         </div>
         <div id="taskList" class="task-list"></div>
       </section>
+      <section id="tab-users" class="tab">
+        <div class="topbar"><div><h1>用户管理</h1><p>为成员创建独立账号，管理角色与登录权限。</p></div><button id="refreshUsersBtn" class="secondary">刷新</button></div>
+        <div class="user-admin-layout">
+          <div id="adminUserList" class="card-list"></div>
+          <form id="adminUserForm" class="user-admin-form">
+            <h2 id="adminUserTitle">新建用户</h2>
+            <label>用户名<input id="adminUsername" autocomplete="off" minlength="2" maxlength="80" required /></label>
+            <label>角色<select id="adminUserRole"><option value="user">普通用户</option><option value="admin">管理员</option></select></label>
+            <label>密码<input id="adminUserPassword" type="password" autocomplete="new-password" minlength="12" maxlength="256" /></label>
+            <p id="adminPasswordHint">新用户需设置至少 12 位密码。</p>
+            <label class="checkbox"><input id="adminUserEnabled" type="checkbox" checked /> 启用账号</label>
+            <p id="adminUserError" role="alert"></p>
+            <div class="toolbar"><button id="newUserBtn" type="button" class="secondary">新建用户</button><button id="saveUserBtn" type="submit">保存</button></div>
+            <p>修改密码、角色或停用账号会撤销其已有登录会话。最后一个管理员不能被停用或降级。</p>
+          </form>
+        </div>
+      </section>
     </main>
   </div>
 
-  <script src="./diagnostics-routing.js?v=20260826-7"></script>
-  <script src="./app.js?v=20260826-7"></script>
+  <script src="./diagnostics-routing.js?v=20260916-execution-engines-5"></script>
+  <script src="./app.js?v=20260916-execution-engines-5"></script>
 </body>
 </html>

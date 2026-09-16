@@ -1,6 +1,6 @@
 # AgentNexus 架构说明
 
-AgentNexus（智枢）由一个 FastAPI 服务和一套浏览器界面组成。前端只负责交互和展示，模型调用、任务编排、工具权限、文件处理和持久化都在服务端完成。
+AgentNexus（智枢）由 FastAPI 服务、浏览器界面及可选 Redis/Worker 组成。未配置 REDIS_URL 时保留进程内开发模式；配置后，API 保存任务与投递记录，Worker 负责执行。模型调用、工具权限、文件处理和持久化均在服务端完成。
 
 ## 主要组件
 
@@ -18,6 +18,12 @@ AgentNexus（智枢）由一个 FastAPI 服务和一套浏览器界面组成。�
 | Loop Scheduler | `app/services/loop_scheduler.py` | 间隔、Cron、单次和 Webhook 自动化 |
 | Policy Engine | `app/services/policy_engine.py` | 在任务和工具生命周期应用拒绝、审批或上下文规则 |
 | SQLite | `app/db.py` | 配置、任务、事件、记忆和文件索引的单机持久化 |
+| 身份与权限 | `app/services/auth_service.py` | 密码哈希、持久会话、角色、成员关系、限流与审计 |
+| Worker 与队列 | `app/worker.py`、`app/services/task_queue.py` | 事务投递、消息确认、运行租约、恢复与用户配额 |
+| 工作区路径 | `app/services/workspace_path_manager.py` | 按组织/用户/项目生成隔离目录，供容器挂载 |
+| 容器执行引擎 | `app/services/container_agent_runner.py`、`docker/runner.Dockerfile` | 为 Codex/Claude Code/自定义命令启动独立容器，流式日志，回收容器 |
+
+| 实时通知 | `app/services/event_notifications.py` | Redis 传递游标通知，SSE 从 SQLite 补读正文 |
 
 ## 普通任务流程
 
@@ -85,11 +91,35 @@ data/artifacts/        任务生成文件
 
 公共任务和事件响应不会返回服务器绝对路径或数据库内部 JSON 字段。产物通过 ID 定位，并由受控接口预览或下载；路径解析会拒绝绝对路径、目录穿越和指向产物目录外部的符号链接。
 
-这些目录仍然是单机共享存储。当前代码没有为不同登录主体提供完整的文件所有权隔离，因此公共响应脱敏不能替代身份认证和访问控制。
+这些目录仍然是单机共享存储。启用认证时，上传登记所有者，任务及产物接口检查用户和工作区权限。公共响应脱敏和接口权限不等于独立文件系统或企业级租户隔离；可信部署与权限验收仍是前提。
+
+## 第三方引擎沙箱
+
+`execution_engine=builtin` 时仍由本机 `AgentRuntime` 调用模型和 MCP。`codex` / `claude` / `container` 时：
+
+```text
+创建任务 (execution_engine)
+        ↓
+AgentRuntime._run_container_task
+        ↓
+确保 data/workspaces/{org}/{user}/{workspace}/code 存在
+        ↓
+docker run --rm agentnexus-runner:latest
+  挂载 code -> /workspace
+  挂载 state/.codex -> /home/node/.codex
+        ↓
+容器内 pip/npm 安装写入 /workspace（宿主机项目目录）
+        ↓
+任务结束 / 超时 / 取消 -> 容器销毁，文件保留
+```
+
+项目新增依赖不要装进镜像。入口脚本把 venv、user site 和 npm prefix 固定在 `/workspace`。容器默认 `--rm`，不会因为“时间久了”而堆积。
 
 ## 部署边界
 
-现有架构是单进程、SQLite 的本地平台实现。它没有分布式队列、跨节点锁、每任务容器、CPU/内存配额、可信用户认证或多租户行级隔离。生产化时需要在入口层、数据层和执行层补齐这些能力。
+现有多人模式使用单台主机、SQLite、Redis Streams 和独立 Worker。Compose 已设置非 root、只读根文件系统及进程/CPU/内存限制；用户配额和运行锁在 Redis 中维护。第三方引擎任务使用每任务容器；内置 MCP/stdio 仍在平台进程中。它不提供跨节点高可用或企业级多租户隔离。外部线程/子进程的副作用不能仅靠取消 Python 协程撤销。
+
+任务/事件契约见 `TASK_EVENT_CONTRACT.md`，投递和恢复语义见 `QUEUE_PROTOCOL.md`，部署与备份见 `SECOND_RELEASE_RUNBOOK.md` 和 `BACKUP_RESTORE.md`。不要用单元测试通过替代逐项上线验收。
 
 PPTX 生成默认由平台内置的 Python `python-pptx` 生成器完成，和主服务在同一 Python 运行环境中执行，不需要 Docker、Node.js 或 npm。若部署方有受支持的外部 Artifact Tool，也可以显式配置 `APP_ARTIFACT_TOOL_ENTRYPOINT` 切换到 Node.js 子进程链路；该路径不是默认依赖。
 

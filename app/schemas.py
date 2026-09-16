@@ -24,6 +24,22 @@ ModelProvider = Literal["openai", "openai_compatible"]
 ApiKeyMode = Literal["env", "direct"]
 
 
+class UserCreate(BaseModel):
+    username: ResourceId
+    password: str = Field(min_length=12, max_length=256, repr=False)
+    role: Literal["admin", "user"] = "user"
+
+
+class UserUpdate(BaseModel):
+    password: str | None = Field(default=None, min_length=12, max_length=256, repr=False)
+    role: Literal["admin", "user"] | None = None
+    enabled: bool | None = None
+
+
+class WorkspaceMemberUpdate(BaseModel):
+    role: Literal["member", "viewer"] = "member"
+
+
 def _validate_http_base_url(value: str) -> str:
     value = value.strip()
     if not value:
@@ -34,6 +50,17 @@ def _validate_http_base_url(value: str) -> str:
     if parsed.username or parsed.password or parsed.fragment:
         raise ValueError("Base URL 不能包含账号、密码或 URL 片段")
     return value.rstrip("/")
+
+
+class ModelDiscoverRequest(BaseModel):
+    base_url: str = Field(..., min_length=1, max_length=2_000)
+    api_key: str | None = None
+    api_key_mode: ApiKeyMode = "env"
+    api_key_env: str | None = None
+    engine_id: str | None = None
+    model_id: str | None = None
+
+    _normalise_base_url = field_validator("base_url")(_validate_http_base_url)
 
 
 class SkillCreate(BaseModel):
@@ -240,6 +267,7 @@ class ModelConfigCreate(BaseModel):
     api_key_mode: ApiKeyMode = "env"
     enabled: bool = True
     config: dict[str, Any] = Field(default_factory=dict)
+    copy_credentials_from: str | None = None
 
     _normalise_base_url = field_validator("base_url")(_validate_http_base_url)
 
@@ -261,6 +289,21 @@ class ModelConfigUpdate(BaseModel):
         return None if value is None else _validate_http_base_url(value)
 
 
+class ExecutionEngineUpdate(BaseModel):
+    enabled: bool | None = None
+    base_url: str | None = Field(default=None, max_length=2_000)
+    api_key_env: str | None = Field(default=None, max_length=200)
+    api_key: str | None = None
+    api_key_mode: ApiKeyMode | None = None
+    model: str | None = Field(default=None, max_length=200)
+    config: dict[str, Any] | None = None
+
+    @field_validator("base_url")
+    @classmethod
+    def normalise_engine_base_url(cls, value: str | None) -> str | None:
+        return None if value is None else _validate_http_base_url(value)
+
+
 class TaskCreate(BaseModel):
     message: str = Field(..., min_length=1)
     agent_id: ResourceId = "general-agent"
@@ -272,7 +315,15 @@ class TaskCreate(BaseModel):
     parent_task_id: str | None = None
     executor_type: str = Field(default="agent", pattern="^(agent|team)$")
     executor_id: str | None = None
-    attachment_ids: list[str] = Field(default_factory=list)
+    attachment_ids: list[str] = Field(default_factory=list, max_length=10)
+    execution_engine: str = Field(default="builtin", pattern="^(builtin|codex|claude|container)$")
+
+    @field_validator('attachment_ids')
+    @classmethod
+    def unique_attachments(cls, value: list[str]) -> list[str]:
+        if len(value) != len(set(value)):
+            raise ValueError('同一附件不能重复添加')
+        return value
 
 
 class ToolInvokeRequest(BaseModel):

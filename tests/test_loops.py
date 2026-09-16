@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import sqlite3
 import tempfile
 import time
 import unittest
@@ -194,6 +195,83 @@ class LoopSchedulerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(loop["status"], "waiting_approval")
         self.assertEqual(loop["consecutive_failures"], 0)
         self.assertEqual(loop["next_run_at"], "")
+
+    async def test_approval_completion_reconciles_after_restart_without_extra_round(self):
+        for index, (task_status, result, expected) in enumerate((
+            ('completed', {'summary': 'done'}, 'active'),
+            ('completed', {'goal_complete': True}, 'completed'),
+            ('completed', {'needs_clarification': True}, 'blocked'),
+            ('failed', {'error': 'failure'}, 'failed'),
+            ('cancelled', {}, 'failed'),
+        )):
+            with self.subTest(task_status=task_status, expected=expected):
+                loop_id = f'approval-{index}'
+                self.add_loop(loop_id=loop_id, status='active', max_failures=1)
+                run = await LoopScheduler(FakeRuntime(final_status='waiting_approval')).run_once(loop_id, scheduled=True)
+                db.update_task_status(run['task_id'], task_status, result=result, artifacts=[{'id': 'artifact-a'}])
+                restarted = LoopScheduler(FakeRuntime())
+                restarted.reconcile_approved_runs()
+                before = db.query_one('SELECT * FROM loops WHERE id=?', (loop_id,))
+                notices = db.query_all('SELECT * FROM notifications WHERE entity_id=?', (loop_id,))
+                restarted.reconcile_approved_runs()
+                self.assertEqual(db.query_all('SELECT * FROM notifications WHERE entity_id=?', (loop_id,)), notices)
+                self.assertEqual(db.query_one('SELECT * FROM loops WHERE id=?', (loop_id,)), before)
+                self.assertEqual(before['status'], expected)
+                self.assertEqual(before['run_count'], 1)
+                self.assertEqual(bool(before['next_run_at']), expected == 'active')
+                history = db.query_one('SELECT * FROM loop_runs WHERE id=?', (run['id'],))
+                self.assertNotEqual(history['status'], 'waiting_approval')
+                self.assertEqual(db.json_loads(history['result_json'], {})['task_result'], result)
+                self.assertEqual(db.query_one('SELECT status FROM automation_trigger_events WHERE id=?', (history['trigger_event_id'],))['status'], history['status'])
+
+    async def test_approval_reconcile_preserves_manual_pause(self):
+        self.add_loop(status='active')
+        run = await LoopScheduler(FakeRuntime(final_status='waiting_approval')).run_once('loop-test', scheduled=True)
+        db.execute("UPDATE loops SET status='paused' WHERE id='loop-test'")
+        db.update_task_status(run['task_id'], 'completed', result={'summary': 'approved'}, artifacts=[])
+        LoopScheduler(FakeRuntime()).reconcile_approved_runs()
+        self.assertEqual(db.query_one("SELECT status FROM loops WHERE id='loop-test'")['status'], 'paused')
+        self.assertEqual(db.query_one('SELECT status FROM loop_runs WHERE id=?', (run['id'],))['status'], 'completed')
+        self.assertEqual(db.json_loads(db.query_one("SELECT state_json FROM loops WHERE id='loop-test'")['state_json'], {})['last_run']['task_status'], 'completed')
+
+    async def test_old_approval_does_not_overwrite_newer_round(self):
+        self.add_loop(status='active')
+        scheduler = LoopScheduler(FakeRuntime(final_status='waiting_approval'))
+        old = await scheduler.run_once('loop-test', scheduled=True)
+        db.execute("UPDATE loops SET status='active' WHERE id='loop-test'")
+        newer = await scheduler.run_once('loop-test', scheduled=True)
+        before = db.query_one("SELECT * FROM loops WHERE id='loop-test'")
+        db.update_task_status(old['task_id'], 'completed', result={'summary': 'old'}, artifacts=[])
+        scheduler.reconcile_approved_runs()
+        self.assertEqual(db.query_one("SELECT * FROM loops WHERE id='loop-test'"), before)
+        self.assertEqual(db.query_one('SELECT status FROM loop_runs WHERE id=?', (old['id'],))['status'], 'completed')
+        self.assertEqual(db.query_one('SELECT status FROM loop_runs WHERE id=?', (newer['id'],))['status'], 'waiting_approval')
+
+    async def test_reconcile_waits_for_original_scheduler_to_finish_handoff(self):
+        self.add_loop(status='active')
+        scheduler = LoopScheduler(FakeRuntime(final_status='waiting_approval'))
+        run = await scheduler.run_once('loop-test', scheduled=True)
+        db.update_task_status(run['task_id'], 'completed', result={'summary': 'done'}, artifacts=[])
+        db.execute("UPDATE loops SET status='running',run_count=0 WHERE id='loop-test'")
+        scheduler.reconcile_approved_runs()
+        self.assertEqual(db.query_one('SELECT status FROM loop_runs WHERE id=?', (run['id'],))['status'], 'waiting_approval')
+        db.execute("UPDATE loops SET status='waiting_approval',run_count=1 WHERE id='loop-test'")
+        scheduler.reconcile_approved_runs()
+        self.assertEqual(db.query_one("SELECT status FROM loops WHERE id='loop-test'")['status'], 'active')
+
+    async def test_approval_projection_updates_roll_back_together(self):
+        self.add_loop(status='active')
+        run = await LoopScheduler(FakeRuntime(final_status='waiting_approval')).run_once('loop-test', scheduled=True)
+        db.update_task_status(run['task_id'], 'completed', result={'summary': 'done'}, artifacts=[])
+        db.execute("CREATE TRIGGER reject_sync BEFORE UPDATE ON loops BEGIN SELECT RAISE(ABORT,'test failure'); END")
+        scheduler = LoopScheduler(FakeRuntime())
+        with self.assertRaises(sqlite3.IntegrityError):
+            scheduler.reconcile_approved_runs()
+        self.assertEqual(db.query_one('SELECT status FROM loop_runs WHERE id=?', (run['id'],))['status'], 'waiting_approval')
+        self.assertEqual(db.query_one('SELECT status FROM automation_trigger_events')['status'], 'waiting_approval')
+        db.execute('DROP TRIGGER reject_sync')
+        scheduler.reconcile_approved_runs()
+        self.assertEqual(db.query_one("SELECT status FROM loops WHERE id='loop-test'")['status'], 'active')
 
     async def test_dispatch_reserves_loop_before_coroutine_runs(self) -> None:
         self.add_loop()

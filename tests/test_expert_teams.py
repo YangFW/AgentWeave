@@ -193,6 +193,47 @@ class ExpertTeamServiceTests(unittest.IsolatedAsyncioTestCase):
         )
         return service
 
+    def test_worker_timeout_closes_team_and_all_active_children(self) -> None:
+        from app.worker import execute_with_deadline
+        runtime = RecordingRuntime(self.task_state)
+        service = self._create_team(runtime)
+        task, parent, team = service.create_task_and_run('risk-council', self.scope, message='测试超时', model_id='deterministic')
+        started = []
+
+        async def blocked(task_id, *, run_id=None):
+            self.task_state.begin_run(task_id, run_id=run_id, activate_task_projection=True)
+            started.append(task_id)
+            await asyncio.Event().wait()
+
+        runtime.run_task = blocked
+        asyncio.run(execute_with_deadline(
+            runtime, task['id'], parent['id'], service.run_team(team['id']), 0.5,
+            on_timeout=lambda error: service.fail_interrupted_run(team['id'], parent['id'], error),
+        ))
+        self.assertTrue(started, '必须在子任务已开始后触发超时')
+        self.assertEqual(db.query_one('SELECT status FROM team_runs WHERE id=?', (team['id'],))['status'], 'failed')
+        self.assertFalse(db.query_all("SELECT id FROM team_member_runs WHERE team_run_id=? AND status IN ('queued','running','waiting_approval')", (team['id'],)))
+        events = db.query_all('SELECT id FROM task_events WHERE task_id=?', (task['id'],))
+        service.fail_interrupted_run(team['id'], parent['id'], {'error_type': 'TaskTimeout', 'message': '任务超过执行时间上限'})
+        self.assertEqual(db.query_all('SELECT id FROM task_events WHERE task_id=?', (task['id'],)), events)
+        for task_id in [task['id'], *started]:
+            self.assertEqual(db.query_one('SELECT status FROM tasks WHERE id=?', (task_id,))['status'], 'failed')
+            for run in self.task_state.list_runs(task_id=task_id):
+                self.assertEqual(run['status'], 'failed')
+                self.task_state.assert_terminal_clean(task_id=task_id, run_id=run['id'])
+
+    async def test_members_and_supervisor_receive_parent_attachments(self) -> None:
+        runtime = RecordingRuntime(self.task_state)
+        service = self._create_team(runtime)
+        attachments = [{'id': 'source-attachment', 'name': 'review.md', 'path': 'test-only.md'}]
+        task, parent, team = service.create_task_and_run('risk-council', self.scope, message='评审附件', attachments=attachments)
+        await service.run_team(team['id'])
+        children = db.query_all('SELECT executor_type,attachments_json FROM tasks WHERE parent_task_id=?', (task['id'],))
+        self.assertEqual(len(children), 3)
+        self.assertEqual({child['executor_type'] for child in children}, {'team_member', 'team_supervisor'})
+        for child in children:
+            self.assertEqual(db.json_loads(child['attachments_json'], []), attachments)
+
     def test_template_installation_persists_scope_and_restrictive_permissions(self) -> None:
         runtime = RecordingRuntime(self.task_state)
         service = ExpertTeamService(runtime, task_state=self.task_state)  # type: ignore[arg-type]
@@ -1352,6 +1393,26 @@ class ExpertTeamApiTests(unittest.TestCase):
             "workspace_id": "workspace-a",
             "user_id": "alice",
         }
+
+    def test_team_submission_idempotency_reuses_one_parent_and_team_run(self):
+        created = self.client.post('/api/expert-teams', json={
+            'id':'idempotent-team', 'name':'Test', 'supervisor_agent_id':'supervisor',
+            'organization_id':'org-a', 'workspace_id':'workspace-a', 'owner_user_id':'alice',
+            'members':[{'agent_id':'researcher'}, {'agent_id':'reviewer'}],
+        })
+        self.assertEqual(created.status_code, 201, created.text)
+        payload = {'message':'分析测试任务', 'executor_type':'team', 'executor_id':'idempotent-team', 'organization_id':'org-a', 'workspace':'workspace-a', 'user_id':'alice'}
+        headers = {'Idempotency-Key':'team-submission'}
+        with patch.object(main_module, '_schedule_team_run') as schedule:
+            first = self.client.post('/api/tasks', json=payload, headers=headers)
+            second = self.client.post('/api/tasks', json=payload, headers=headers)
+            conflict = self.client.post('/api/tasks', json={**payload,'message':'changed'}, headers=headers)
+        self.assertEqual(first.status_code, 200, first.text)
+        self.assertEqual(second.status_code, 200, second.text)
+        self.assertEqual(first.json()['id'], second.json()['id'])
+        self.assertEqual(first.json()['team_run']['id'], second.json()['team_run']['id'])
+        self.assertEqual(conflict.status_code, 409)
+        schedule.assert_called_once()
 
     def test_template_install_team_and_async_run_api_contract(self) -> None:
         created = self.client.post(

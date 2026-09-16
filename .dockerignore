@@ -124,6 +124,10 @@ logs/**
 **/mcp-workspace
 **/mcp-workspace/**
 data/*
+backups
+backups/**
+restore-staging
+restore-staging/**
 
 # Public reproducibility files
 !.env.example

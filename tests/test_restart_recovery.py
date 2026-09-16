@@ -75,6 +75,41 @@ class RestartRecoveryTests(unittest.TestCase):
         run = self.state.begin_run(task["id"])
         return task, run
 
+    def test_api_restart_does_not_recover_worker_owned_running_attempt(self):
+        task, run = self._running_task("Worker 正在执行")
+        self.state.update_run_metadata(run["id"], {"dispatch_backend": "redis"})
+        for _ in range(2):
+            recovered = main_module._recover_interrupted_runs()
+            self.assertEqual(recovered, [])
+            self.assertEqual(self.state.get_run(run["id"])["status"], "running")
+            self.assertEqual(db.query_one("SELECT status FROM tasks WHERE id=?", (task["id"],))["status"], "running")
+            self.assertEqual(len(self.state.list_runs(task_id=task["id"])), 1)
+
+    def test_worker_recovery_persists_new_dispatch_in_same_transaction(self):
+        task, run = self._running_task("Worker 中断")
+        self.state.update_run_metadata(run["id"], {"dispatch_backend": "redis"})
+        first = self.state.recover_interrupted_attempt(run["id"])
+        second = self.state.recover_interrupted_attempt(run["id"])
+        self.assertEqual(first["run"]["id"], second["run"]["id"])
+        self.assertEqual(first["run"]["metadata"]["dispatch_backend"], "redis")
+        pending = db.query_all("SELECT run_id FROM dispatch_outbox WHERE delivered=0")
+        self.assertEqual(pending, [{"run_id": first["run"]["id"]}])
+
+    def test_worker_policy_decision_is_not_consumed_by_api_restart(self):
+        task, run = self._running_task("等待 Policy 审批")
+        self.state.update_run_metadata(run['id'], {'dispatch_backend': 'redis'})
+        self._policy_wait(task, run, 'policy-worker-test')
+        command = self.state.enqueue_command(task['id'], 'approval', run_id=run['id'], payload={'approved': True, 'approval_id': 'policy-worker-test'})
+        self.assertEqual(db.query_one('SELECT command_id FROM approval_dispatch')['command_id'], command['id'])
+        self.assertEqual(main_module._prepare_waiting_approval_recovery(), [])
+        self.assertEqual(self.state.get_run(run['id'])['status'], 'waiting_approval')
+        decision = self.state.commit_policy_approval_decision(task_id=task['id'], run_id=run['id'], approval_id='policy-worker-test', worker_id='worker-test')
+        self.assertTrue(decision['approved'])
+        recovery = self.state.recover_interrupted_attempt(run['id'])
+        self.assertEqual(recovery['run']['metadata']['dispatch_backend'], 'redis')
+        self.assertIn('policy_approval_decisions', recovery['run']['metadata'])
+        self.assertIsNotNone(db.query_one('SELECT run_id FROM dispatch_outbox WHERE run_id=?', (recovery['run']['id'],)))
+
     def _policy_wait(
         self,
         task: dict,

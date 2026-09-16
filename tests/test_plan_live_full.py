@@ -257,8 +257,9 @@ class LiveAcceptanceTests(unittest.TestCase):
             attachments=[self._upload("expert-review-brief.md")["id"]],
             executor_type="team",
         )
-        self.assertIn(task.get("status"), {"completed", "failed"})
-        self.assertTrue(self._events(events, "expert_selection") or self._events(events, "plan"))
+        self.assertEqual(task.get("status"), "completed")
+        self.assertFalse((task.get('result') or {}).get('needs_clarification'), '已提供附件，不能以补充信息代替实际专家评审')
+        self.assertTrue(self._events(events, "team_completed"), '必须实际完成成员执行及主管汇总')
 
 
 if __name__ == "__main__":  # pragma: no cover

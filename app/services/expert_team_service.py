@@ -6,6 +6,7 @@ import uuid
 from typing import Any, Mapping
 
 from app import db
+from app.services import task_queue
 from app.services.agent_runtime import AgentRuntime, create_task_record
 from app.services.context_service import ExecutionScope
 from app.services.event_bus import emit
@@ -1079,6 +1080,12 @@ class ExpertTeamService:
                 parent_run_id,
             ),
         )
+        if task_queue.enabled():
+            row = conn.execute("SELECT metadata_json FROM task_runs WHERE id=?", (parent_run_id,)).fetchone()
+            metadata = db.json_loads(row[0], {})
+            metadata['dispatch_backend'] = 'redis'
+            conn.execute("UPDATE task_runs SET metadata_json=? WHERE id=?", (db.json_dumps(metadata), parent_run_id))
+            conn.execute("INSERT INTO dispatch_outbox(run_id,task_id,payload_json,created_at) VALUES(?,?,?,?)", (parent_run_id, task_id, db.json_dumps({'task_id': task_id, 'run_id': parent_run_id, 'kind': 'team', 'team_run_id': team_run_id}), now))
 
     @staticmethod
     def _team_from_connection(
@@ -1469,7 +1476,7 @@ class ExpertTeamService:
             transaction_effect=close_extension,
         )
 
-    def reconcile_interrupted_orchestrated_runs(self) -> list[dict[str, str]]:
+    def reconcile_interrupted_orchestrated_runs(self, *, exclude_task_ids: set[str] | None = None) -> list[dict[str, str]]:
         """Reconcile durable team ownership before generic restart recovery.
 
         Queued team submissions remain schedulable.  A team that had already
@@ -1501,6 +1508,8 @@ class ExpertTeamService:
             """
         )
         for row in parent_rows:
+            if row['task_id'] in (exclude_task_ids or set()):
+                continue
             if str(row.get("task_status") or "") in {
                 "completed", "failed", "cancelled"
             }:
@@ -1669,6 +1678,8 @@ class ExpertTeamService:
             """
         )
         for row in child_rows:
+            if row['task_id'] in (exclude_task_ids or set()):
+                continue
             if str(row.get("task_status") or "") in {
                 "completed", "failed", "cancelled"
             }:
@@ -1718,6 +1729,8 @@ class ExpertTeamService:
         conversation_id: str | None = None,
         attachments: list[Mapping[str, Any]] | None = None,
         parent_task_id: str = "",
+        submission_key: str = "",
+        submission_hash: str = "",
     ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
         team = self.get_team(team_id, scope)
         if not team or not team.get("enabled"):
@@ -1728,6 +1741,15 @@ class ExpertTeamService:
         resolved_conversation_id = conversation_id or _new_id("conv")
         title = message.strip().replace("\n", " ")[:60] or "新任务"
         with self.task_state.transaction(write=True) as conn:
+            previous = conn.execute('SELECT * FROM task_submissions WHERE organization_id=? AND user_id=? AND key_hash=?', (scope.organization_id,scope.user_id,submission_key)).fetchone() if submission_key else None
+            if previous:
+                if previous['payload_hash'] != submission_hash:
+                    raise ExpertConflictError('相同 Idempotency-Key 已用于不同任务内容')
+                parent = dict(conn.execute('SELECT * FROM tasks WHERE id=?', (previous['task_id'],)).fetchone())
+                parent['_submission_reused'] = True
+                run = self.task_state._serialize_run(dict(conn.execute('SELECT * FROM task_runs WHERE id=?', (previous['run_id'],)).fetchone()))
+                team_run = self._run_api(dict(conn.execute('SELECT * FROM team_runs WHERE parent_run_id=?', (previous['run_id'],)).fetchone()))
+                return parent, run, team_run
             durable_team = self._team_from_connection(conn, team_id, scope)
             if durable_team is None:
                 raise ExpertNotFoundError("专家团不存在、不可见或已停用")
@@ -1774,6 +1796,8 @@ class ExpertTeamService:
                 scope=scope,
                 now=now,
             )
+            if submission_key:
+                conn.execute('INSERT INTO task_submissions(organization_id,user_id,key_hash,payload_hash,task_id,run_id) VALUES(?,?,?,?,?,?)', (scope.organization_id,scope.user_id,submission_key,submission_hash,task_id,parent_run_id))
             self._insert_submission_events(
                 conn,
                 task_id=task_id,
@@ -1906,6 +1930,7 @@ class ExpertTeamService:
             parent_task_id=team_run["parent_task_id"],
             executor_type="team_member",
             executor_id=member["agent_id"],
+            attachments=db.json_loads(parent.get('attachments_json'), []),
         )
         child_run = self.task_state.create_run(
             child["id"],
@@ -3052,6 +3077,7 @@ class ExpertTeamService:
             user_id=team_run.get("user_id") or "local-user",
             parent_task_id=team_run["parent_task_id"], executor_type="team_supervisor",
             executor_id=team["supervisor_agent_id"],
+            attachments=db.json_loads(parent.get('attachments_json'), []),
         )
         child_run = self.task_state.create_run(
             child["id"], metadata={"team_run_id": team_run_id, "role": "supervisor", "aggregation_attempt": attempt}
@@ -3233,6 +3259,27 @@ class ExpertTeamService:
             ],
         )
 
+    def fail_interrupted_run(self, team_run_id: str, parent_run_id: str, error: Mapping[str, Any]) -> None:
+        """执行协程已停止后关闭残留成员，最后发布父团队失败终态。"""
+        team = db.query_one('SELECT * FROM team_runs WHERE id=? AND parent_run_id=?', (team_run_id, parent_run_id))
+        if not team:
+            raise PublicationConflict('专家团运行不再拥有指定父运行')
+        message = str(error.get('message') or '专家团执行中断')
+        children = db.query_all("""SELECT r.id,r.task_id FROM task_runs r JOIN tasks t ON t.id=r.task_id
+            WHERE t.parent_task_id=? AND r.status IN ('queued','running','paused','waiting_approval')""", (team['parent_task_id'],))
+        for child in children:
+            def close_member(conn: Any, task_id: str = child['task_id']) -> None:
+                conn.execute("""UPDATE team_member_runs SET status='failed',error_json=?,finished_at=?,updated_at=?
+                    WHERE team_run_id=? AND child_task_id=? AND status IN ('queued','running','waiting_approval')""",
+                    (db.json_dumps(dict(error)), db.utc_now(), db.utc_now(), team_run_id, task_id))
+            self.task_state.commit_failure(task_id=child['task_id'], run_id=child['id'],
+                                           error=error, result={'summary': message}, transaction_effect=close_member)
+        # 尚未创建子任务的排队成员同样不能留在活动状态。
+        db.execute("""UPDATE team_member_runs SET status='failed',error_json=?,finished_at=?,updated_at=?
+            WHERE team_run_id=? AND status IN ('queued','running','waiting_approval')""",
+            (db.json_dumps(dict(error)), db.utc_now(), db.utc_now(), team_run_id))
+        self._fail_team_run(team, message, error=dict(error), parent_run_id=parent_run_id)
+
     def _fail_team_run(
         self,
         team_run: dict[str, Any],
@@ -3313,6 +3360,8 @@ class ExpertTeamService:
             "trigger": "member_retry",
             "member_id": member["id"],
         }
+        if task_queue.enabled():
+            parent_metadata['dispatch_backend'] = 'redis'
         with self.task_state.transaction(write=True) as conn:
             attempt = int(
                 conn.execute(

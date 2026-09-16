@@ -1,12 +1,16 @@
 # AgentNexus（智枢）开发交接文档
 
-更新时间：2026-08-26（Asia/Shanghai）
+更新时间：2026-09-15（Asia/Shanghai）
 
 本文是开发和维护交接记录，不是面向普通用户的产品宣传页。它说明当前代码如何组成、如何启动、哪些能力已经实现、哪些能力只适合本机开发，以及接手后应先验证什么。
 
 ## 1. 当前状态
 
 当前工作区包含一套 FastAPI + SQLite 的单机智能体平台。前端位于 `web/`，后端入口是 `app/main.py`，标准 Python 文件名没有改成其他名称。项目目录名是 `AgentNexus`，产品中文名为“智枢”。
+
+2026-09-16 已落地执行引擎管理页：管理员可在“执行引擎”中配置 Codex / Claude Code 的 Base URL、密钥方式（环境变量或加密直填）和可选模型名。配置写入 `execution_engines` 表，容器启动时优先注入这些值，其次才回退进程环境 / `.env.local`。页面为后续“新增执行引擎”留了占位，当前不提供增删引擎种类。密钥不要写入 `agentnexus-runner` 镜像。
+
+2026-09-15 已落地第三方执行引擎沙箱：任务可指定 `builtin` / `codex` / `claude` / `container`。Codex 与 Claude Code 在公共镜像 `agentnexus-runner:latest` 的独立容器中运行；每个组织/用户/项目有独立宿主机目录，项目依赖安装到挂载的 `code/` 下，任务结束后容器销毁。内置平台模式（Skill/MCP/模型网关）行为保持不变。
 
 当前代码改动尚未提交或推送到 Git。`git status` 中的修改和未跟踪文件均属于本地工作区版本；不要用 `git reset` 或 `git checkout` 覆盖它们。
 
@@ -34,6 +38,12 @@ data/platform.db
 data/.secret_key
 data/uploads/
 data/artifacts/
+data/workspaces/{org}/{user}/{workspace}/
+  code/          # 挂载为容器 /workspace；.venv 与 node_modules 也在这里
+  artifacts/
+  state/.codex
+  state/.claude
+  logs/
 ```
 
 这些内容可能包含 API 密钥材料、用户文件、任务上下文和生成文件，不应提交到 Git 或通过静态文件暴露。
@@ -92,6 +102,8 @@ APP_MODEL_HOST_ALLOWLIST=供应商主机名
 - 工具调用前的 GoalSpec、Schema、权限、Policy 和参数复验。
 - 输出前的规则验收、产物存在性/可读性/Hash 检查和语义复核；未通过不发布为完成。
 - 缺少必要参数时返回简短的补充问题，不向用户展示模型隐藏思考内容。
+- 任务可指定执行引擎：`builtin`（默认平台模式）、`codex`、`claude`、`container`。后三者在独立容器中运行，项目依赖和会话状态落在宿主机项目目录。
+
 
 ### Skill
 
@@ -151,20 +163,37 @@ git diff --check
 
 测试默认使用临时数据库和 Mock，不需要真实 API Key，也不应访问外部服务。若测试创建临时目录失败，说明当前终端没有可写临时目录，需要修复运行环境后再判断测试结果，不能把环境错误当成代码失败。
 
-## 8. 尚未完成或不能对外承诺
+## 8. 第三方引擎沙箱（2026-09-15）
+
+工作台顶部可选择执行引擎。`builtin` 走原 `AgentRuntime`；`codex` / `claude` / `container` 走 `ContainerAgentRunner`：
+
+1. `WorkspacePathManager` 按组织、用户、项目创建物理目录，拒绝 `..` 与路径分隔符。
+2. 启动 `agentnexus-runner:latest`，只挂载当前项目目录，以宿主机 UID/GID 运行。
+3. 入口脚本把 Python/npm 安装根固定到 `/workspace`（即宿主机 `code/`）。
+4. 标准输出进入任务事件流；新文件登记为产物。
+5. `--rm` + 超时/取消/`docker rm -f` + 孤儿清扫，容器不长期驻留。
+
+构建镜像：`./scripts/build-runner-image.sh`。需要引擎访问模型 API 时开启 `APP_ALLOW_OUTBOUND_NETWORK`，并把密钥通过环境变量注入容器。
+
+同一项目多轮任务共享挂载目录和 `state/.codex` / `state/.claude`；不同客户/项目目录互不可见。Codex/Claude 任务还会附带平台侧该会话的最近对话摘要作为提示上下文。
+
+专项测试：`tests/test_workspace_path_manager.py`、`tests/test_container_agent_runner.py`、`tests/test_container_task_runtime.py`、`tests/test_container_api.py`、`tests/test_sandbox_isolation_and_lifecycle.py`。手工清单见 `docs/TEST_PLAN.md` 第 14 节。
+
+## 9. 尚未完成或不能对外承诺
+
 
 - 可信登录、完整 RBAC、真实多租户行级隔离和资源所有权。
-- 每任务容器/微虚拟机沙箱、CPU/内存/网络配额和用户本地 Runner。
+- 内置 stdio MCP 仍在平台主机进程中运行，尚未迁入每任务容器；用户电脑本地 Runner 仍未实现。第三方引擎任务的容器沙箱已可用。
 - Skill/MCP 市场的发布者签名、版本锁、依赖预览、升级和回滚。
 - OAuth 连接器、跨渠道消息入口、统一 Plugin/解决方案包。
 - KMS/Vault、租户级密钥轮换与撤销。
 - 完整文件树、Diff、批量下载、分享撤销和保留策略。
 - 知识库向量/混合检索、同步连接器、页级引用和检索评测。
-- Docker 镜像的真实构建和容器启动冒烟尚未在当前机器验证；本机没有 Docker CLI。
+- 本机已验证 `agentnexus-runner:latest` 构建与容器启停冒烟；平台 API 镜像的生产分发与签名流程仍需按发布手册执行。
 
 当前适合本机开发或受控内网，不应未经认证、授权和执行隔离加固直接暴露到公网。
 
-## 9. 本次交接验收记录
+## 10. 本次交接验收记录
 
 2026-08-19 在当前工作区和运行中的 `127.0.0.1:8000` 服务上完成：
 
@@ -184,11 +213,20 @@ git diff --check
 
 2026-08-26 增量验收：重启本地服务后完成 `521/521` 全量自动化回归，并完成浏览器页面验收。在线模型任务在约 17.7 秒内完成，页面在等待期间显示实时处理状态；普通离线问答与 Markdown 产物预览/下载均通过。N-21 核心路径更新为通过；N-23（服务重启页面恢复）和 N-25（页面跨工作区/会话隔离）仍标记为页面边界待测，不把未执行的故障注入写成失败。
 
-## 10. 接手后的第一批工作
+2026-09-15 沙箱增量验收：
 
-1. 先在干净临时数据库运行完整回归，再启动服务做一次最小真实任务。
-2. 修正或补齐真实主体认证、工作区资源所有权和 RBAC，再谈多用户部署。
-3. 为高风险工具建立统一 Ask/Plan/Execute 门禁和逐操作授权生命周期。
-4. 设计隔离 Runner/沙箱，明确本地 MCP 和用户电脑工具的执行位置。
-5. 将知识库从关键词检索升级为带权限过滤和引用定位的可评测检索系统。
-6. 发布前补做测试文档 N-23～N-25 的页面边界验收：服务重启恢复、同名产物版本与回读、跨工作区/会话资源隔离。N-21 核心路径和 N-27 摘要链路已在自动化与真实页面验证；不可用模型页面“重试”按钮仍可作为后续补测项，不阻塞当前本机版本。
+- 构建 `agentnexus-runner:latest`，容器内 `codex --version` 与 `claude --version` 可用。
+- 路径隔离、跨客户文件不可见、同项目多轮文件连续、依赖安装到宿主机挂载目录、完成后/超时/取消销毁容器，均有自动化证据。
+- 工作台可选择执行引擎；`POST /api/tasks` 接受 `execution_engine`。
+- 内置平台模式代码路径未改主链，抽样任务运行时/认证/专家团测试此前通过。
+
+## 11. 接手后的第一批工作
+
+
+1. 先在干净临时数据库运行完整回归，再启动服务做一次最小真实任务（含 `builtin` 与 `container` 各一条）。
+2. 若要真实调用 Codex/Claude，打开“执行引擎”由管理员保存密钥或环境变量名，开启出站网络，构建并确认 `agentnexus-runner:latest` 存在。不要 `docker commit` 账号进镜像。
+3. 修正或补齐真实主体认证、工作区资源所有权和 RBAC，再谈多用户公网部署。
+4. 为高风险工具建立统一 Ask/Plan/Execute 门禁和逐操作授权生命周期。
+5. 将内置 stdio MCP 迁入同一套项目挂载容器，并继续用户电脑本地 Runner。
+6. 将知识库从关键词检索升级为带权限过滤和引用定位的可评测检索系统。
+7. 发布前补做测试文档 N-23～N-25 及第 14 节沙箱用例的页面边界验收。

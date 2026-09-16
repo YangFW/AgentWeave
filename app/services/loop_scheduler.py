@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from app import db
+from app.services import task_queue
 from app.services.agent_runtime import AgentRuntime
 from app.services.task_state import TaskStateService, serialize_checkpoint_state
 from app.services.secret_store import secret_store
@@ -317,6 +318,7 @@ class LoopScheduler:
 
     def __init__(self, runtime: AgentRuntime, poll_seconds: float = 1.0) -> None:
         self.runtime = runtime
+        self.worker_execution = False
         self.task_state = getattr(runtime, "task_state", None) or TaskStateService()
         self.poll_seconds = poll_seconds
         self._runner: asyncio.Task[None] | None = None
@@ -346,6 +348,7 @@ class LoopScheduler:
 
     async def _poll(self) -> None:
         while True:
+            self.reconcile_approved_runs()
             # Accepted webhook events are durable and survive a process restart.
             queued = db.query_all(
                 """SELECT e.id, e.loop_id, e.trigger_type
@@ -372,7 +375,77 @@ class LoopScheduler:
                     self.dispatch_once(item["id"], scheduled=True, trigger_type=item["trigger_type"])
             await asyncio.sleep(self.poll_seconds)
 
+    def reconcile_approved_runs(self) -> None:
+        """审批续跑可能在其他进程结束；按持久终态原子补齐自动化投影。"""
+        candidates = db.query_all("""SELECT r.id FROM loop_runs r JOIN tasks t ON t.id=r.task_id
+            WHERE r.status='waiting_approval' AND t.status IN ('completed','failed','cancelled')""")
+        for candidate in candidates:
+            with self.task_state.transaction(write=True) as conn:
+                row = conn.execute("SELECT * FROM loop_runs WHERE id=? AND status='waiting_approval'", (candidate['id'],)).fetchone()
+                if not row:
+                    continue
+                run = dict(row)
+                task = conn.execute("SELECT * FROM tasks WHERE id=?", (run['task_id'],)).fetchone()
+                if not task or task['status'] not in {'completed', 'failed', 'cancelled'}:
+                    continue
+                result = db.json_loads(task['result_json'], {})
+                result = result if isinstance(result, dict) else {'value': result}
+                artifacts = db.json_loads(task['artifacts_json'], [])
+                artifacts = artifacts if isinstance(artifacts, list) else []
+                previous = db.json_loads(run['input_state_json'], {})
+                output = _output_state(previous, result, task['status'], artifacts)
+                diff = _state_diff(previous, output)
+                blocked = bool(result.get('needs_clarification'))
+                success = task['status'] == 'completed' and not blocked
+                status = 'blocked' if blocked else 'completed' if success else 'failed'
+                error = {} if success or blocked else {'message': str(result.get('error') or result.get('summary') or '审批后任务未成功完成')}
+                decision = db.json_loads(run['decision_json'], {})
+                now = db.utc_now()
+                loop_row = conn.execute('SELECT * FROM loops WHERE id=?', (run['loop_id'],)).fetchone()
+                loop = dict(loop_row) if loop_row else None
+                # 原调度进程尚未提交本轮计数时先等待，避免它随后覆盖同步结果。
+                if loop and loop['status'] == 'running' and loop['last_task_id'] == run['task_id'] and int(loop['run_count']) < int(run['run_number']):
+                    continue
+                owns_projection = bool(loop and loop['last_task_id'] == run['task_id'] and int(loop['run_count']) <= int(run['run_number']) and loop['status'] in {'waiting_approval', 'paused'})
+                next_status = 'paused'
+                failures = 0
+                if owns_projection:
+                    failures = int(loop['consecutive_failures']) if blocked else 0 if success else int(loop['consecutive_failures']) + 1
+                    reached_limit = int(run['run_number']) >= int(loop['max_runs'])
+                    once = loop['trigger_type'] == 'once'
+                    if blocked:
+                        next_status = 'blocked'
+                    elif success and (result.get('loop_complete') or result.get('goal_complete') or reached_limit or once):
+                        next_status = 'completed'
+                    elif not success and (failures >= int(loop['max_failures']) or reached_limit or once):
+                        next_status = 'failed'
+                    elif task['status'] == 'cancelled' or decision.get('previous_status', 'paused') == 'paused':
+                        next_status = 'paused'
+                    else:
+                        next_status = 'active'
+                    if loop['status'] == 'paused':
+                        next_status = 'paused'
+                decision.update({'continue': owns_projection and next_status == 'active', 'task_status': task['status'],
+                                 'reason': '审批后任务已结束，已同步自动化结果', 'approval_reconciled': True,
+                                 'artifact_count': len(artifacts)})
+                conn.execute("""UPDATE loop_runs SET status=?,finished_at=?,result_json=?,error_json=?,
+                    output_state_json=?,diff_json=?,decision_json=? WHERE id=?""",
+                    (status, now, db.json_dumps({'task_result': result, 'artifacts': artifacts}), db.json_dumps(error),
+                     db.json_dumps(output), db.json_dumps(diff), db.json_dumps(decision), run['id']))
+                conn.execute("""UPDATE automation_trigger_events SET status=?,error=?,finished_at=?
+                    WHERE id=? AND run_id=? AND status='waiting_approval'""",
+                    (status, str(error.get('message') or ''), now, run['trigger_event_id'], run['id']))
+                if owns_projection:
+                    next_run = next_schedule_at(loop) if next_status == 'active' and loop['trigger_type'] in {'interval', 'cron'} else ''
+                    conn.execute("""UPDATE loops SET status=?,consecutive_failures=?,next_run_at=?,state_json=?,
+                        last_diff_json=?,last_run_at=?,updated_at=?,run_count=MAX(run_count,?) WHERE id=?""",
+                        (next_status, failures, next_run, db.json_dumps(output), db.json_dumps(diff), now, now, run['run_number'], loop['id']))
+                    self._notify(loop, '自动化审批结果已同步', decision['reason'],
+                                 {'run_id': run['id'], 'run_number': run['run_number'], 'status': next_status}, connection=conn)
+
     def is_busy(self, loop_id: str) -> bool:
+        if task_queue.enabled() and not self.worker_execution and db.query_one("SELECT job_id FROM automation_dispatch WHERE loop_id=? AND status IN ('queued','running')", (loop_id,)):
+            return True
         return loop_id in self._pending or loop_id in self._active
 
     def dispatch_once(
@@ -386,6 +459,13 @@ class LoopScheduler:
         """Queue one logical iteration without keeping the HTTP request open."""
         if self.is_busy(loop_id):
             raise RuntimeError("这个自动化正在执行，请勿重复运行")
+        if task_queue.enabled() and not self.worker_execution:
+            job_id = 'automation_' + uuid.uuid4().hex
+            payload = {'kind': 'automation', 'job_id': job_id, 'dispatch_id': job_id, 'loop_id': loop_id, 'scheduled': scheduled, 'trigger_event_id': trigger_event_id, 'trigger_type': trigger_type}
+            db.execute("INSERT INTO automation_dispatch(job_id,loop_id,payload_json,created_at) VALUES(?,?,?,?)", (job_id, loop_id, db.json_dumps(payload), db.utc_now()))
+            async def accepted():
+                return {'accepted': True, 'job_id': job_id}
+            return asyncio.create_task(accepted())
         self._pending.add(loop_id)
 
         async def dispatched() -> dict[str, Any]:
@@ -430,8 +510,9 @@ class LoopScheduler:
         return base64.b64decode(secret_store.decrypt(encrypted).encode("ascii"), validate=True)
 
     @staticmethod
-    def _notify(loop: dict[str, Any], title: str, content: str, data: dict[str, Any]) -> None:
-        db.execute(
+    def _notify(loop: dict[str, Any], title: str, content: str, data: dict[str, Any], *, connection: Any = None) -> None:
+        execute = connection.execute if connection is not None else db.execute
+        execute(
             """INSERT INTO notifications(
                    id, organization_id, workspace_id, user_id, kind, title, content,
                    data_json, status, entity_type, entity_id, created_at
@@ -443,27 +524,29 @@ class LoopScheduler:
             ),
         )
 
-    def recover_interrupted_runs(self) -> set[str]:
+    def recover_interrupted_runs(self, *, exclude_loop_ids: set[str] | None = None, error: dict[str, Any] | None = None) -> set[str]:
         """Close orphaned loop attempts and pause their parent automations safely."""
         rows = db.query_all("SELECT * FROM loop_runs WHERE status = 'running' ORDER BY started_at")
         interrupted_tasks: set[str] = set()
         affected: dict[str, int] = {}
         now = db.utc_now()
+        recovery_error = error or {"message": "平台服务重启，本次自动化尝试已中断", "error_type": "ServiceRestart"}
         for row in rows:
+            if row['loop_id'] in (exclude_loop_ids or set()):
+                continue
             interrupted_tasks.add(str(row.get("task_id") or ""))
             affected[row["loop_id"]] = max(affected.get(row["loop_id"], 0), int(row["run_number"]))
-            error = {"message": "平台服务重启，本次自动化尝试已中断", "error_type": "ServiceRestart"}
-            decision = {"continue": False, "reason": error["message"], "task_status": "failed", "interrupted": True}
+            decision = {"continue": False, "reason": recovery_error["message"], "task_status": "failed", "interrupted": True}
             db.execute(
                 """UPDATE loop_runs SET status = 'failed', finished_at = ?, error_json = ?,
                        result_json = ?, decision_json = ? WHERE id = ?""",
-                (now, db.json_dumps(error), db.json_dumps({"error": error["message"]}), db.json_dumps(decision), row["id"]),
+                (now, db.json_dumps(recovery_error), db.json_dumps({"error": recovery_error["message"]}), db.json_dumps(decision), row["id"]),
             )
             if row.get("trigger_event_id"):
                 db.execute(
                     """UPDATE automation_trigger_events SET status = 'failed', error = ?, finished_at = ?
                        WHERE id = ? AND status = 'running'""",
-                    (error["message"], now, row["trigger_event_id"]),
+                    (recovery_error["message"], now, row["trigger_event_id"]),
                 )
         for loop_id, run_number in affected.items():
             loop = db.query_one("SELECT * FROM loops WHERE id = ?", (loop_id,))
@@ -475,16 +558,18 @@ class LoopScheduler:
                    WHERE id = ?""",
                 (max(int(loop.get("run_count") or 0), run_number), now, now, loop_id),
             )
-            self._notify(loop, "自动化因服务重启暂停", "检测到未完成的执行尝试，请确认后重新启动。", {"run_number": run_number})
+            self._notify(loop, "自动化执行中断暂停" if error else "自动化因服务重启暂停", recovery_error['message'], {"run_number": run_number})
         # Legacy rows may have a running parent without a surviving run row.
+        exclusions = tuple(exclude_loop_ids or ())
+        placeholders = ','.join('?' for _ in exclusions) or "''"
         db.execute(
-            "UPDATE loops SET status = 'paused', next_run_at = '', updated_at = ? WHERE status = 'running'",
-            (now,),
+            f"UPDATE loops SET status = 'paused', next_run_at = '', updated_at = ? WHERE status = 'running' AND id NOT IN ({placeholders})",
+            (now, *exclusions),
         )
         db.execute(
-            """UPDATE automation_trigger_events SET status = 'failed', error = ?, finished_at = ?
-               WHERE status = 'running'""",
-            ("平台服务重启，触发事件对应的执行已中断", now),
+            f"""UPDATE automation_trigger_events SET status = 'failed', error = ?, finished_at = ?
+               WHERE status = 'running' AND loop_id NOT IN ({placeholders})""",
+            (recovery_error['message'], now, *exclusions),
         )
         return {task_id for task_id in interrupted_tasks if task_id}
 
@@ -514,7 +599,7 @@ class LoopScheduler:
             title = message.strip().replace("\n", " ")[:60] or "新任务"
             scope_org = loop.get("organization_id") or "local-org"
             scope_user = loop.get("user_id") or "local-user"
-            workspace = f"loop:{loop['id']}"
+            workspace = (loop.get('workspace_id') or 'default') if self.worker_execution else f"loop:{loop['id']}"
             metadata = {
                 "trigger": "automation",
                 "automation_run": True,
@@ -526,6 +611,8 @@ class LoopScheduler:
                 "organization_id": scope_org,
                 "user_id": scope_user,
             }
+            if self.worker_execution:
+                metadata['dispatch_backend'] = 'redis'
             with self.task_state.transaction(write=True) as conn:
                 conn.execute(
                     """INSERT INTO loop_runs(
@@ -746,6 +833,7 @@ class LoopScheduler:
             finished_at = db.utc_now()
             decision = {
                 "continue": next_status == "active", "reason": reason,
+                "previous_status": previous_status,
                 "task_status": final["task_status"], "goal_complete": goal_complete,
                 "artifact_count": len(final["artifacts"]),
                 "attempts": int(

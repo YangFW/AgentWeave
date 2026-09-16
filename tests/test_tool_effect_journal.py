@@ -107,6 +107,17 @@ class ToolEffectJournalTests(unittest.TestCase):
             safe_arguments=arguments or {"message": "hello"},
         )
 
+    def test_api_restart_preserves_effect_owned_by_live_worker(self) -> None:
+        protected = self._prepare(run_id="worker-run", effect_kind="idempotent_write")
+        local = self._prepare(run_id="local-run", effect_kind="idempotent_write", operation_key="other-call")
+        for row, owner in ((protected, "worker-run"), (local, "local-run")):
+            self.journal.acquire_effect(row["effect_key"], run_id=owner, worker_id=owner, lease_seconds=60)
+        recovered = self.journal.recover_interrupted_executions(exclude_run_ids={"worker-run"})
+        self.assertEqual([row["effect_key"] for row in recovered], [local["effect_key"]])
+        with self._connect() as connection:
+            state = connection.execute("SELECT state FROM tool_effects WHERE effect_key=?", (protected["effect_key"],)).fetchone()[0]
+        self.assertEqual(state, "executing")
+
     def test_stable_effect_key_crosses_runs_but_preserves_logical_call_slots(self) -> None:
         first = self._prepare(run_id="run-1", effect_kind="idempotent_write")
         second = self._prepare(run_id="run-2", effect_kind="idempotent_write")

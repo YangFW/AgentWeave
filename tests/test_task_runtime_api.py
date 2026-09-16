@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -49,6 +50,72 @@ class TaskRuntimeApiTests(unittest.TestCase):
         self.scheduler_stop_patch.start()
         self.client_context = TestClient(main_module.app)
         self.client = self.client_context.__enter__()
+
+    @unittest.skipUnless(os.getenv("APP_TEST_REDIS_URL"), "需要独立测试 Redis")
+    def test_redis_sse_replays_database_events_without_notification(self):
+        task = create_task_record("事件补发", "general-agent")
+        first = db.insert_event(task["id"], "answer", "回答", "first")
+        second = db.insert_event(task["id"], "answer", "回答", "second")
+        db.update_task_status(task["id"], "completed")
+        # 消息已落库且从未 publish，仍须按游标补发，不能依赖 Pub/Sub 历史。
+        with patch.dict(os.environ, {"REDIS_URL": os.environ["APP_TEST_REDIS_URL"]}):
+            result = self.client.get(f"/api/tasks/{task['id']}/events/stream", params={"after_id": first})
+        self.assertEqual(result.status_code, 200)
+        self.assertIn(f"id: {second}\n", result.text)
+        self.assertNotIn(f"id: {first}\n", result.text)
+        self.assertIn('second', result.text)
+
+    def test_attachment_limits_reject_without_creating_partial_task(self):
+        before = len(db.query_all('SELECT id FROM tasks'))
+        response = self.client.post('/api/tasks', json={'message': 'test', 'attachment_ids': [f'upload-{index}' for index in range(11)]})
+        self.assertEqual(response.status_code, 422)
+        response = self.client.post('/api/tasks', json={'message': 'test', 'attachment_ids': ['same-upload', 'same-upload']})
+        self.assertEqual(response.status_code, 422)
+        response = self.client.post('/api/tasks', json={'message': 'test', 'attachment_ids': ['missing-upload']})
+        self.assertEqual(response.status_code, 404)
+        for index in range(2):
+            db.execute('INSERT INTO uploads(id,name,path,size,created_at) VALUES(?,?,?,?,?)', (f'large-{index}', 'large.txt', 'unused', 30 * 1024 * 1024, db.utc_now()))
+        response = self.client.post('/api/tasks', json={'message': 'test', 'attachment_ids': ['large-0', 'large-1']})
+        self.assertEqual(response.status_code, 413)
+        self.assertEqual(len(db.query_all('SELECT id FROM tasks')), before)
+
+    def test_task_run_and_outbox_rollback_as_one_submission(self):
+        for table in ('task_runs', 'dispatch_outbox'):
+            with self.subTest(table=table):
+                before = {name: len(db.query_all(f'SELECT * FROM {name}')) for name in ('tasks', 'task_runs', 'dispatch_outbox')}
+                db.execute(f"CREATE TRIGGER reject_submission BEFORE INSERT ON {table} BEGIN SELECT RAISE(ABORT,'test rollback'); END")
+                try:
+                    with patch.dict(os.environ, {'REDIS_URL': 'redis://127.0.0.1:1/0'}):
+                        with self.assertRaises(sqlite3.IntegrityError):
+                            self.client.post('/api/tasks', json={'message': 'test atomic submission', 'model_id': 'deterministic'})
+                finally:
+                    db.execute('DROP TRIGGER reject_submission')
+                after = {name: len(db.query_all(f'SELECT * FROM {name}')) for name in before}
+                self.assertEqual(after, before)
+
+    def test_submission_key_reuses_task_and_rejects_conflicting_payload(self):
+        headers = {'Idempotency-Key': 'stable-submission'}
+        payload = {'message': '你好', 'model_id': 'deterministic'}
+        with patch.object(main_module, '_schedule_runtime') as schedule:
+            first = self.client.post('/api/tasks', json=payload, headers=headers)
+            second = self.client.post('/api/tasks', json=payload, headers=headers)
+            conflict = self.client.post('/api/tasks', json={**payload, 'message': 'different'}, headers=headers)
+        self.assertEqual(first.status_code, 200, first.text)
+        self.assertEqual(second.status_code, 200, second.text)
+        self.assertEqual(first.json()['id'], second.json()['id'])
+        self.assertEqual(first.json()['run']['id'], second.json()['run']['id'])
+        self.assertEqual(conflict.status_code, 409)
+        schedule.assert_called_once()
+        self.assertEqual(len(db.query_all('SELECT * FROM task_submissions')), 1)
+
+    def test_task_and_event_expose_contract_version(self):
+        task = create_task_record('versioned task','general-agent')
+        db.insert_event(task['id'],'answer','回答','versioned answer')
+        task_response = self.client.get('/api/tasks/'+task['id'])
+        events = self.client.get(f"/api/tasks/{task['id']}/events").json()
+        self.assertEqual(task_response.json()['schema_version'],1)
+        self.assertEqual(events[0]['schema_version'],1)
+        self.assertEqual(task_response.json()['status'],'queued')
 
     def tearDown(self) -> None:
         self.client_context.__exit__(None, None, None)

@@ -376,6 +376,48 @@ class MemoryRuntimeIntegrationTests(unittest.IsolatedAsyncioTestCase):
             )
         ]
 
+    async def test_orchestrator_goal_receives_current_attachment(self) -> None:
+        model = RecordingModelGateway()
+        runtime = self._runtime(model)
+        path = Path(self.temp_dir.name) / 'review.txt'
+        path.write_text('ATTACHMENT_EVIDENCE: 产品技术安全评审资料', encoding='utf-8')
+        task = create_task_record('请评审附件', 'general-agent', attachments=[{'id': 'review-source', 'name': path.name, 'path': str(path), 'size': path.stat().st_size}])
+        await runtime.resolve_task_goal(task)
+        self.assertEqual(model.intent_calls[-1]['message'], '请评审附件')
+        history = '\n'.join(item['content'] for item in model.intent_calls[-1]['history'])
+        self.assertIn('ATTACHMENT_EVIDENCE', history)
+
+    async def test_worker_uses_persisted_scope_for_memory_and_knowledge(self) -> None:
+        from app.services import auth_service
+        from app.worker import execute_with_deadline
+
+        model = RecordingModelGateway()
+        runtime = self._runtime(model)
+        cases = [('alice', 'workspace-a', 'OWN'), ('bob', 'workspace-a', 'OTHER_USER'), ('alice', 'workspace-b', 'OTHER_WORKSPACE')]
+        for user, workspace, marker in cases:
+            scope = ExecutionScope('org-memory-runtime', workspace, user, 'general-agent', 'same-conversation')
+            self.context_service.create_memory(scope, scope_type='user', content=f'MEMORY_{marker}: release 要求')
+            base = runtime.knowledge_service.create_base(scope, name=f'知识库 {marker}', visibility='private')
+            path = Path(self.temp_dir.name) / f'{marker}.txt'
+            content = f'release 的验收要求：KNOWLEDGE_{marker}'
+            path.write_text(content, encoding='utf-8')
+            runtime.knowledge_service.index_upload(base['id'], scope, upload={'id': f'upload-{marker}', 'name': path.name, 'path': str(path), 'size': path.stat().st_size, 'content_type': 'text/plain'})
+
+        task = self._task('请概括 release 的验收要求', user_id='alice', workspace='workspace-a', conversation_id='same-conversation')
+        run = self.task_state.create_run(task['id'], metadata={'dispatch_backend': 'redis'})
+        # 模拟后台协程意外继承另一请求身份；资源上下文仍须来自持久任务。
+        token = auth_service.current_identity.set({'user_id': 'bob', 'role': 'user'})
+        try:
+            await execute_with_deadline(runtime, task['id'], run['id'], runtime.run_task(task['id'], run_id=run['id']), 10)
+        finally:
+            auth_service.current_identity.reset(token)
+        self.assertEqual(self.task_state.get_run(run['id'])['status'], 'completed')
+        prompt = '\n'.join(item['prompt'] + item['system_prompt'] for item in model.solve_calls)
+        self.assertIn('MEMORY_OWN', prompt)
+        self.assertIn('KNOWLEDGE_OWN', prompt)
+        self.assertNotIn('OTHER_USER', prompt)
+        self.assertNotIn('OTHER_WORKSPACE', prompt)
+
     async def test_chat_remember_injects_across_conversations_isolates_and_forget_stops_it(self) -> None:
         memory_content = "以后普通回答都使用简体中文，并在结尾注明验收完成"
         remember_model = RecordingModelGateway()

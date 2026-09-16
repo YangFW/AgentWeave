@@ -896,7 +896,8 @@ class ToolEffectJournal:
             return self._row(updated) or {}
 
     def recover_interrupted_executions(
-        self, *, reason: str = "service_restart"
+        self, *, reason: str = "service_restart", exclude_run_ids: set[str] | None = None,
+        only_run_ids: set[str] | None = None,
     ) -> list[dict[str, Any]]:
         """Move every in-process claim to ``unknown`` during startup recovery."""
 
@@ -908,6 +909,10 @@ class ToolEffectJournal:
                 "SELECT * FROM tool_effects WHERE state = 'executing' ORDER BY created_at"
             ).fetchall()
             for row in rows:
+                if str(row["owner_run_id"]) in (exclude_run_ids or set()):
+                    continue
+                if only_run_ids is not None and str(row["owner_run_id"]) not in only_run_ids:
+                    continue
                 updated = self._set_unknown_locked(
                     conn,
                     row,

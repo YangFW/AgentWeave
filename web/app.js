@@ -19,11 +19,18 @@ function writePreference(name, value) {
 }
 
 const state = {
+  pendingSubmission: null,
+  currentUser: null,
+  adminUsers: [],
+  adminSelectedUser: null,
+  authenticated: false,
+  authEnabled: false,
   skills: [],
   mcp: [],
   agents: [],
   tasks: [],
   models: [],
+  executionEngines: [],
   loops: [],
   workspaces: [],
   memories: [],
@@ -55,6 +62,7 @@ const state = {
   selectedMcp: null,
   selectedAgent: null,
   selectedModel: null,
+  selectedExecutionEngine: null,
   selectedWorkspace: null,
   selectedLoop: null,
   selectedMemory: null,
@@ -117,10 +125,16 @@ function createConversationId() {
 async function api(path, options = {}) {
   const isForm = options.body instanceof FormData;
   const res = await fetch(path, {
-    headers: { ...(isForm ? {} : { 'Content-Type': 'application/json' }), ...(options.headers || {}) },
     ...options,
+    headers: { ...(isForm ? {} : { 'Content-Type': 'application/json' }), ...(options.headers || {}) },
   });
   if (!res.ok) {
+    if (res.status === 401 && state.authenticated) {
+      state.authenticated = false;
+      document.body.classList.add('auth-pending');
+      state.eventSource?.close();
+      location.reload();
+    }
     const text = await res.text();
     let message = text || res.statusText;
     try {
@@ -505,7 +519,20 @@ function recordThinkingActivity(item, type, event = {}, data = {}) {
       activity = { key: 'answer:stream', kind: 'output', label: '正在输出结果…', detail: `${item.answerChars} 字`, status: 'running' };
       break;
     case 'answer':
-      activity = { key: eventKey, kind: 'output', label: '已生成最终答复', detail: content, status: 'completed' };
+      {
+        let label = '已生成最终答复';
+        if (data.engine && data.engine !== 'builtin') {
+          const engName = data.engine.toUpperCase();
+          label = `${engName} 沙箱已生成答复`;
+          if (data.session_id) {
+            label += ` · 会话: ${data.session_id.slice(0, 8)}`;
+          }
+          if (data.resumed_session) {
+            label += ' (上下文已延续)';
+          }
+        }
+        activity = { key: eventKey, kind: 'output', label, detail: content, status: 'completed' };
+      }
       break;
     case 'approval_required': case 'clarification':
       activity = { key: eventKey, kind: 'goal', label: type === 'approval_required' ? '等待你的确认' : '需要补充信息', detail: content || '补充后将继续当前任务', status: 'waiting' };
@@ -851,6 +878,10 @@ function switchTab(tab) {
     loadArtifactsOnly({ preserveSelection: true }).catch((err) => notify(`产物刷新失败：${err.message || err}`, 'error'));
   } else if (tab === 'loops') {
     loadLoopsOnly().catch((err) => notify(`自动化刷新失败：${err.message || err}`, 'error'));
+  } else if (tab === 'users') {
+    loadAdminUsers().catch((err) => notify(err.message, 'error'));
+  } else if (tab === 'engines') {
+    loadExecutionEnginesOnly({ preserveSelection: true }).catch((err) => notify(`执行引擎刷新失败：${err.message || err}`, 'error'));
   }
 }
 
@@ -899,12 +930,13 @@ function renderWorkspaceSelect() {
 }
 
 async function loadAll() {
-  const [skills, mcp, agents, tasks, models, loops, workspaces, capabilities, marketplace] = await Promise.all([
+  const [skills, mcp, agents, tasks, models, executionEngines, loops, workspaces, capabilities, marketplace] = await Promise.all([
     api('/api/skills'),
     api('/api/mcp'),
-    api('/api/agents'),
+    api(`/api/agents?workspace_id=${encodeURIComponent(currentWorkspaceId())}`),
     api(`/api/tasks?${new URLSearchParams(platformScopeValues()).toString()}`),
     api('/api/models'),
+    api('/api/execution-engines'),
     api(`/api/loops?${new URLSearchParams(platformScopeValues()).toString()}`),
     api(`/api/workspaces?${workspaceQuery()}`),
     api('/api/capabilities'),
@@ -915,6 +947,7 @@ async function loadAll() {
   state.agents = agents;
   state.tasks = tasks;
   state.models = models;
+  state.executionEngines = executionEngines;
   state.loops = loops;
   state.workspaces = workspaces;
   state.capabilities = capabilities;
@@ -929,6 +962,8 @@ async function loadAll() {
   renderAgents();
   renderTasks();
   renderModels();
+  renderExecutionEngines();
+  renderExecutionEngineSelect();
   renderLoops();
   renderCapabilities();
   renderMarketplace();
@@ -970,6 +1005,21 @@ async function loadAll() {
     $('expertInstallationList').innerHTML = '<div class="meta empty">暂时无法读取已安装专家。</div>';
     $('expertTeamList').innerHTML = '<div class="meta empty">专家团服务暂不可用，请稍后刷新。</div>';
     resetExpertRunLive('暂时无法读取团队运行。');
+  }
+  await refreshExecutionMode();
+}
+
+async function refreshExecutionMode() {
+  const notice = $('runtimeModeNotice');
+  if (!notice) return;
+  try {
+    const response = await fetch('/api/readiness');
+    const status = await response.json();
+    notice.textContent = status.mode === 'local'
+      ? '当前为本地开发模式，不适合多人共享部署。'
+      : status.ready ? '任务执行服务已就绪。' : '任务执行服务暂未就绪，新任务可能需要等待。';
+  } catch (error) {
+    notice.textContent = '暂时无法检查任务执行服务，请刷新重试。';
   }
 }
 
@@ -1053,6 +1103,7 @@ function renderTaskModelSelect() {
   if (ready.some((m) => m.id === preferred)) select.value = preferred;
   else if (ready.length) select.value = ready[0].id;
   renderWorkbenchModelStatus();
+  renderExecutionEngineSelect();
 }
 
 function currentWorkbenchModel() {
@@ -1306,9 +1357,7 @@ async function sendTask() {
   }
   $('messageInput').value = '';
   try {
-    const task = await api('/api/tasks', {
-      method: 'POST',
-      body: JSON.stringify({
+    const submissionBody = JSON.stringify({
         message,
         agent_id: $('agentSelect').value,
         model_id: $('taskModelSelect').value,
@@ -1319,8 +1368,17 @@ async function sendTask() {
         executor_type: expertMode ? 'team' : 'agent',
         executor_id: expertMode ? ($('expertTeamSelect').value || null) : $('agentSelect').value,
         attachment_ids: state.uploads.map((x) => x.id),
-      }),
+        execution_engine: $('executionEngineSelect')?.value || 'builtin',
+      });
+    if (state.pendingSubmission?.body !== submissionBody) {
+      state.pendingSubmission = {body: submissionBody, key: createConversationId()};
+    }
+    const task = await api('/api/tasks', {
+      method: 'POST',
+      headers: {'Idempotency-Key': state.pendingSubmission.key},
+      body: submissionBody,
     });
+    state.pendingSubmission = null;
     state.uploads = [];
     renderUploads();
     state.currentTask = task;
@@ -1353,6 +1411,7 @@ async function sendTask() {
     // selected model became unavailable after the page was loaded).  Keep the
     // temporary “正在提交” status from trapping the send button in running
     // mode, and distinguish this from a failure inside an existing task.
+    if (!$('messageInput').value) $('messageInput').value = message;
     finishSubmissionFailure(err.message || err);
   }
 }
@@ -2712,13 +2771,21 @@ function renderArtifacts(artifacts) {
 }
 
 function renderSkills() {
-  $('skillList').innerHTML = state.skills.map((s) => `
-    <div class="card ${state.selectedSkill?.id === s.id ? 'active' : ''}" data-skill="${escapeHtml(s.id)}">
+  const keyword = String($('skillSearch')?.value || '').trim().toLowerCase();
+  const showDisabled = !!$('skillShowDisabled')?.checked;
+  const visible = state.skills.filter((s) => {
+    if (!showDisabled && !s.enabled) return false;
+    if (!keyword) return true;
+    return [s.name, s.id, s.description, s.category].some((value) => String(value || '').toLowerCase().includes(keyword));
+  });
+  if ($('skillCount')) $('skillCount').textContent = `${visible.length}/${state.skills.length}`;
+  $('skillList').innerHTML = visible.map((s) => `
+    <div class="card skill-card ${state.selectedSkill?.id === s.id ? 'active' : ''} ${s.enabled ? '' : 'disabled'}" data-skill="${escapeHtml(s.id)}">
       <div class="card-title"><span>${escapeHtml(s.name)}</span><span class="status">${s.enabled ? 'enabled' : 'disabled'}</span></div>
       <div class="card-desc">${escapeHtml(s.description)}</div>
       <div class="small">${escapeHtml(s.id)} · ${escapeHtml(s.category)} · ${escapeHtml(s.version)} · ${s.file_count || 0} files</div>
     </div>
-  `).join('');
+  `).join('') || `<div class="meta empty">${keyword ? '没有匹配的技能。' : (showDisabled ? '还没有技能。' : '没有启用的技能。')}</div>`;
   document.querySelectorAll('[data-skill]').forEach((el) => el.onclick = () => selectSkill(el.dataset.skill));
 }
 
@@ -3032,7 +3099,15 @@ async function invokeTool() {
 }
 
 function renderAgents() {
-  $('agentList').innerHTML = state.agents.map((a) => `
+  const keyword = String($('agentSearch')?.value || '').trim().toLowerCase();
+  const showDisabled = !!$('agentShowDisabled')?.checked;
+  const visible = state.agents.filter((a) => {
+    if (!showDisabled && a.enabled === false) return false;
+    if (!keyword) return true;
+    return [a.name, a.id, a.description].some((value) => String(value || '').toLowerCase().includes(keyword));
+  });
+  $('agentCount').textContent = `${visible.length}/${state.agents.length}`;
+  $('agentList').innerHTML = visible.map((a) => `
     <div class="agent-card ${state.selectedAgent?.id === a.id ? 'active' : ''}" data-agent="${escapeHtml(a.id)}">
       <div class="agent-card-head">
         <div class="agent-avatar ${agentAvatarTone(a)}">${agentIconSvg(a)}</div>
@@ -3046,13 +3121,13 @@ function renderAgents() {
         <strong>权限</strong><span>${escapeHtml(formatJson(a.permissions || {}))}</span>
       </div>
     </div>
-  `).join('');
+  `).join('') || `<div class="meta empty">${keyword ? '没有匹配的智能体。' : '还没有智能体。'}</div>`;
   document.querySelectorAll('[data-agent]').forEach((el) => el.onclick = () => selectAgent(el.dataset.agent));
 }
 
 function newAgent() { state.selectedAgent = null; $('agentEditorTitle').textContent = '新建智能体'; $('agentId').disabled = false; $('agentId').value = 'custom-agent'; $('agentName').value = '我的智能体'; $('agentDescription').value = ''; $('agentPrompt').value = '请理解用户目标，优先使用已配置的技能和工具完成任务。'; $('agentSkills').value = 'general_task,report_generation'; $('agentMcps').value = 'report'; $('agentPermissions').value = '{}'; $('agentModel').value = 'deterministic'; renderAgents(); }
 function selectAgent(id) { const a = state.agents.find((x) => x.id === id); if (!a) return; state.selectedAgent = a; $('agentEditorTitle').textContent = a.name; $('agentId').disabled = true; $('agentId').value = a.id; $('agentName').value = a.name; $('agentDescription').value = a.description; $('agentPrompt').value = a.system_prompt; $('agentSkills').value = (a.skills || []).join(','); $('agentMcps').value = (a.mcp_servers || []).join(','); $('agentPermissions').value = formatJson(a.permissions || {}); $('agentModel').value = a.model; renderAgents(); }
-async function saveAgent() { const list = (id) => $(id).value.split(',').map((x) => x.trim()).filter(Boolean); const payload = { id: $('agentId').value.trim(), name: $('agentName').value.trim(), description: $('agentDescription').value.trim(), model: $('agentModel').value, system_prompt: $('agentPrompt').value, skills: list('agentSkills'), mcp_servers: list('agentMcps'), permissions: JSON.parse($('agentPermissions').value || '{}') }; if (state.selectedAgent) await api(`/api/agents/${state.selectedAgent.id}`, { method: 'PUT', body: JSON.stringify(payload) }); else await api('/api/agents', { method: 'POST', body: JSON.stringify(payload) }); state.agents = await api('/api/agents'); renderAgentsSelect(); selectAgent(payload.id); }
+async function saveAgent() { const list = (id) => $(id).value.split(',').map((x) => x.trim()).filter(Boolean); const payload = { id: $('agentId').value.trim(), name: $('agentName').value.trim(), description: $('agentDescription').value.trim(), model: $('agentModel').value, system_prompt: $('agentPrompt').value, skills: list('agentSkills'), mcp_servers: list('agentMcps'), permissions: JSON.parse($('agentPermissions').value || '{}') }; if (state.selectedAgent) await api(`/api/agents/${state.selectedAgent.id}`, { method: 'PUT', body: JSON.stringify(payload) }); else await api('/api/agents', { method: 'POST', body: JSON.stringify(payload) }); state.agents = await api(`/api/agents?workspace_id=${encodeURIComponent(currentWorkspaceId())}`); renderAgentsSelect(); selectAgent(payload.id); }
 
 function renderWorkspaceModelOptions() {
   const agentSelect = $('workspaceDefaultAgent');
@@ -3063,20 +3138,28 @@ function renderWorkspaceModelOptions() {
 
 function renderWorkspaces() {
   renderWorkspaceModelOptions();
-  $('workspaceCount').textContent = String(state.workspaces.length);
-  $('workspaceList').innerHTML = state.workspaces.map((item) => `
+  const keyword = String($('workspaceSearch')?.value || '').trim().toLowerCase();
+  const showDisabled = !!$('workspaceShowDisabled')?.checked;
+  const visible = state.workspaces.filter((item) => {
+    if (!showDisabled && !item.enabled) return false;
+    if (!keyword) return true;
+    return [item.name, item.id, item.description].some((value) => String(value || '').toLowerCase().includes(keyword));
+  });
+  $('workspaceCount').textContent = `${visible.length}/${state.workspaces.length}`;
+  $('workspaceList').innerHTML = visible.map((item) => `
     <div class="card workspace-card ${state.selectedWorkspace?.id === item.id ? 'active' : ''} ${item.enabled ? '' : 'disabled'}" data-workspace="${escapeHtml(item.id)}">
       <div class="card-title"><span>${escapeHtml(item.name)}</span><span class="status ${item.enabled ? 'completed' : ''}">${item.enabled ? '已启用' : '已停用'}</span></div>
       <div class="card-desc">${escapeHtml(item.description || '暂无描述')}</div>
       <div class="memory-card-meta"><span>${escapeHtml(item.id)}</span><span>智能体 ${escapeHtml(item.default_agent_id || 'general-agent')}</span><span>模型 ${escapeHtml(item.default_model_id || 'deterministic')}</span></div>
     </div>
-  `).join('') || '<div class="meta empty">还没有项目。</div>';
+  `).join('') || `<div class="meta empty">${keyword ? '没有匹配的项目。' : '还没有项目。'}</div>`;
   document.querySelectorAll('[data-workspace]').forEach((element) => {
     element.onclick = () => selectWorkspaceEditor(element.dataset.workspace);
   });
 }
 
 function newWorkspace() {
+  $('workspaceMembersPanel').classList.add('hidden');
   state.selectedWorkspace = null;
   renderWorkspaces();
   $('workspaceEditorTitle').textContent = '新建项目';
@@ -3113,6 +3196,53 @@ function selectWorkspaceEditor(id, { activate = true } = {}) {
   $('workspaceSettings').value = formatJson(item.settings || {});
   $('workspaceEnabled').checked = !!item.enabled;
   $('deleteWorkspaceBtn').classList.toggle('hidden', item.id === 'default' || !item.enabled);
+  const canManage = state.currentUser && (state.currentUser.role === 'admin' || state.currentUser.user_id === item.owner_user_id);
+  $('workspaceMembersPanel').classList.toggle('hidden', !canManage);
+  if (canManage) loadWorkspaceMembers(item.id).catch((error) => { $('workspaceMembersError').textContent = error.message; });
+}
+
+async function loadWorkspaceMembers(workspaceId) {
+  $('workspaceMembersError').textContent = '';
+  const members = await api(`/api/workspaces/${encodeURIComponent(workspaceId)}/members`);
+  if (state.selectedWorkspace?.id !== workspaceId) return;
+  const list = $('workspaceMembersList');
+  list.replaceChildren();
+  for (const member of members) {
+    const row = document.createElement('div');
+    row.className = 'toolbar';
+    const label = document.createElement('span');
+    label.textContent = `${member.username} · ${member.role === 'viewer' ? '只读' : '成员'}`;
+    row.appendChild(label);
+    for (const [text, method, role] of [['切换权限', 'PUT', member.role === 'viewer' ? 'member' : 'viewer'], ['移除', 'DELETE', null]]) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'secondary';
+      button.textContent = text;
+      button.onclick = async () => {
+        button.disabled = true;
+        try {
+          await api(`/api/workspaces/${encodeURIComponent(workspaceId)}/members/${encodeURIComponent(member.user_id)}`, {method, ...(role ? {body: JSON.stringify({role})} : {})});
+          await loadWorkspaceMembers(workspaceId);
+        } catch (error) { $('workspaceMembersError').textContent = error.message; }
+        finally { button.disabled = false; }
+      };
+      row.appendChild(button);
+    }
+    list.appendChild(row);
+  }
+}
+
+async function addWorkspaceMember() {
+  const workspaceId = state.selectedWorkspace?.id;
+  const username = $('workspaceMemberUsername').value.trim();
+  if (!workspaceId || !username) return;
+  $('addWorkspaceMemberBtn').disabled = true;
+  try {
+    await api(`/api/workspaces/${encodeURIComponent(workspaceId)}/members/by-username/${encodeURIComponent(username)}`, {method:'PUT', body:JSON.stringify({role:$('workspaceMemberRole').value})});
+    $('workspaceMemberUsername').value = '';
+    await loadWorkspaceMembers(workspaceId);
+  } catch (error) { $('workspaceMembersError').textContent = error.message; }
+  finally { $('addWorkspaceMemberBtn').disabled = false; }
 }
 
 async function saveWorkspace() {
@@ -3421,7 +3551,7 @@ async function installSelectedExpertTemplate() {
     const installed = await api(`/api/expert-templates/${encodeURIComponent(item.id)}/install`, { method: 'POST', body: JSON.stringify(payload) });
     [state.expertInstallations, state.agents] = await Promise.all([
       api(`/api/expert-installations?${expertQuery()}`),
-      api('/api/agents'),
+      api(`/api/agents?workspace_id=${encodeURIComponent(currentWorkspaceId())}`),
     ]);
     $('expertInstallAgentId').value = '';
     renderExpertInstallations();
@@ -5774,6 +5904,424 @@ async function testModel() {
   } finally { setBusy(button, false); }
 }
 
+
+function canManageExecutionEngines() {
+  if (!state.authEnabled) return true;
+  return state.currentUser?.role === 'admin';
+}
+
+function engineReadinessClass(engine) {
+  const value = engine?.readiness?.state || (engine?.enabled ? 'ready' : 'off');
+  if (value === 'ready') return 'ready';
+  if (value === 'off') return 'off';
+  return 'pending';
+}
+
+function engineReadinessLabel(engine) {
+  return engine?.readiness?.label || (engine?.enabled ? '可用' : '已停用');
+}
+
+function engineCredentialText(engine) {
+  if (engine?.has_api_key) return '已保存加密密钥';
+  if (engine?.api_key_env) return `环境变量：${engine.api_key_env}`;
+  return '尚未配置密钥';
+}
+
+async function loadExecutionEnginesOnly({ preserveSelection = false } = {}) {
+  const previous = preserveSelection ? state.selectedExecutionEngine?.id : null;
+  state.executionEngines = await api('/api/execution-engines');
+  renderExecutionEngines();
+  renderExecutionEngineSelect();
+  if (previous && state.executionEngines.some((item) => item.id === previous)) {
+    selectExecutionEngine(previous);
+  }
+  return state.executionEngines;
+}
+
+function syncExecutionEngineModelUi() {
+  const engineSelect = $('executionEngineSelect');
+  const taskModelSelect = $('taskModelSelect');
+  const pill = $('modelStatusPill');
+  if (!engineSelect || !taskModelSelect) return;
+  const val = engineSelect.value;
+  if (val === 'codex' || val === 'claude' || val === 'container') {
+    taskModelSelect.disabled = true;
+    taskModelSelect.title = `当前由 ${val.toUpperCase()} 独立容器沙箱执行，使用引擎自身独立配置的模型与环境。`;
+    if (pill) {
+      pill.textContent = val === 'codex' ? 'Codex (容器引擎)' : val === 'claude' ? 'Claude (容器引擎)' : '自定义容器引擎';
+      pill.className = 'model-status-pill ready';
+      pill.title = '当前由三方容器沙箱执行，模型在“执行引擎”标签页中配置';
+    }
+  } else {
+    taskModelSelect.disabled = false;
+    taskModelSelect.title = '选择内置智能体模型';
+    renderWorkbenchModelStatus();
+  }
+}
+
+function renderExecutionEngineSelect() {
+  const select = $('executionEngineSelect');
+  if (!select) return;
+  const remembered = select.value || readPreference('execution-engine') || 'builtin';
+  const engines = state.executionEngines || [];
+  const options = [
+    { id: 'builtin', name: '内置智能体引擎', enabled: true, ready: true },
+    ...engines.map((engine) => ({
+      id: engine.id,
+      name: engine.name,
+      enabled: !!engine.enabled,
+      ready: (engine.readiness?.state || 'ready') === 'ready',
+    })),
+    { id: 'container', name: '自定义容器沙箱', enabled: true, ready: true },
+  ];
+  select.innerHTML = options.map((item) => {
+    const disabled = !item.enabled;
+    const label = disabled ? `${item.name} · 已停用` : item.name;
+    return `<option value="${escapeHtml(item.id)}" ${disabled ? 'disabled' : ''}>${escapeHtml(label)}</option>`;
+  }).join('');
+  const available = options.filter((item) => item.enabled);
+  const preferred = available.some((item) => item.id === remembered) ? remembered : 'builtin';
+  select.value = preferred;
+  syncExecutionEngineModelUi();
+}
+
+function renderExecutionEngines() {
+  if (!$('engineList')) return;
+  const engines = state.executionEngines || [];
+  $('engineCount').textContent = String(engines.length);
+  $('engineList').innerHTML = engines.map((engine) => `
+    <div class="card model-card ${state.selectedExecutionEngine?.id === engine.id ? 'active' : ''}" data-engine="${escapeHtml(engine.id)}">
+      <div class="card-title"><span>${escapeHtml(engine.name)}</span><span class="status ${escapeHtml(engineReadinessClass(engine))}">${escapeHtml(engineReadinessLabel(engine))}</span></div>
+      <div class="card-desc">${escapeHtml(engine.description || engine.kind || '')}</div>
+      <div class="small">${escapeHtml(engineCredentialText(engine))}</div>
+      ${engine.readiness?.detail ? `<div class="model-readiness-detail">${escapeHtml(engine.readiness.detail)}</div>` : ''}
+    </div>
+  `).join('') || '<div class="meta empty">尚未接入执行引擎</div>';
+  document.querySelectorAll('[data-engine]').forEach((el) => {
+    el.onclick = () => selectExecutionEngine(el.dataset.engine);
+  });
+  const canManage = canManageExecutionEngines();
+  ['engineBaseUrl', 'engineModel', 'engineKeyMode', 'engineApiKeyEnv', 'engineApiKey', 'engineEnabled', 'saveEngineBtn'].forEach((id) => {
+    const node = $(id);
+    if (node) node.disabled = !canManage || !state.selectedExecutionEngine;
+  });
+}
+
+function toggleEngineKeyMode() {
+  const direct = $('engineKeyMode')?.value === 'direct';
+  $('engineKeyEnvField')?.classList.toggle('hidden', direct);
+  $('engineKeyDirectField')?.classList.toggle('hidden', !direct);
+  if (!$('engineKeyStatus')) return;
+  if (!state.selectedExecutionEngine) {
+    $('engineKeyStatus').textContent = '选择引擎后查看密钥状态';
+    return;
+  }
+  $('engineKeyStatus').textContent = direct
+    ? (state.selectedExecutionEngine.has_api_key ? '本机已保存加密密钥；输入新值可替换，留空保持不变。' : '密钥将在本机加密保存，页面不会回显。')
+    : '平台运行时从服务进程的环境变量读取密钥；这里只保存变量名。';
+}
+
+function selectExecutionEngine(id) {
+  const engine = (state.executionEngines || []).find((item) => item.id === id);
+  if (!engine) return;
+  state.selectedExecutionEngine = engine;
+  renderExecutionEngines();
+  $('engineEditorTitle').textContent = engine.name;
+  $('engineEditorHint').textContent = engine.description || '配置该引擎使用的接口地址和密钥。';
+  $('engineName').value = engine.name;
+  $('engineBaseUrl').value = engine.base_url || '';
+  $('engineModel').value = engine.config?.model || '';
+  $('engineKeyMode').value = engine.api_key_mode || (engine.has_api_key ? 'direct' : 'env');
+  $('engineApiKeyEnv').value = engine.api_key_env || engine.default_api_key_env || '';
+  $('engineApiKey').value = '';
+  $('engineEnabled').checked = !!engine.enabled;
+  $('engineSaveResult').textContent = engine.readiness?.detail || '保存后，新的任务会使用这里的配置。';
+  const canManage = canManageExecutionEngines();
+  ['engineBaseUrl', 'engineModel', 'engineKeyMode', 'engineApiKeyEnv', 'engineApiKey', 'engineEnabled', 'saveEngineBtn'].forEach((fieldId) => {
+    const node = $(fieldId);
+    if (node) node.disabled = !canManage;
+  });
+  toggleEngineKeyMode();
+}
+
+async function saveExecutionEngine() {
+  const engine = state.selectedExecutionEngine;
+  if (!engine) { notify('请先选择一个执行引擎', 'error'); return; }
+  if (!canManageExecutionEngines()) { notify('只有管理员可以修改执行引擎', 'error'); return; }
+  const button = $('saveEngineBtn'); setBusy(button, true);
+  try {
+    const payload = {
+      enabled: $('engineEnabled').checked,
+      base_url: $('engineBaseUrl').value.trim(),
+      api_key_mode: $('engineKeyMode').value,
+      api_key_env: $('engineApiKeyEnv').value.trim(),
+      model: $('engineModel').value.trim(),
+    };
+    if (payload.api_key_mode === 'direct' && $('engineApiKey').value) payload.api_key = $('engineApiKey').value;
+    const saved = await api(`/api/execution-engines/${engine.id}`, { method: 'PUT', body: JSON.stringify(payload) });
+    state.executionEngines = await api('/api/execution-engines');
+    selectExecutionEngine(saved.id);
+    renderExecutionEngineSelect();
+    $('engineApiKey').value = '';
+    $('engineSaveResult').textContent = `已保存“${saved.name}”。新任务会使用当前配置；已在运行的任务不会改动。`;
+    notify(`已保存“${saved.name}”的配置`);
+  } catch (err) {
+    $('engineSaveResult').textContent = `保存失败：${err.message || err}`;
+    notify(`执行引擎保存失败：${err.message || err}`, 'error');
+  } finally { setBusy(button, false); }
+}
+
+
+
+async function openCodexSessionsDialog() {
+  const dialog = $('codexSessionsDialog');
+  if (!dialog) return;
+  dialog.classList.remove('hidden');
+  $('codexSessionsListContainer').classList.remove('hidden');
+  $('codexSessionDetailContainer').classList.add('hidden');
+  const list = $('codexSessionsList');
+  list.innerHTML = '<div class="meta empty">正在加载当前项目的 Codex 历史会话…</div>';
+  try {
+    const wsId = currentWorkspaceId();
+    const sessions = await api(`/api/workspaces/${encodeURIComponent(wsId)}/codex-sessions`);
+    if (!sessions || sessions.length === 0) {
+      list.innerHTML = '<div class="meta empty">当前项目下暂无 Codex 会话记录。在执行引擎中选用 Codex 发送任务后，会话记录将自动保存并出现在这里。</div>';
+      return;
+    }
+    list.innerHTML = sessions.map((s) => `
+      <div class="card model-card" data-codex-session="${escapeHtml(s.session_id)}" style="cursor: pointer; padding: 12px 14px; margin-bottom: 8px;">
+        <div class="card-title">
+          <span><strong>会话 ID: ${escapeHtml(s.session_id.slice(0, 12))}…</strong></span>
+          <span class="status pass">${escapeHtml(s.turn_count || 1)} 轮交互</span>
+        </div>
+        <div class="card-desc" style="font-size: 13px; margin: 4px 0; color: var(--text-color);">
+          ${escapeHtml(s.first_prompt || s.last_reply || '执行会话记录')}
+        </div>
+        <div class="small" style="color: var(--muted); display: flex; justify-content: space-between;">
+          <span>模型: ${escapeHtml(s.model || 'Codex 引擎')}</span>
+          <span>${formatIsoDate(s.updated_at)}</span>
+        </div>
+      </div>
+    `).join('');
+    list.querySelectorAll('[data-codex-session]').forEach((el) => {
+      el.onclick = () => openCodexSessionDetail(el.dataset.codexSession);
+    });
+  } catch (err) {
+    list.innerHTML = `<div class="meta empty">加载会话失败：${escapeHtml(err.message || err)}</div>`;
+  }
+}
+
+async function openCodexSessionDetail(sessionId) {
+  $('codexSessionsListContainer').classList.add('hidden');
+  $('codexSessionDetailContainer').classList.remove('hidden');
+  const messagesBox = $('codexSessionDetailMessages');
+  const metaBox = $('codexSessionDetailMeta');
+  metaBox.textContent = `会话 ID: ${sessionId} (加载中…)`;
+  messagesBox.innerHTML = '<div class="meta empty">正在读取会话历史…</div>';
+  try {
+    const wsId = currentWorkspaceId();
+    const detail = await api(`/api/workspaces/${encodeURIComponent(wsId)}/codex-sessions/${encodeURIComponent(sessionId)}`);
+    metaBox.innerHTML = `<strong>会话 ID:</strong> <code>${escapeHtml(sessionId)}</code> &nbsp;·&nbsp; <strong>模型:</strong> ${escapeHtml(detail.meta?.model || 'gpt-5.2')} &nbsp;·&nbsp; 共 ${detail.messages?.length || 0} 条对话记录`;
+    const msgs = detail.messages || [];
+    if (msgs.length === 0) {
+      messagesBox.innerHTML = '<div class="meta empty">该会话无可见对话记录。</div>';
+      return;
+    }
+    messagesBox.innerHTML = msgs.map((m) => {
+      const isUser = m.role === 'user';
+      return `
+        <div class="message ${isUser ? 'user' : 'assistant'}" style="margin: 4px 0; max-width: 90%; align-self: ${isUser ? 'flex-end' : 'flex-start'};">
+          <div class="message-bubble" style="padding: 10px 14px; border-radius: 8px; background: ${isUser ? 'var(--accent-subtle)' : 'var(--card-bg)'}; border: 1px solid var(--border-color);">
+            <div style="font-size: 11px; color: var(--muted); margin-bottom: 4px;"><strong>${isUser ? '用户指令' : 'Codex 答复'}</strong> ${m.timestamp ? `· ${formatIsoDate(m.timestamp)}` : ''}</div>
+            <div style="white-space: pre-wrap; word-break: break-word;">${escapeHtml(m.content)}</div>
+          </div>
+        </div>
+      `;
+    }).join('');
+  } catch (err) {
+    messagesBox.innerHTML = `<div class="meta empty">读取失败：${escapeHtml(err.message || err)}</div>`;
+  }
+}
+
+async function discoverModelsForModelConfig() {
+  const baseUrl = $('modelBaseUrl')?.value.trim();
+  if (!baseUrl) {
+    notify('请先填写 Base URL', 'error');
+    $('modelBaseUrl')?.focus();
+    return;
+  }
+  const button = $('discoverModelsBtn');
+  setBusy(button, true, '正在获取…');
+  const hint = $('discoveredModelsHint');
+  if (hint) hint.textContent = '正在向上游接口查询模型列表…';
+  try {
+    const payload = {
+      base_url: baseUrl,
+      api_key_mode: $('modelKeyMode')?.value || 'env',
+      api_key_env: $('modelApiKeyEnv')?.value.trim() || '',
+    };
+    if (payload.api_key_mode === 'direct' && $('modelApiKey')?.value) {
+      payload.api_key = $('modelApiKey').value;
+    }
+    if (state.selectedModel?.id) {
+      payload.model_id = state.selectedModel.id;
+    }
+    const result = await api('/api/models/discover', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+    const models = result.models || [];
+    const datalist = $('discoveredModelsList');
+    if (datalist) {
+      datalist.innerHTML = models.map((m) => `<option value="${escapeHtml(m)}"></option>`).join('');
+    }
+    const picker = $('modelPickerSelect');
+    if (picker) {
+      picker.innerHTML = `<option value="">-- 点击直接选择已获取的模型 (${models.length} 个) --</option>` +
+        models.map((m) => `<option value="${escapeHtml(m)}">${escapeHtml(m)}</option>`).join('');
+      picker.classList.remove('hidden');
+      picker.onchange = () => {
+        if (picker.value) {
+          $('modelNameValue').value = picker.value;
+          if (!$('modelId').value || $('modelId').value === 'openai-main' || $('modelId').value.startsWith('model-')) {
+            $('modelId').value = picker.value.toLowerCase().replace(/[^a-z0-9_\-\.]/g, '-');
+            $('modelName').value = picker.value;
+          }
+        }
+      };
+    }
+    const addBtn = $('addDiscoveredModelBtn');
+    if (addBtn) {
+      addBtn.classList.remove('hidden');
+      addBtn.onclick = async () => {
+        const chosenModel = $('modelNameValue').value.trim() || picker?.value;
+        if (!chosenModel) {
+          notify('请先在下拉框中选择或输入一个模型', 'error');
+          return;
+        }
+        const cleanId = chosenModel.toLowerCase().replace(/[^a-z0-9_\-\.]/g, '-');
+        try {
+          setBusy(addBtn, true, '正在添加…');
+          await api('/api/models', {
+            method: 'POST',
+            body: JSON.stringify({
+              id: cleanId,
+              name: chosenModel,
+              model: chosenModel,
+              base_url: $('modelBaseUrl').value.trim(),
+              provider: $('modelProvider').value || 'openai_compatible',
+              api_key_mode: $('modelKeyMode').value,
+              api_key: $('modelApiKey')?.value || '',
+              api_key_env: $('modelApiKeyEnv')?.value.trim() || '',
+              copy_credentials_from: state.selectedModel?.id || 'gpt-5.5',
+              enabled: true,
+            }),
+          });
+          notify(`已成功添加“${chosenModel}”为可用模型`);
+          state.models = await api('/api/models');
+          renderModels();
+          renderTaskModelSelect();
+          selectModel(cleanId);
+        } catch (err) {
+          notify(`添加模型失败：${err.message || err}`, 'error');
+        } finally {
+          setBusy(addBtn, false);
+        }
+      };
+    }
+    if (hint) hint.textContent = `已获取 ${models.length} 个可用模型，可通过下拉菜单直接点击选择。`;
+    if (!$('modelNameValue').value && models.length > 0) {
+      $('modelNameValue').value = models.find((m) => m.includes('gpt-5') || m.includes('gpt-4')) || models[0];
+    }
+    notify(`成功获取 ${models.length} 个可用模型`);
+  } catch (err) {
+    if (hint) hint.textContent = `获取模型失败：${err.message || err}`;
+    notify(`获取可用模型失败：${err.message || err}`, 'error');
+  } finally {
+    setBusy(button, false);
+  }
+}
+
+async function discoverModelsForExecutionEngine() {
+  const baseUrl = $('engineBaseUrl')?.value.trim();
+  if (!baseUrl) {
+    notify('请先填写接口地址 Base URL', 'error');
+    $('engineBaseUrl')?.focus();
+    return;
+  }
+  const button = $('discoverEngineModelsBtn');
+  setBusy(button, true, '正在获取…');
+  const hint = $('discoveredEngineModelsHint');
+  if (hint) hint.textContent = '正在向上游接口查询模型列表…';
+  try {
+    const payload = {
+      base_url: baseUrl,
+      api_key_mode: $('engineKeyMode')?.value || 'env',
+      api_key_env: $('engineApiKeyEnv')?.value.trim() || '',
+    };
+    if (payload.api_key_mode === 'direct' && $('engineApiKey')?.value) {
+      payload.api_key = $('engineApiKey').value;
+    }
+    if (state.selectedExecutionEngine?.id) {
+      payload.engine_id = state.selectedExecutionEngine.id;
+    }
+    const result = await api('/api/models/discover', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+    const models = result.models || [];
+    const datalist = $('discoveredEngineModelsList');
+    if (datalist) {
+      datalist.innerHTML = models.map((m) => `<option value="${escapeHtml(m)}"></option>`).join('');
+    }
+    const picker = $('engineModelPickerSelect');
+    if (picker) {
+      picker.innerHTML = `<option value="">-- 点击直接选择已获取的模型 (${models.length} 个) --</option>` +
+        models.map((m) => `<option value="${escapeHtml(m)}">${escapeHtml(m)}</option>`).join('');
+      picker.classList.remove('hidden');
+      picker.onchange = () => {
+        if (picker.value) {
+          $('engineModel').value = picker.value;
+        }
+      };
+    }
+    if (hint) hint.textContent = `已获取 ${models.length} 个可用模型，可通过下拉菜单直接选择。`;
+    if (!$('engineModel').value && models.length > 0) {
+      $('engineModel').value = models.find((m) => m.includes('gpt-5') || m.includes('gpt-4')) || models[0];
+    }
+    notify(`成功获取 ${models.length} 个可用模型`);
+  } catch (err) {
+    if (hint) hint.textContent = `获取模型失败：${err.message || err}`;
+    notify(`获取可用模型失败：${err.message || err}`, 'error');
+  } finally {
+    setBusy(button, false);
+  }
+}
+
+async function testExecutionEngine() {
+  const engine = state.selectedExecutionEngine;
+  if (!engine) { notify('请先选择一个执行引擎', 'error'); return; }
+  const button = $('testEngineBtn');
+  setBusy(button, true, '正在测试…');
+  $('engineSaveResult').textContent = `正在为 ${engine.name} 启动容器并测试连接…`;
+  try {
+    const result = await api(`/api/execution-engines/${engine.id}/test`, { method: 'POST' });
+    const reply = result.response || 'OK';
+    const duration = result.duration ? `（耗时 ${result.duration} 秒）` : '';
+    $('engineSaveResult').textContent = `测试通过：${reply} ${duration}
+容器沙箱、网络与模型认证均正常。`;
+    state.executionEngines = await api('/api/execution-engines');
+    renderExecutionEngines();
+    renderExecutionEngineSelect();
+    notify(`执行引擎“${engine.name}”连接测试通过`);
+  } catch (err) {
+    $('engineSaveResult').textContent = `测试失败：${err.message || err}`;
+    notify(`执行引擎测试失败：${err.message || err}`, 'error');
+  } finally {
+    setBusy(button, false);
+  }
+}
+
 function uploadContextStateLabel(upload) {
   const context = upload?.context_status || {};
   if (context.label) return context.label;
@@ -6344,6 +6892,10 @@ function initSidebar() {
 }
 
 function bindEvents() {
+  $('addWorkspaceMemberBtn').onclick = addWorkspaceMember;
+  $('newUserBtn').onclick = () => selectAdminUser(null);
+  $('refreshUsersBtn').onclick = () => loadAdminUsers().catch((error) => notify(error.message, 'error'));
+  $('adminUserForm').onsubmit = saveAdminUser;
   document.querySelectorAll('.nav').forEach((btn) => btn.onclick = () => switchTab(btn.dataset.tab));
   $('sidebarToggle').onclick = () => setSidebarCollapsed(!$('sidebar').classList.contains('collapsed'));
   $('workspaceSelect').onchange = (event) => switchWorkspace(event.target.value).catch((err) => notify(`项目切换失败：${err.message || err}`, 'error'));
@@ -6356,6 +6908,15 @@ function bindEvents() {
     renderWorkbenchMode();
   };
   $('sendBtn').onclick = sendTask;
+    if ($('viewCodexSessionsBtn')) $('viewCodexSessionsBtn').onclick = openCodexSessionsDialog;
+  if ($('closeCodexSessionsBtn')) $('closeCodexSessionsBtn').onclick = () => $('codexSessionsDialog').classList.add('hidden');
+  if ($('backToCodexSessionsBtn')) $('backToCodexSessionsBtn').onclick = () => {
+    $('codexSessionDetailContainer').classList.add('hidden');
+    $('codexSessionsListContainer').classList.remove('hidden');
+  };
+  if ($('codexSessionsDialog')) $('codexSessionsDialog').addEventListener('click', (event) => {
+    if (event.target === $('codexSessionsDialog')) $('codexSessionsDialog').classList.add('hidden');
+  });
   $('closePptxConfigBtn').onclick = closePptxConfigDialog;
   $('detectPptxConfigBtn').onclick = () => loadPptxConfiguration().catch((err) => notify(`重新检测失败：${err.message || err}`, 'error'));
   $('savePptxConfigBtn').onclick = () => savePptxConfiguration().catch((err) => notify(`PPTX 配置失败：${err.message || err}`, 'error'));
@@ -6408,10 +6969,16 @@ function bindEvents() {
   };
   $('refreshBtn').onclick = loadAll;
   $('refreshWorkspacesBtn').onclick = () => loadWorkspacesOnly({ preserveSelection: true }).catch((err) => notify(`项目刷新失败：${err.message || err}`, 'error'));
+  $('workspaceSearch').oninput = () => renderWorkspaces();
+  $('workspaceShowDisabled').onchange = () => renderWorkspaces();
+  $('agentSearch').oninput = () => renderAgents();
+  $('agentShowDisabled').onchange = () => renderAgents();
   $('newWorkspaceBtn').onclick = newWorkspace;
   $('saveWorkspaceBtn').onclick = saveWorkspace;
   $('deleteWorkspaceBtn').onclick = deleteWorkspace;
   $('newSkillBtn').onclick = newSkill;
+  $('skillSearch').oninput = () => renderSkills();
+  $('skillShowDisabled').onchange = () => renderSkills();
   $('skillPackageInput').onchange = (e) => e.target.files[0] && installSkillPackage(e.target.files[0]);
   $('installSkillUrlBtn').onclick = installSkillFromUrl;
   $('saveSkillBtn').onclick = saveSkill;
@@ -6472,6 +7039,15 @@ function bindEvents() {
   $('artifactKindFilter').onchange = () => loadArtifactsOnly({ preserveSelection: true }).catch((err) => notify(`产物筛选失败：${err.message || err}`, 'error'));
   $('newModelBtn').onclick = newModel; $('saveModelBtn').onclick = saveModel; $('testModelBtn').onclick = testModel; $('deleteModelBtn').onclick = () => deleteModel().catch((err) => notify(`模型删除失败：${err.message || err}`, 'error'));
   $('modelKeyMode').onchange = toggleModelKeyMode;
+  if ($('saveEngineBtn')) $('saveEngineBtn').onclick = () => saveExecutionEngine().catch((err) => notify(`执行引擎保存失败：${err.message || err}`, 'error'));
+  if ($('engineKeyMode')) $('engineKeyMode').onchange = toggleEngineKeyMode;
+  if ($('executionEngineSelect')) $('executionEngineSelect').onchange = (event) => {
+    writePreference('execution-engine', event.target.value);
+    syncExecutionEngineModelUi();
+  };
+  if ($('testEngineBtn')) $('testEngineBtn').onclick = () => testExecutionEngine().catch((err) => notify(`测试失败：${err.message || err}`, 'error'));
+  if ($('discoverModelsBtn')) $('discoverModelsBtn').onclick = discoverModelsForModelConfig;
+  if ($('discoverEngineModelsBtn')) $('discoverEngineModelsBtn').onclick = discoverModelsForExecutionEngine;
   $('fileInput').onchange = (e) => {
     uploadFiles(Array.from(e.target.files || []));
     e.target.value = '';
@@ -6502,7 +7078,127 @@ function bindEvents() {
   });
 }
 
+function selectAdminUser(user) {
+  state.adminSelectedUser = user;
+  $('adminUserTitle').textContent = user ? `编辑用户：${user.username}` : '新建用户';
+  $('adminUsername').value = user?.username || '';
+  $('adminUsername').disabled = Boolean(user);
+  $('adminUserRole').value = user?.role || 'user';
+  $('adminUserPassword').value = '';
+  $('adminUserPassword').required = !user;
+  $('adminPasswordHint').textContent = user ? '留空保留当前密码；填写新密码将撤销已有会话。' : '新用户需设置至少 12 位密码。';
+  $('adminUserEnabled').checked = user ? Boolean(user.enabled) : true;
+  $('adminUserEnabled').disabled = !user;
+  $('adminUserError').textContent = '';
+}
+
+async function loadAdminUsers() {
+  state.adminUsers = await api('/api/users');
+  const list = $('adminUserList');
+  list.replaceChildren();
+  for (const user of state.adminUsers) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'secondary';
+    button.textContent = `${user.username} · ${user.role === 'admin' ? '管理员' : '普通用户'} · ${user.enabled ? '已启用' : '已停用'}`;
+    button.onclick = () => selectAdminUser(user);
+    list.appendChild(button);
+  }
+  const selected = state.adminUsers.find((user) => user.id === state.adminSelectedUser?.id);
+  selectAdminUser(selected || null);
+}
+
+async function saveAdminUser(event) {
+  event.preventDefault();
+  const selected = state.adminSelectedUser;
+  const payload = { role: $('adminUserRole').value };
+  if (selected) payload.enabled = $('adminUserEnabled').checked;
+  else payload.username = $('adminUsername').value.trim();
+  const password = $('adminUserPassword').value;
+  if (password) payload.password = password;
+  if (!selected && !password) {
+    $('adminUserError').textContent = '新用户必须设置密码。';
+    return;
+  }
+  $('saveUserBtn').disabled = true;
+  $('adminUserError').textContent = '';
+  try {
+    const user = await api(selected ? `/api/users/${encodeURIComponent(selected.id)}` : '/api/users', {
+      method: selected ? 'PUT' : 'POST', body: JSON.stringify(payload),
+    });
+    state.adminSelectedUser = user;
+    await loadAdminUsers();
+    notify('用户已保存');
+  } catch (error) {
+    $('adminUserError').textContent = error.message;
+  } finally {
+    $('adminUserPassword').value = '';
+    $('saveUserBtn').disabled = false;
+  }
+}
+
+async function initializeAuthentication() {
+  const session = await api('/api/auth/me');
+  if (session.enabled && !session.authenticated) {
+    $('loginPanel').classList.remove('hidden');
+    $('loginForm').onsubmit = async (event) => {
+      event.preventDefault();
+      $('loginSubmit').disabled = true;
+      $('loginError').textContent = '';
+      try {
+        await api('/api/auth/login', { method: 'POST', body: JSON.stringify({
+          username: $('loginUsername').value.trim(), password: $('loginPassword').value,
+        }) });
+        location.reload();
+      } catch (error) {
+        $('loginError').textContent = error.message;
+        $('loginPassword').value = '';
+      } finally {
+        $('loginSubmit').disabled = false;
+      }
+    };
+    $('loginUsername').focus();
+    return false;
+  }
+  state.authenticated = Boolean(session.authenticated);
+  state.currentUser = session.user || null;
+  state.authEnabled = Boolean(session.enabled);
+  if (session.enabled) {
+    if (session.user.role === 'admin') {
+      $('usersNav').classList.remove('hidden');
+      $('enginesNav')?.classList.remove('hidden');
+    }
+    $('accountPanel').classList.remove('hidden');
+    $('accountName').textContent = session.user.username;
+    $('logoutButton').onclick = async () => {
+      try {
+        await api('/api/auth/logout', { method: 'POST' });
+        location.reload();
+      } catch (error) { notify(error.message, 'error'); }
+    };
+    if (readPreference('account-id') !== session.user.user_id) {
+      state.conversationId = createConversationId();
+      state.workspaceId = 'default';
+      writePreference('conversation', state.conversationId);
+      writePreference('workspace', state.workspaceId);
+      writePreference('account-id', session.user.user_id);
+    }
+  } else {
+    $('enginesNav')?.classList.remove('hidden');
+  }
+  document.body.classList.remove('auth-pending');
+  return true;
+}
+
 (async function init() {
+  try {
+    if (!await initializeAuthentication()) return;
+  } catch (error) {
+    $('loginPanel').classList.remove('hidden');
+    $('loginError').textContent = `无法检查登录状态：${error.message}`;
+    $('loginSubmit').disabled = true;
+    return;
+  }
   initSidebar();
   bindEvents();
   renderWorkbenchMode();

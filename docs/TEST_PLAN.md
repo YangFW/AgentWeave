@@ -1,6 +1,6 @@
 # AgentNexus 全功能测试与验收文档
 
-> 目标：覆盖平台当前涉及的对话、模式、模型、Skill、MCP、知识库、记忆、文件产物、运行控制和自动化能力。
+> 目标：覆盖平台当前涉及的对话、模式、模型、Skill、MCP、知识库、记忆、文件产物、运行控制、自动化能力，以及 builtin / Codex / Claude Code 执行引擎与容器沙箱隔离。
 >
 > 测试地址：<http://127.0.0.1:8000/>
 > 记录方式：每个用例执行后填写“结果”和“备注”，不要只看最终答案，还要检查执行过程、节点明细、调用明细和下载文件。
@@ -516,7 +516,7 @@
 - 在线模型、联网搜索、远程 MCP、远程 Skill/MCP 安装：需要开启网络开关、主机白名单和对应密钥。
 - PPTX：默认使用平台内置 Python 生成器；切换外部 Artifact Tool 时才需要 Node.js。未配置时应验证“明确不可用提示”，不能把它当作普通格式失败。
 - 扫描 PDF、图片、音频、视频和旧版 Office：默认不保证正文提取，需要单独的解析或多模态能力。
-- 对外部署：登录认证、RBAC、租户隔离、执行沙箱、Secret Manager 和资源配额仍需按部署环境补测。
+- 对外部署：登录认证、RBAC、租户隔离、Secret Manager 和资源配额仍需按部署环境补测。第三方引擎任务的容器沙箱已有本机自动化与第 14 节手工清单。
 
 ## 13. 新增边界用例执行记录
 
@@ -533,3 +533,144 @@
 | N-27 | 通过（已修复） | 中性长对话实测 10～11 轮后，新目标结果没有混入旧 `PULSE-*` 内容；修复后摘要接口返回 200、版本为 2，并产生 1 条 `conversation_summary` 事件 | 后续可补测更长内容和复杂记忆约束，但本轮目标确认与摘要链路已闭环 |
 
 本轮执行证据：本地服务恢复后 `/api/health` 返回 `ok: true`；浏览器实测普通模式离线问答、在线模型问答、Markdown 生成/预览/下载、任务概览、运行控制、Skill/MCP/模型下钻和自检均正常，浏览器控制台没有 error/warn；在线任务先出现“正在处理/实时”状态，完成后正确收起追踪区域。修复后完整自动化回归为 `521/521` 通过（含更新后的内置 Python PPT 生成器断言）。本轮还修复了空答案被伪装成成功、PPT 设计说明误入正文、PPT 页数安全上限断言和前端资源版本不一致。当前结论是“N-21、N-24 的核心链路已有页面证据；N-23、N-25 仍保留页面级边界待测”，不能把未执行的故障注入误写成失败。
+
+
+## 14. 执行引擎、容器沙箱、会话与依赖落盘
+
+本节覆盖默认平台模式、第三方 Agent 引擎、容器启停、会话隔离和项目依赖安装位置。自动化入口：
+
+```bash
+.venv/bin/python -m unittest \
+  tests.test_workspace_path_manager \
+  tests.test_container_agent_runner \
+  tests.test_container_task_runtime \
+  tests.test_container_api \
+  tests.test_sandbox_isolation_and_lifecycle \
+  tests.test_execution_engines -v
+```
+
+2026-09-15 上述专项在本机全部通过。真实 Codex/Claude 在线账号任务仍需密钥，不能用离线 `codex --version` 代替一次真实生成。
+
+### 14.1 默认平台模式（`execution_engine=builtin`）
+
+保持第 3～7 节原有普通模式、专家模式、模型、知识库和自动化用例。额外确认：
+
+- [ ] 工作台引擎选择器默认为“内置智能体引擎”。
+- [ ] 不选第三方引擎时，任务仍走 Skill 匹配、MCP、计划节点和产物验收，行为与升级前一致。
+- [ ] `POST /api/tasks` 不传 `execution_engine` 时数据库值为 `builtin`。
+- [ ] 内置模式不会无故启动 `nexus-run-*` 容器。
+
+### 14.2 第三方 Agent 引擎模式
+
+前置：已构建 `agentnexus-runner:latest`；在线调用还需 `APP_ALLOW_OUTBOUND_NETWORK=true` 及对应 API Key。
+
+#### 用例 E-01：页面指定 Codex
+
+- [ ] 选择项目 A，引擎选“Codex 容器沙箱”，发送一条明确的代码任务。
+- [ ] 预期：任务 `execution_engine=codex`；过程出现容器启动与执行日志；完成后可下载产物或看到工作区文件变化。
+- [ ] 检查：`docker ps -a` 无残留 `nexus-run-*`。
+
+#### 用例 E-02：页面指定 Claude Code
+
+- [ ] 同一项目或另一项目选择“Claude Code 容器沙箱”发送任务。
+- [ ] 预期：`execution_engine=claude`；日志来自 Claude Code；不串用 Codex 的会话目录。
+
+#### 用例 E-10：管理员配置引擎密钥
+
+- [ ] 管理员打开“执行引擎”，为 Codex 保存 Base URL 和密钥（或环境变量名），启用引擎。
+- [ ] 预期：列表显示已配置；接口不回显明文；普通用户无法保存。
+- [ ] 工作台引擎选择器能看到已启用的 Codex / Claude Code；停用后选项不可选。
+
+#### 用例 E-03：自定义容器命令（验收引擎）
+
+
+- [ ] API 或页面选择 `container`，消息为 `echo ok > /workspace/artifacts/ok.txt`。
+- [ ] 预期：任务完成，产物 `ok.txt` 可下载；宿主机 `data/workspaces/.../artifacts/ok.txt` 存在。
+
+#### 用例 E-04：引擎可执行文件存在
+
+- [ ] 自动化：`test_codex_and_claude_engines_present_and_executable_in_sandbox`
+- [ ] 预期：容器内 `codex --version` 含 `codex-cli`，`claude --version` 含 `Claude Code`。
+
+### 14.3 容器启停与超时
+
+#### 用例 C-01：完成后立即销毁
+
+- [ ] 跑一条短容器任务，完成后执行 `docker ps -a --filter name=nexus-run-`
+- [ ] 预期：0 条。自动化：`test_container_destroyed_immediately_on_completion`
+
+#### 用例 C-02：超时销毁
+
+- [ ] 自动化：`test_container_destroyed_on_timeout`（`sleep 30`，超时 2 秒）
+- [ ] 预期：状态 `timeout`，容器已删除。
+
+#### 用例 C-03：取消销毁
+
+- [ ] 页面或 API 对运行中的容器任务点取消。
+- [ ] 预期：任务 `cancelled`，容器消失。自动化：`test_cancellation_stops_container`
+
+#### 用例 C-04：孤儿清扫
+
+- [ ] 自动化：`test_stale_container_cleanup_sweep`
+- [ ] 预期：名称前缀 `nexus-run-` 的残留容器被 `cleanup_stale_containers` 删除。
+
+### 14.4 会话与项目隔离
+
+#### 用例 S-01：同项目多轮连续
+
+- [ ] 同一对话、同一项目连续两轮：第一轮写入文件，第二轮读取并追加。
+- [ ] 预期：第二轮看得到第一轮文件；平台对话历史对 Codex/Claude 任务会拼进提示。
+- [ ] 自动化：`test_multi_turn_session_continuity_in_same_project`
+
+#### 用例 S-02：跨客户跨项目不可见
+
+- [ ] 客户 A 项目放入机密文件；客户 B 容器内 `ls /workspace` 并尝试读取该文件名。
+- [ ] 预期：NOT_FOUND，输出不含机密内容。自动化：`test_cross_customer_and_cross_project_isolation`
+
+#### 用例 S-03：引擎状态目录隔离
+
+- [ ] 分别在项目 A、项目 B 跑 Codex 任务后，检查
+  `data/workspaces/<org>/<user>/<A>/state/.codex` 与 `<B>/state/.codex`
+- [ ] 预期：两套目录独立存在，互不覆盖。
+
+#### 用例 S-04：平台会话记录不串项目
+
+- [ ] 在项目 A 完成对话后切换到项目 B。
+- [ ] 预期：任务列表与工作区文件均不出现项目 A 的内容（对应原 N-25，页面级仍建议补测）。
+
+### 14.5 新增依赖必须落在宿主机项目目录
+
+确认无误：容器内工作目录 `/workspace` 就是宿主机 `code/` 的 bind mount。入口脚本把 venv、pip user site、npm prefix 都指到 `/workspace`。因此 `pip install` / `npm install` 装的是项目本地依赖，不是镜像层；容器销毁后依赖仍在该项目下。
+
+#### 用例 D-01：Python 依赖落盘并复用
+
+- [ ] 在项目内 `pip install` 一个包（测试用本地 `vendor/demo_dep`）。
+- [ ] 预期：宿主机 `code/.venv/lib/python*/site-packages/` 出现该包。
+- [ ] 再开一个新容器，不重装即可 `import`。
+- [ ] 另一客户项目没有该包。
+- [ ] 自动化：`test_new_dependencies_install_onto_host_project_mount`
+
+#### 用例 D-02：npm 依赖落盘并复用
+
+- [ ] 在项目内 `npm install`（测试用本地 `vendor/demo-npm`）。
+- [ ] 预期：宿主机 `code/node_modules/` 存在对应包；新容器可 `require`；其他项目没有。
+
+#### 用例 D-03：不要把依赖装进镜像
+
+- [ ] 安装依赖后 `docker commit` 或对比镜像层前后（可选）。
+- [ ] 预期：公共镜像保持干净；依赖只出现在 `data/workspaces/.../code/`。
+
+### 14.6 本轮执行记录
+
+执行日期：2026-09-15（Asia/Shanghai）。
+
+| 用例 | 当前结果 | 已验证内容 | 仍需补测 |
+|---|---|---|---|
+| 14.1 builtin 默认 | 自动化通过，页面抽样待测 | 默认值 `builtin`；API 可创建容器引擎任务且不破坏原任务字段 | 浏览器完整走一遍普通模式旧用例，确认选择器未改默认行为 |
+| E-01/E-02 真实 Codex/Claude | 引擎二进制通过 | 容器内 `codex --version`、`claude --version` | 配置真实 Key 后各跑一条生成任务 |
+| E-03 container 命令 | 通过 | 写文件、登记产物、任务完成 | 无 |
+| C-01/C-02/C-03/C-04 | 通过 | 完成、超时、取消、孤儿清扫后无残留容器 | 页面取消按钮的一次手工点击 |
+| S-01 多轮会话 | 通过 | 同项目两轮文件连续 | 真实 Codex 多轮“接着改刚才的文件” |
+| S-02 跨客户隔离 | 通过 | B 看不到 A 的机密文件 | 页面切换两个登录用户（若开启认证） |
+| S-03 引擎状态目录 | 代码与挂载约定已实现 | 每项目 `state/.codex` 与 `state/.claude` | 真实引擎登录后核对 session 文件位置 |
+| D-01/D-02 依赖落盘 | 通过 | pip/npm 安装出现在宿主机项目目录，新容器可复用，其他项目没有 | 真实 Agent 自行执行 `pip install requests` 的一次页面任务 |

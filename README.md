@@ -1,8 +1,8 @@
-# AgentNexus（智枢）
+# AgentWeave（智枢）
 
 **简体中文** | [English](README_EN.md)
 
-AgentNexus（中文名“智枢”）是一个通过浏览器使用的智能体工作平台。模型、智能体、Skill、MCP 工具、任务记录和生成文件都由平台统一管理，使用者可以直接发起对话，也可以按工作场景配置自己的处理流程。
+AgentWeave（中文名“智枢”）是一个通过浏览器使用的智能体工作平台。模型、智能体、Skill、MCP 工具、任务记录和生成文件都由平台统一管理，使用者可以直接发起对话，也可以按工作场景配置自己的处理流程。
 
 目前提供的主要能力包括：
 
@@ -53,6 +53,8 @@ uvicorn app.main:app --env-file .env.local --host 127.0.0.1 --port 8000
 
 ## Docker 启动
 
+当前 Compose 包含 API、Redis 和独立 Worker。本地脚本在未设置 `REDIS_URL` 时仍使用进程内执行。面向最多 10 人的部署配置、账号管理和备份说明见 [第二次上线操作手册](docs/SECOND_RELEASE_RUNBOOK.md)；实施状态和未完成验收项见 [逐项审计](docs/SECOND_RELEASE_AUDIT.md)。
+
 ```bash
 docker compose up --build
 ```
@@ -99,6 +101,16 @@ cp .env.example .env.local
 也可以选择“直接填写 API Key”；密钥会使用本机密钥加密后保存在 SQLite 中，页面不会回显明文。这是单机存储方案，不替代生产环境的 Secret Manager 或 KMS。
 
 保存后，模型会出现在“已配置模型”和工作台的模型选择器中。建议先点击“测试连接”，再用它运行任务。
+
+## 配置执行引擎
+
+打开“执行引擎”页面，由管理员为 Codex、Claude Code 填写接口地址和密钥。密钥同样支持环境变量或本机加密保存，页面不会回显明文。不要把账号写进 Docker 镜像。
+
+- 环境变量方式：把变量写在 `.env.local`，页面里填写变量名，例如 `OPENAI_API_KEY`、`ANTHROPIC_API_KEY`。
+- 直接填写密钥：保存在数据库加密字段中，任务启动容器时再注入。
+- 可选模型名：填写后会传给对应引擎；留空则使用引擎默认模型。
+
+工作台可以选择“内置智能体引擎”或已启用的第三方引擎。新增更多执行引擎的入口已留在页面上，当前还不能增删引擎种类。
 
 ## 第一次使用
 
@@ -156,7 +168,7 @@ export APP_ARTIFACT_TOOL_ENTRYPOINT='/absolute/path/to/artifact_tool.mjs'
 
 ## 重要边界
 
-当前实现适合本机开发或受控内网使用，尚未包含完整的登录认证、多租户 RBAC、资源行级隔离、分布式任务队列和进程沙箱。不要未经加固直接暴露到不可信公网。
+当前已加入可选登录、管理员/普通用户角色、工作区成员与资源权限检查，以及 Redis Streams/Worker 执行。认证默认关闭，本地模式适合个人开发；多人配置示例会开启认证。第三方引擎（Codex / Claude Code）任务已使用每任务容器和按项目挂载隔离；内置 Skill/MCP 仍在平台进程中执行。它仍不提供企业级多租户 RBAC 或高可用集群，不能未经部署验收直接暴露到不可信公网。
 
 安装 Skill 不会自动执行包内脚本。本地 stdio MCP 会在平台服务器上启动进程，而不是在浏览器用户的电脑上运行。启用这类能力前，请限制命令、远程主机和工具权限。
 
@@ -168,6 +180,7 @@ export APP_ARTIFACT_TOOL_ENTRYPOINT='/absolute/path/to/artifact_tool.mjs'
 app/
   main.py                 FastAPI 入口和 HTTP/SSE 接口
   db.py                   SQLite 存储
+  worker.py               独立任务执行进程
   builtin_skill_catalog.py 对话中可确认安装的少量内置 Skill
   builtin_skills/         随平台加载的 Skill
   services/               任务、模型、Skill、MCP、专家团、记忆和产物服务
@@ -181,11 +194,11 @@ data/                     本地运行数据（不提交）
 
 ## 参与贡献
 
-欢迎通过 [Issues](https://github.com/YangFW/AgentNexus/issues) 反馈问题，或提交 Pull Request。提交前请确认改动中不包含 `.env`、API Key、数据库、上传文件、生成文件或其他本地运行数据，并在 PR 中说明改动目的、使用方式和验证结果。
+欢迎通过 [Issues](https://github.com/YangFW/AgentWeave/issues) 反馈问题，或提交 Pull Request。提交前请确认改动中不包含 `.env`、API Key、数据库、上传文件、生成文件或其他本地运行数据，并在 PR 中说明改动目的、使用方式和验证结果。
 
 ## 参考与致谢
 
-AgentNexus 是一个独立开源项目，在协议实现和基础设施层使用或参考了以下公开规范与项目：
+AgentWeave 是一个独立开源项目，在协议实现和基础设施层使用或参考了以下公开规范与项目：
 
 - [Model Context Protocol](https://modelcontextprotocol.io/specification/latest) 与 [MCP Python SDK](https://github.com/modelcontextprotocol/python-sdk)：MCP 服务接入与工具调用。
 - [OpenAI API Reference](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create)：Chat Completions 兼容模型接口。
@@ -193,18 +206,18 @@ AgentNexus 是一个独立开源项目，在协议实现和基础设施层使用
 - [SQLite](https://www.sqlite.org/docs.html)：本地配置与任务数据存储。
 - [Open-Meteo](https://open-meteo.com/en/docs)：内置天气工具的数据接口。
 
-上述名称仅用于说明兼容协议、依赖关系或数据来源，不表示相关项目或机构对 AgentNexus 提供官方背书。第三方组件和外部服务仍分别受其自身许可证与服务条款约束。
+上述名称仅用于说明兼容协议、依赖关系或数据来源，不表示相关项目或机构对 AgentWeave 提供官方背书。第三方组件和外部服务仍分别受其自身许可证与服务条款约束。
 
 ## 引用
 
-如果 AgentNexus 对你的项目或研究有所帮助，欢迎点亮 Star ⭐。如需在论文、报告或其他成果中引用本项目，可使用以下 BibTeX：
+如果 AgentWeave 对你的项目或研究有所帮助，欢迎点亮 Star ⭐。如需在论文、报告或其他成果中引用本项目，可使用以下 BibTeX：
 
 ```bibtex
-@software{YangFW_AgentNexus_2026,
+@software{YangFW_AgentWeave_2026,
   author  = {{YangFW}},
-  title   = {AgentNexus},
+  title   = {AgentWeave},
   year    = {2026},
-  url     = {https://github.com/YangFW/AgentNexus},
+  url     = {https://github.com/YangFW/AgentWeave},
   license = {MIT}
 }
 ```
@@ -213,4 +226,4 @@ AgentNexus 是一个独立开源项目，在协议实现和基础设施层使用
 
 ## 许可证
 
-AgentNexus 自有源码采用 [MIT License](LICENSE) 发布。
+AgentWeave 自有源码采用 [MIT License](LICENSE) 发布。

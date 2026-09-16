@@ -629,6 +629,42 @@ def _automation_task_run_binding_schema(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "loop_runs", "task_run_id", "TEXT NOT NULL DEFAULT ''")
 
 
+def _execution_engines_schema(conn: sqlite3.Connection) -> None:
+    """Store admin-managed credentials for third-party execution engines."""
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS execution_engines (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            base_url TEXT NOT NULL DEFAULT '',
+            api_key_env TEXT NOT NULL DEFAULT '',
+            api_key_ciphertext TEXT NOT NULL DEFAULT '',
+            config_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    now = utc_now()
+    seeds = (
+        ("codex", "Codex", "codex", "OPENAI_API_KEY"),
+        ("claude", "Claude Code", "claude", "ANTHROPIC_API_KEY"),
+    )
+    for engine_id, name, kind, api_key_env in seeds:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO execution_engines(
+                id, name, kind, enabled, base_url, api_key_env, api_key_ciphertext,
+                config_json, created_at, updated_at
+            ) VALUES (?, ?, ?, 1, '', ?, '', '{}', ?, ?)
+            """,
+            (engine_id, name, kind, api_key_env, now, now),
+        )
+
+
 SCHEMA_MIGRATIONS: tuple[tuple[int, Any], ...] = (
     (1, _shared_scope_schema),
     (2, _expert_team_scope_schema),
@@ -639,6 +675,7 @@ SCHEMA_MIGRATIONS: tuple[tuple[int, Any], ...] = (
     (8, _artifact_effect_identity_and_pending_run_fence),
     (9, _tool_effect_journal_schema),
     (10, _automation_task_run_binding_schema),
+    (11, _execution_engines_schema),
 )
 
 # Keep retired version numbers reserved so existing databases do not
@@ -782,6 +819,7 @@ def init_db() -> None:
                     model_id TEXT NOT NULL DEFAULT '',
                     conversation_id TEXT NOT NULL DEFAULT '',
                     workspace TEXT NOT NULL DEFAULT 'default',
+                    execution_engine TEXT NOT NULL DEFAULT 'builtin',
                     status TEXT NOT NULL DEFAULT 'queued',
                     result_json TEXT NOT NULL DEFAULT '{}',
                     artifacts_json TEXT NOT NULL DEFAULT '[]',
@@ -886,6 +924,8 @@ def init_db() -> None:
                 conn.execute("ALTER TABLE tasks ADD COLUMN model_id TEXT NOT NULL DEFAULT ''")
             if "conversation_id" not in task_columns:
                 conn.execute("ALTER TABLE tasks ADD COLUMN conversation_id TEXT NOT NULL DEFAULT ''")
+            if "execution_engine" not in task_columns:
+                conn.execute("ALTER TABLE tasks ADD COLUMN execution_engine TEXT NOT NULL DEFAULT 'builtin'")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_conversation_created ON tasks(conversation_id, created_at)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_skill_files_skill ON skill_files(skill_id, path)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_loops_due ON loops(status, next_run_at)")

@@ -18,6 +18,7 @@ import httpx
 
 from app import db
 from app.schemas import McpServerCreate
+from app.services.call_limits import call_limits, call_timeout
 from app.services.network_policy import env_flag, require_outbound_network, validate_outbound_http_url
 from app.services.tool_effect_journal import (
     inject_http_idempotency_key,
@@ -805,8 +806,8 @@ class McpGateway:
         headers = self._resolve_env_values(config.get("headers", {}))
         if idempotency_key:
             headers = inject_http_idempotency_key(headers, idempotency_key)
-        timeout = float(config.get("timeout", 30))
-        async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
+        limits = call_limits('http_tool', config)
+        async with call_timeout('http_tool', limits.timeout), httpx.AsyncClient(timeout=limits.timeout, follow_redirects=False) as client:
             if method == "GET":
                 response = await client.get(url, params=arguments, headers=headers)
             else:
@@ -1058,11 +1059,13 @@ class McpGateway:
 
     def _stdio_timeout_seconds(self, server: dict[str, Any]) -> float:
         config = server.get("config", {})
+        default = call_limits('mcp', {key: value for key, value in config.items() if key != 'timeout'}).timeout
         try:
-            value = float(config.get("timeout", config.get("startup_timeout", 60)))
+            value = float(config.get("timeout", config.get("startup_timeout", default)))
         except (TypeError, ValueError):
-            value = 60.0
-        return max(5.0, min(value, 300.0))
+            value = default
+        # 保留 stdio 历史配置的 5～300 秒限制及无效字符串回退行为。
+        return call_limits('mcp', {**config, 'timeout': max(5.0, min(value, 300.0))}).timeout
 
     def _mcp_http_config(
         self,
@@ -1085,7 +1088,8 @@ class McpGateway:
         from mcp import ClientSession
         from mcp.client.streamable_http import streamable_http_client
         url, headers = self._mcp_http_config(server)
-        async with httpx.AsyncClient(headers=headers, timeout=60, follow_redirects=False) as client:
+        timeout = call_limits('mcp', server.get('config', {})).timeout
+        async with call_timeout('mcp', timeout), httpx.AsyncClient(headers=headers, timeout=timeout, follow_redirects=False) as client:
             async with streamable_http_client(url, http_client=client) as (read, write, _):
                 async with ClientSession(read, write) as session:
                     await session.initialize()
@@ -1104,7 +1108,8 @@ class McpGateway:
         url, headers = self._mcp_http_config(
             server, idempotency_key=idempotency_key
         )
-        async with httpx.AsyncClient(headers=headers, timeout=60, follow_redirects=False) as client:
+        timeout = call_limits('mcp', server.get('config', {})).timeout
+        async with call_timeout('mcp', timeout), httpx.AsyncClient(headers=headers, timeout=timeout, follow_redirects=False) as client:
             async with streamable_http_client(url, http_client=client) as (read, write, _):
                 async with ClientSession(read, write) as session:
                     await session.initialize()

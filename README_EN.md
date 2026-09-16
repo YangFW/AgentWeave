@@ -55,6 +55,8 @@ Do not open `web/index.html` directly with `file://`. A static page cannot save 
 
 ## Docker
 
+Compose now includes the API, Redis, and an independent Worker. Without `REDIS_URL`, local startup retains in-process execution. For the small-team deployment configuration and current acceptance status, see [the release runbook](docs/SECOND_RELEASE_RUNBOOK.md) and [the release audit](docs/SECOND_RELEASE_AUDIT.md).
+
 ```bash
 docker compose up --build
 ```
@@ -158,7 +160,7 @@ Files are stored in runtime directories under `data/` and accessed through contr
 
 ## Important limitations
 
-The current implementation is intended for local development or controlled internal networks. It does not yet provide complete login authentication, multi-tenant RBAC, row-level resource isolation, a distributed task queue, or process sandboxing. Do not expose it directly to an untrusted public network without additional hardening.
+The implementation now includes optional login, administrator/member roles, workspace membership and resource checks, and Redis Streams/Worker execution. Authentication remains disabled for local development by default; the small-team configuration enables it. This does not provide enterprise multi-tenant RBAC, a sandbox per task, or a highly available cluster. Do not expose it to an untrusted public network without completing deployment validation.
 
 Installing a Skill does not execute scripts contained in its package. A local stdio MCP service starts a process on the AgentNexus server, not on the browser user's computer. Restrict commands, remote hosts, and tool permissions before enabling these capabilities.
 

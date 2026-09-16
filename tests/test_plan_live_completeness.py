@@ -235,6 +235,12 @@ class PlanCompletenessLiveTests(unittest.TestCase):
             # administrator configures APP_SKILL_LOCAL_ROOTS.  The public
             # response is the expected conditional capability boundary.
             self.assertIn("APP_SKILL_LOCAL_ROOTS", json.dumps(path_install, ensure_ascii=False))
+            # 本地路径功能关闭时自行准备 ZIP 夹具，不能依赖另一测试先安装。
+            installed = self._request(
+                "POST", "/api/skills/install/upload",
+                files={"file": ("sample_skill.zip", (SAMPLES / "sample_skill.zip").read_bytes(), "application/zip")},
+            )
+            self.assertEqual(installed.get('id'), 'meeting_notes_sample')
         self.assertTrue(self._request("GET", "/api/skills/meeting_notes_sample/files"))
         self.assertTrue(
             any(item.get("id") == "meeting_notes_sample" for item in self._request("GET", "/api/skills"))

@@ -1,11 +1,30 @@
+x-runtime: &runtime_limits
+  user: "${APP_RUNTIME_UID:-1000}:${APP_RUNTIME_GID:-1000}"
+  init: true
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  pids_limit: 128
+  mem_limit: "${APP_PROCESS_MEMORY:-1g}"
+  cpus: "${APP_PROCESS_CPUS:-1.0}"
+  tmpfs:
+    - /tmp:rw,nosuid,nodev,size=256m
+
 services:
   agentnexus:
+    <<: *runtime_limits
     build: .
     container_name: agentnexus
     ports:
-      - "127.0.0.1:8000:8000"
-    environment:
+      - "${APP_BIND_HOST:-127.0.0.1}:8000:8000"
+    environment: &app_environment
       APP_DB_PATH: /app/data/platform.db
+      AGENTNEXUS_ENV_FILE: /app/data/.env.runtime
+      APP_AUTH_ENABLED: "${APP_AUTH_ENABLED:-false}"
+      APP_ADMIN_USERNAME: "${APP_ADMIN_USERNAME:-admin}"
+      APP_ADMIN_PASSWORD: "${APP_ADMIN_PASSWORD:-}"
+      APP_USER_USERNAME: "${APP_USER_USERNAME:-user}"
+      APP_USER_PASSWORD: "${APP_USER_PASSWORD:-}"
       APP_ALLOW_OUTBOUND_NETWORK: "${APP_ALLOW_OUTBOUND_NETWORK:-false}"
       APP_ALLOW_HTTP_TOOLS: "${APP_ALLOW_HTTP_TOOLS:-false}"
       APP_ALLOW_STDIO_MCP: "${APP_ALLOW_STDIO_MCP:-false}"
@@ -21,6 +40,7 @@ services:
       APP_REMOTE_INSTALL_HOST_ALLOWLIST: "${APP_REMOTE_INSTALL_HOST_ALLOWLIST:-github.com,raw.githubusercontent.com,gitlab.com}"
       APP_SKILL_LOCAL_ROOTS: "${APP_SKILL_LOCAL_ROOTS:-}"
       APP_MAX_UPLOAD_MB: "${APP_MAX_UPLOAD_MB:-20}"
+      APP_MAX_TASK_ATTACHMENTS_MB: "${APP_MAX_TASK_ATTACHMENTS_MB:-40}"
       APP_ARTIFACT_DIR: "${APP_ARTIFACT_DIR:-/app/data/artifacts}"
       APP_UPLOAD_DIR: "${APP_UPLOAD_DIR:-/app/data/uploads}"
       APP_NODE_BINARY: "${APP_NODE_BINARY:-node}"
@@ -33,5 +53,56 @@ services:
       OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
       TAVILY_API_KEY: "${TAVILY_API_KEY:-}"
       BRAVE_SEARCH_API_KEY: "${BRAVE_SEARCH_API_KEY:-}"
+      APP_TASK_QUEUE: "${APP_TASK_QUEUE:-agentnexus:tasks}"
+      APP_TASK_MAX_RETRIES: "${APP_TASK_MAX_RETRIES:-2}"
+      APP_TASK_TIMEOUT_SECONDS: "${APP_TASK_TIMEOUT_SECONDS:-1800}"
+      APP_MAX_MODEL_CALLS: "${APP_MAX_MODEL_CALLS:-32}"
+      APP_MODEL_TIMEOUT_SECONDS: "${APP_MODEL_TIMEOUT_SECONDS:-90}"
+      APP_MODEL_MAX_RETRIES: "${APP_MODEL_MAX_RETRIES:-3}"
+      APP_MODEL_RETRY_BACKOFF_SECONDS: "${APP_MODEL_RETRY_BACKOFF_SECONDS:-0.6}"
+      APP_HTTP_TOOL_TIMEOUT_SECONDS: "${APP_HTTP_TOOL_TIMEOUT_SECONDS:-30}"
+      APP_HTTP_TOOL_MAX_RETRIES: "${APP_HTTP_TOOL_MAX_RETRIES:-0}"
+      APP_MCP_TIMEOUT_SECONDS: "${APP_MCP_TIMEOUT_SECONDS:-60}"
+      APP_MCP_MAX_RETRIES: "${APP_MCP_MAX_RETRIES:-0}"
+      APP_MAX_TOOL_CALLS: "${APP_MAX_TOOL_CALLS:-32}"
+      APP_MAX_CONCURRENT_TASKS_PER_USER: "${APP_MAX_CONCURRENT_TASKS_PER_USER:-2}"
+      REDIS_URL: "redis://redis:6379/0"
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import json,urllib.request; assert json.load(urllib.request.urlopen('http://127.0.0.1:8000/api/health',timeout=3))['ok']"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
     volumes:
       - ./data:/app/data
+  worker:
+    <<: *runtime_limits
+    build: .
+    deploy:
+      replicas: ${APP_WORKER_COUNT:-1}
+    command: ["python", "-m", "app.worker"]
+    environment: *app_environment
+    depends_on:
+      agentnexus:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./data:/app/data
+  redis:
+    image: redis:7-alpine
+    container_name: agentnexus-redis
+    command: ["redis-server", "--appendonly", "yes"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    volumes:
+      - agentnexus-redis:/data
+
+volumes:
+  agentnexus-redis:

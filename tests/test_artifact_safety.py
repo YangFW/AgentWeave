@@ -7,7 +7,6 @@ import os
 import re
 import tempfile
 import threading
-import time
 import unittest
 import zipfile
 from pathlib import Path
@@ -394,6 +393,9 @@ class ArtifactAsyncInvocationTests(unittest.IsolatedAsyncioTestCase):
         for server_id, tool_name, method_name in cases:
             with self.subTest(tool=f"{server_id}.{tool_name}"):
                 worker_threads: list[int] = []
+                loop = asyncio.get_running_loop()
+                entered = asyncio.Event()
+                release = threading.Event()
 
                 def blocking_generator(
                     arguments: dict,
@@ -402,7 +404,9 @@ class ArtifactAsyncInvocationTests(unittest.IsolatedAsyncioTestCase):
                     tool_effect_id: str = "",
                 ) -> dict:
                     worker_threads.append(threading.get_ident())
-                    time.sleep(0.03)
+                    loop.call_soon_threadsafe(entered.set)
+                    if not release.wait(timeout=5):
+                        raise AssertionError("事件循环未能放行文件生成线程")
                     return {
                         "arguments": arguments,
                         "task_id": task_id,
@@ -413,9 +417,13 @@ class ArtifactAsyncInvocationTests(unittest.IsolatedAsyncioTestCase):
                     invocation = asyncio.create_task(
                         gateway._invoke_builtin(server_id, tool_name, {"value": 1}, task_id="task-thread-test")
                     )
-                    await asyncio.sleep(0.005)
-                    self.assertFalse(invocation.done())
-                    result = await invocation
+                    try:
+                        await asyncio.wait_for(entered.wait(), timeout=2)
+                        self.assertFalse(invocation.done())
+                        self.assertNotEqual(worker_threads[0], main_thread)
+                    finally:
+                        release.set()
+                        result = await invocation
 
                 self.assertEqual(result["task_id"], "task-thread-test")
                 self.assertEqual(result["arguments"], {"value": 1})

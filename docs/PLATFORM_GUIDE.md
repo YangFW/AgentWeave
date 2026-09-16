@@ -24,6 +24,8 @@ uvicorn app.main:app --host 127.0.0.1 --port 8000
 
 ### 使用 Docker
 
+当前 Compose 同时启动 API、Redis 和 Worker。多人配置请按 `SECOND_RELEASE_RUNBOOK.md` 使用 `.env.release.example`，开启认证并创建独立用户；未配置 Redis 的本地启动仍在 API 进程内执行。
+
 ```bash
 docker compose up --build
 ```
@@ -519,12 +521,12 @@ data/artifacts/
 
 当前版本仍有以下边界：
 
-- 没有完整的登录认证、可信用户身份、多租户 RBAC 和数据库行级隔离。
+- 已支持可选登录、持久会话、角色和工作区成员权限；不等同于企业级多租户 RBAC 或独立数据库租户隔离。
 - `organization_id`、`workspace_id` 和 `user_id` 目前主要是逻辑作用域，不是已经认证的主体。
-- 没有每任务容器、Worktree、进程沙箱、网络配额或资源配额。
+- 第三方引擎任务使用每任务容器、项目目录挂载、CPU/内存/进程数限制；内置 stdio MCP 仍在平台主机。没有用户电脑 Worktree 或企业级网络微隔离。
 - stdio MCP 使用平台服务账号的本机权限。
 - 下载链接安装有 HTTPS、主机和包结构检查，但没有发布者签名、恶意代码扫描、信誉系统或自动升级回滚。
-- SQLite 和单进程调度不等同于高可用分布式任务系统。
+- SQLite 与单机 Redis/Worker 部署不等同于高可用分布式任务系统。
 - 直接 API Key 加密和 MCP 字段脱敏不等同于企业 Secret Vault。
 - 附件解析不包含 OCR、图片理解或知识库检索。
 
