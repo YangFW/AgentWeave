@@ -18,6 +18,8 @@ class WorkspaceApiTests(unittest.TestCase):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.original_db_path = db.DB_PATH
         self.original_app_db_path = os.environ.get("APP_DB_PATH")
+        self.original_auth_enabled = os.environ.get("APP_AUTH_ENABLED")
+        os.environ["APP_AUTH_ENABLED"] = "false"
         self.db_path = Path(self.temp_dir.name) / "workspace-api.db"
         os.environ["APP_DB_PATH"] = str(self.db_path)
         db.DB_PATH = self.db_path
@@ -46,6 +48,10 @@ class WorkspaceApiTests(unittest.TestCase):
             os.environ.pop("APP_DB_PATH", None)
         else:
             os.environ["APP_DB_PATH"] = self.original_app_db_path
+        if self.original_auth_enabled is None:
+            os.environ.pop("APP_AUTH_ENABLED", None)
+        else:
+            os.environ["APP_AUTH_ENABLED"] = self.original_auth_enabled
         self.temp_dir.cleanup()
 
     def test_default_workspace_exists_and_cannot_be_deleted(self) -> None:
@@ -129,6 +135,66 @@ class WorkspaceApiTests(unittest.TestCase):
         with_disabled = self.client.get("/api/workspaces", params={"include_disabled": True})
         disabled = next(item for item in with_disabled.json() if item["id"] == "project-alpha")
         self.assertFalse(disabled["enabled"])
+
+    def test_workspace_name_uniqueness(self) -> None:
+        created = self.client.post(
+            "/api/workspaces",
+            json={
+                "id": "proj-uniq-1",
+                "name": "唯一项目测试",
+                "description": "测试",
+                "organization_id": "local-org",
+                "user_id": "alice",
+                "default_agent_id": "general-agent",
+                "default_model_id": "deterministic",
+            },
+        )
+        self.assertEqual(created.status_code, 201)
+
+        # Duplicate create should be rejected with 409
+        dup = self.client.post(
+            "/api/workspaces",
+            json={
+                "id": "proj-uniq-2",
+                "name": " 唯一项目测试 ",
+                "description": "测试重复",
+                "organization_id": "local-org",
+                "user_id": "alice",
+                "default_agent_id": "general-agent",
+                "default_model_id": "deterministic",
+            },
+        )
+        self.assertEqual(dup.status_code, 409, dup.text)
+        self.assertIn("已存在", dup.json()["detail"])
+
+        # Create with different name succeeds
+        other = self.client.post(
+            "/api/workspaces",
+            json={
+                "id": "proj-uniq-3",
+                "name": "另一个项目",
+                "description": "测试",
+                "organization_id": "local-org",
+                "user_id": "alice",
+                "default_agent_id": "general-agent",
+                "default_model_id": "deterministic",
+            },
+        )
+        self.assertEqual(other.status_code, 201)
+
+        # Renaming proj-uniq-3 to existing name should be rejected with 409
+        dup_update = self.client.put(
+            "/api/workspaces/proj-uniq-3",
+            json={
+                "name": "唯一项目测试",
+                "description": "试图重命名为重复名称",
+                "default_agent_id": "general-agent",
+                "default_model_id": "deterministic",
+                "enabled": True,
+            },
+        )
+        self.assertEqual(dup_update.status_code, 409, dup_update.text)
+        self.assertIn("已存在", dup_update.json()["detail"])
 
 
 if __name__ == "__main__":

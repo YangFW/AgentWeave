@@ -43,6 +43,9 @@ class SandboxIsolationAndLifecycleTests(unittest.IsolatedAsyncioTestCase):
         db.DB_PATH = self.orig_db_path
         self.temp_dir.cleanup()
 
+    async def asyncTearDown(self) -> None:
+        await default_container_runner.cleanup_stale_containers(prefix="nexus-", force_all_idle_warm=True)
+
     async def test_multi_turn_session_continuity_in_same_project(self) -> None:
         conv_id = "conv_continuity_test"
         ws_id = "proj_accounting"
@@ -173,6 +176,28 @@ class SandboxIsolationAndLifecycleTests(unittest.IsolatedAsyncioTestCase):
         # Verify it is gone
         proc = await asyncio.create_subprocess_exec(
             "docker", "ps", "-a", "--filter", f"name={stale_name}", "--format", "{{.ID}}",
+            stdout=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await proc.communicate()
+        containers = [c for c in stdout.decode().strip().split("\n") if c]
+        self.assertEqual(len(containers), 0)
+
+    async def test_warm_container_idle_cleanup(self) -> None:
+        stale_warm_name = "nexus-warm-unit-test-stale-sweep"
+        await asyncio.create_subprocess_exec(
+            "docker", "run", "-d", "--name", stale_warm_name, "node:22-bookworm-slim", "sleep", "60",
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await asyncio.sleep(0.5)
+
+        cleaned_count = await default_container_runner.cleanup_stale_containers(
+            prefix="nexus-warm-unit-test-stale", force_all_idle_warm=True
+        )
+        self.assertGreaterEqual(cleaned_count, 1)
+
+        proc = await asyncio.create_subprocess_exec(
+            "docker", "ps", "-a", "--filter", f"name={stale_warm_name}", "--format", "{{.ID}}",
             stdout=asyncio.subprocess.PIPE,
         )
         stdout, _ = await proc.communicate()

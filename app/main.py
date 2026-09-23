@@ -3,6 +3,7 @@ from __future__ import annotations
 from app.services.workspace_path_manager import default_path_manager
 
 import asyncio
+import mimetypes
 import csv
 import hashlib
 import hmac
@@ -19,10 +20,11 @@ from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Mapping
+import urllib.parse
 from urllib.parse import urljoin, urlparse
 
 import httpx
-from fastapi import FastAPI, File, HTTPException, Request, Response, UploadFile
+from fastapi import Body, FastAPI, File, Form, HTTPException, Request, Response, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -63,6 +65,7 @@ from app.services.knowledge_base_service import (
 )
 from app.services.workspace_service import (
     WorkspaceError,
+    WorkspaceConflictError,
     WorkspaceNotFoundError,
     WorkspaceService,
 )
@@ -884,11 +887,19 @@ async def on_startup() -> None:
         background.add_done_callback(_runtime_tasks.discard)
     for team_run in queued_team_runs:
         _schedule_team_run(team_run["id"])
+    from app.services.container_agent_runner import default_container_runner
+    default_container_runner._start_reaper_if_needed()
+    cleanup_bg = asyncio.create_task(default_container_runner.cleanup_stale_containers(prefix="nexus-"))
+    _runtime_tasks.add(cleanup_bg)
+    cleanup_bg.add_done_callback(_runtime_tasks.discard)
 
 
 @app.on_event("shutdown")
 async def on_shutdown() -> None:
     await loop_scheduler.stop()
+    from app.services.container_agent_runner import default_container_runner
+    if default_container_runner._reaper_task and not default_container_runner._reaper_task.done():
+        default_container_runner._reaper_task.cancel()
     pending = [item for item in _runtime_tasks if not item.done()]
     for item in pending:
         item.cancel()
@@ -1453,6 +1464,8 @@ def create_workspace(payload: WorkspaceCreate) -> dict[str, Any]:
         )
     except sqlite3.IntegrityError as exc:
         raise HTTPException(status_code=409, detail="项目 ID 已存在") from exc
+    except WorkspaceConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except (WorkspaceError, TypeError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -1496,6 +1509,8 @@ def update_workspace(
         )
     except WorkspaceNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except WorkspaceConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except (WorkspaceError, TypeError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -1659,6 +1674,244 @@ def get_workspace_codex_session(
         "meta": meta,
         "messages": messages,
     }
+
+
+@app.get("/api/workspaces/{workspace_id}/files/{file_path:path}")
+def get_workspace_file(workspace_id: str, file_path: str, inline: bool = False):
+    _require_workspace_access(workspace_id)
+    identity = auth_service.current_identity.get()
+    owner = db.query_one("SELECT owner_user_id, organization_id FROM workspaces WHERE id=?", (workspace_id,))
+    effective_user = owner["owner_user_id"] if owner and owner.get("owner_user_id") else (identity.get("user_id") if identity else "local-user")
+    org_id = owner["organization_id"] if owner and owner.get("organization_id") else "local-org"
+    paths = default_path_manager.get_paths(org_id, effective_user, workspace_id)
+
+    clean_rel = Path(file_path).as_posix().lstrip("/")
+    target = (paths.code_dir / clean_rel).resolve()
+    if not target.exists() or not str(target).startswith(str(paths.code_dir.resolve())):
+        target = (paths.root / clean_rel).resolve()
+        if not target.exists() or not str(target).startswith(str(paths.root.resolve())):
+            target = None
+            if identity and identity.get("user_id") and identity["user_id"] != effective_user:
+                alt_paths = default_path_manager.get_paths(org_id, identity["user_id"], workspace_id)
+                cand = (alt_paths.code_dir / clean_rel).resolve()
+                if cand.exists() and str(cand).startswith(str(alt_paths.code_dir.resolve())):
+                    target = cand
+                else:
+                    cand = (alt_paths.root / clean_rel).resolve()
+                    if cand.exists() and str(cand).startswith(str(alt_paths.root.resolve())):
+                        target = cand
+            if target is None:
+                for cand in default_path_manager.base_dir.glob(f"*/*/{workspace_id}/code/{clean_rel}"):
+                    if cand.is_file():
+                        target = cand.resolve()
+                        break
+            if "/" not in clean_rel:
+                for cand in paths.root.rglob(Path(clean_rel).name):
+                    if cand.is_file():
+                        target = cand.resolve()
+                        break
+    if not target or not target.is_file():
+        raise HTTPException(status_code=404, detail="文件不存在")
+
+    mime_type, _ = mimetypes.guess_type(target.name)
+    media_type = mime_type or "application/octet-stream"
+    if inline:
+        return FileResponse(target, media_type=media_type)
+    return FileResponse(target, filename=target.name, media_type=media_type)
+
+
+@app.get("/api/workspaces/{workspace_id}/files")
+def list_workspace_files(
+    workspace_id: str,
+    subpath: str = "",
+    recursive: bool = True,
+) -> dict[str, Any]:
+    _require_workspace_access(workspace_id)
+    identity = auth_service.current_identity.get()
+    owner = db.query_one("SELECT owner_user_id, organization_id FROM workspaces WHERE id=?", (workspace_id,))
+    effective_user = owner["owner_user_id"] if owner and owner.get("owner_user_id") else (identity.get("user_id") if identity else "local-user")
+    org_id = owner["organization_id"] if owner and owner.get("organization_id") else "local-org"
+    paths = default_path_manager.get_paths(org_id, effective_user, workspace_id)
+
+    code_dir = paths.code_dir.resolve()
+    has_files = False
+    try:
+        has_files = any(code_dir.iterdir())
+    except Exception:
+        has_files = False
+    if not has_files:
+        if identity and identity.get("user_id") and identity["user_id"] != effective_user:
+            alt_paths = default_path_manager.get_paths(org_id, identity["user_id"], workspace_id)
+            if alt_paths.code_dir.exists():
+                try:
+                    if any(alt_paths.code_dir.iterdir()):
+                        code_dir = alt_paths.code_dir.resolve()
+                        has_files = True
+                except Exception:
+                    pass
+        if not has_files:
+            for cand in default_path_manager.base_dir.glob(f"*/*/{workspace_id}/code"):
+                if cand.is_dir():
+                    try:
+                        if any(cand.iterdir()):
+                            code_dir = cand.resolve()
+                            break
+                    except Exception:
+                        pass
+    base_dir = code_dir
+    clean_sub = ""
+    if subpath:
+        clean_sub = Path(subpath).as_posix().lstrip("/")
+        cand = (code_dir / clean_sub).resolve()
+        if cand.exists() and str(cand).startswith(str(code_dir)):
+            base_dir = cand
+
+    if not base_dir.exists():
+        base_dir.mkdir(parents=True, exist_ok=True)
+
+    items: list[dict[str, Any]] = []
+    ignore_dirs = {".git", "__pycache__", ".venv", ".pytest_cache", "node_modules"}
+
+    def scan_dir(d: Path, rel_prefix: str = ""):
+        try:
+            entries = sorted(d.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
+        except Exception:
+            return
+        for entry in entries:
+            if entry.name in ignore_dirs or entry.name.startswith("."):
+                continue
+            rel = f"{rel_prefix}/{entry.name}" if rel_prefix else entry.name
+            if entry.is_dir():
+                items.append({
+                    "name": entry.name,
+                    "path": rel,
+                    "is_dir": True,
+                    "size": 0,
+                    "modified_at": datetime.fromtimestamp(entry.stat().st_mtime, timezone.utc).isoformat(),
+                    "kind": "directory",
+                })
+                if recursive:
+                    scan_dir(entry, rel)
+            elif entry.is_file():
+                ext = entry.suffix.lstrip(".").lower()
+                stat = entry.stat()
+                download_rel = "/".join(
+                    urllib.parse.quote(part) for part in ([*clean_sub.split("/")] if clean_sub else []) + rel.split("/")
+                )
+                items.append({
+                    "name": entry.name,
+                    "path": rel,
+                    "is_dir": False,
+                    "size": stat.st_size,
+                    "modified_at": datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat(),
+                    "kind": ext or "file",
+                    "download_url": f"/api/workspaces/{workspace_id}/files/{download_rel}",
+                    "preview_url": f"/api/workspaces/{workspace_id}/files/{download_rel}?inline=true",
+                })
+
+    scan_dir(base_dir)
+
+    return {
+        "workspace_id": workspace_id,
+        "subpath": subpath,
+        "items": items,
+        "total": len(items),
+    }
+
+
+@app.post("/api/workspaces/{workspace_id}/files/upload")
+async def upload_workspace_file(
+    workspace_id: str,
+    file: UploadFile = File(...),
+    subpath: str = Form(""),
+) -> dict[str, Any]:
+    _require_workspace_access(workspace_id)
+    identity = auth_service.current_identity.get()
+    owner = db.query_one("SELECT owner_user_id, organization_id FROM workspaces WHERE id=?", (workspace_id,))
+    effective_user = owner["owner_user_id"] if owner and owner.get("owner_user_id") else (identity.get("user_id") if identity else "local-user")
+    org_id = owner["organization_id"] if owner and owner.get("organization_id") else "local-org"
+    paths = default_path_manager.get_paths(org_id, effective_user, workspace_id)
+
+    max_bytes = int(os.getenv("APP_MAX_UPLOAD_MB", "50")) * 1024 * 1024
+    raw = await file.read(max_bytes + 1)
+    if len(raw) > max_bytes:
+        raise HTTPException(status_code=413, detail="文件超过上传大小限制")
+
+    code_dir = paths.code_dir.resolve()
+    target_dir = code_dir
+    if subpath:
+        clean_sub = Path(subpath).as_posix().lstrip("/")
+        cand = (code_dir / clean_sub).resolve()
+        if str(cand).startswith(str(code_dir)):
+            target_dir = cand
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    original_name = Path(file.filename or "upload.bin").name
+    safe_name = re.sub(r'[\\/:*?"<>|]', "_", original_name)
+    target_file = (target_dir / safe_name).resolve()
+    if not str(target_file).startswith(str(code_dir)):
+        raise HTTPException(status_code=400, detail="非法文件路径")
+
+    target_file.write_bytes(raw)
+
+    rel_path = target_file.relative_to(code_dir).as_posix()
+    ext = target_file.suffix.lstrip(".").lower()
+    stat = target_file.stat()
+    encoded_rel = "/".join(urllib.parse.quote(part) for part in rel_path.split("/"))
+
+    upload_id = "upl_" + uuid.uuid4().hex[:12]
+    record = {
+        "id": upload_id,
+        "name": safe_name,
+        "content_type": file.content_type or "application/octet-stream",
+        "size": len(raw),
+        "path": str(target_file),
+        "created_at": db.utc_now(),
+    }
+    db.execute(
+        "INSERT INTO uploads(id, name, content_type, size, path, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+        tuple(record.values()),
+    )
+    if identity:
+        db.execute("INSERT INTO upload_owners(upload_id, user_id) VALUES (?, ?)", (upload_id, identity["user_id"]))
+
+    return {
+        "ok": True,
+        "file": {
+            "name": safe_name,
+            "path": rel_path,
+            "size": stat.st_size,
+            "kind": ext or "file",
+            "modified_at": datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat(),
+            "download_url": f"/api/workspaces/{workspace_id}/files/{encoded_rel}",
+            "preview_url": f"/api/workspaces/{workspace_id}/files/{encoded_rel}?inline=true",
+        }
+    }
+
+
+@app.delete("/api/workspaces/{workspace_id}/files/{file_path:path}")
+def delete_workspace_file(workspace_id: str, file_path: str) -> dict[str, Any]:
+    _require_workspace_access(workspace_id, manage=True)
+    identity = auth_service.current_identity.get()
+    owner = db.query_one("SELECT owner_user_id, organization_id FROM workspaces WHERE id=?", (workspace_id,))
+    effective_user = owner["owner_user_id"] if owner and owner.get("owner_user_id") else (identity.get("user_id") if identity else "local-user")
+    org_id = owner["organization_id"] if owner and owner.get("organization_id") else "local-org"
+    paths = default_path_manager.get_paths(org_id, effective_user, workspace_id)
+
+    code_dir = paths.code_dir.resolve()
+    clean_rel = Path(file_path).as_posix().lstrip("/")
+    target = (code_dir / clean_rel).resolve()
+    if not target.exists() or not str(target).startswith(str(code_dir)):
+        raise HTTPException(status_code=404, detail="文件不存在")
+    if target == code_dir:
+        raise HTTPException(status_code=400, detail="不能删除项目根目录")
+
+    if target.is_dir():
+        shutil.rmtree(target)
+    else:
+        target.unlink()
+
+    return {"ok": True, "path": clean_rel}
 
 
 @app.delete("/api/workspaces/{workspace_id}")
@@ -3139,8 +3392,11 @@ def get_system_settings() -> dict[str, Any]:
 
 
 @app.put("/api/system-settings")
-def update_system_settings(payload: SystemSettingsUpdate) -> dict[str, Any]:
+async def update_system_settings(payload: SystemSettingsUpdate) -> dict[str, Any]:
     val = set_runner_idle_seconds(payload.runner_idle_seconds)
+    if val == 0:
+        from app.services.container_agent_runner import default_container_runner
+        await default_container_runner.cleanup_stale_containers(prefix="nexus-", force_all_idle_warm=True)
     return {
         "runner_idle_seconds": val,
     }
@@ -3444,7 +3700,7 @@ def _public_artifact(value: dict[str, Any]) -> dict[str, Any]:
     allowed = {
         "id", "task_id", "run_id", "workspace_id", "name", "kind",
         "mime_type", "size", "sha256", "version", "created_at",
-        "delivery_status",
+        "delivery_status", "relative_path",
     }
     result = {key: value.get(key) for key in allowed if value.get(key) not in (None, "")}
     result["delivery_status"] = delivery_status
@@ -4404,9 +4660,18 @@ def _public_task(
             }
         else:
             result["result"] = _sanitize_public_payload(stored_result)
+    stored_artifacts = db.json_loads(value.get("artifacts_json"), [])
+    if not stored_artifacts and value.get("result_json"):
+        stored_result_data = db.json_loads(value.get("result_json"), {})
+        if isinstance(stored_result_data.get("artifacts"), list) and stored_result_data.get("artifacts"):
+            stored_artifacts = stored_result_data.get("artifacts")
+    if not stored_artifacts and value.get("id"):
+        db_artifacts = db.query_all("SELECT * FROM artifacts WHERE task_id = ? ORDER BY id", (value["id"],))
+        if db_artifacts:
+            stored_artifacts = db_artifacts
     result["artifacts"] = [
         _public_artifact(item)
-        for item in db.json_loads(value.get("artifacts_json"), [])
+        for item in stored_artifacts
         if isinstance(item, dict)
     ]
     if include_attachments:
@@ -5209,7 +5474,8 @@ async def create_task(payload: TaskCreate, request: Request = None) -> dict[str,
                 raise HTTPException(status_code=403, detail="管理员未授权当前角色使用该第三方执行引擎")
 
     fallback_model_id = str((selected_agent or {}).get("model") or "")
-    _ensure_model_ready(payload.model_id or fallback_model_id or "deterministic", label="所选模型")
+    if payload.execution_engine not in ("codex", "claude"):
+        _ensure_model_ready(payload.model_id or fallback_model_id or "deterministic", label="所选模型")
     if payload.executor_type == "team":
         try:
             task, run, team_run = expert_team_service.create_task_and_run(
@@ -5273,6 +5539,8 @@ async def create_task(payload: TaskCreate, request: Request = None) -> dict[str,
                 executor_type=payload.executor_type,
                 executor_id=executor_id,
                 execution_engine=payload.execution_engine,
+                execution_model=payload.execution_model or "",
+                execution_reasoning_effort=payload.execution_reasoning_effort or "",
             )
             run = task_state.create_run_in_transaction(
                 conn,
@@ -5350,36 +5618,94 @@ def get_conversation_messages(conversation_id: str) -> dict[str, Any]:
                 "task_id": task["id"],
                 "event_id": public_error.get("id"),
             })
-    return {"conversation_id": conversation_id, "messages": messages}
+    conversation_artifacts: list[dict[str, Any]] = []
+    task_ids = [r["id"] for r in rows]
+    if task_ids:
+        placeholders = ",".join("?" for _ in task_ids)
+        artifact_rows = db.query_all(
+            f"SELECT * FROM artifacts WHERE task_id IN ({placeholders}) AND delivery_status != 'rejected' ORDER BY created_at DESC",  # noqa: S608 - placeholders only
+            tuple(task_ids),
+        )
+        seen_paths: set[str] = set()
+        for art in artifact_rows:
+            key = art.get("relative_path") or art.get("name") or art.get("id")
+            if key not in seen_paths:
+                seen_paths.add(key)
+                conversation_artifacts.append(_public_artifact(art))
+        for task in reversed(rows):
+            task_arts = db.json_loads(task.get("artifacts_json"), [])
+            if not task_arts and task.get("result_json"):
+                res_data = db.json_loads(task.get("result_json"), {})
+                if isinstance(res_data.get("artifacts"), list):
+                    task_arts = res_data.get("artifacts")
+            for item in (task_arts or []):
+                if isinstance(item, dict):
+                    key = item.get("relative_path") or item.get("name") or item.get("id")
+                    if key not in seen_paths:
+                        seen_paths.add(key)
+                        conversation_artifacts.append(_public_artifact(item))
+    meta = db.query_one("SELECT title FROM conversation_metadata WHERE conversation_id = ?", (conversation_id,))
+    title = meta["title"] if meta and meta.get("title") else (rows[0]["message"] if rows else "")
+    return {
+        "conversation_id": conversation_id,
+        "title": title,
+        "messages": messages,
+        "artifacts": conversation_artifacts,
+        "latest_task_id": rows[-1]["id"] if rows else None,
+    }
 
 
 @app.get("/api/workspaces/{workspace_id}/conversations")
 def list_workspace_conversations(workspace_id: str) -> dict[str, Any]:
     _require_workspace_access(workspace_id)
     identity = auth_service.current_identity.get()
-    owner_clause = " AND user_id=? AND organization_id='local-org'" if identity and identity["role"] != "admin" else ""
+    owner_clause = " AND t.user_id=? AND t.organization_id='local-org'" if identity and identity["role"] != "admin" else ""
     query = f"""
         SELECT
-            conversation_id,
-            MIN(created_at) as created_at,
-            MAX(created_at) as updated_at,
-            COUNT(id) as message_count,
-            MIN(message) as preview,
-            MAX(id) as latest_task_id,
-            MAX(execution_engine) as execution_engine
-        FROM tasks
-        WHERE workspace = ? AND conversation_id != '' {owner_clause}
-        GROUP BY conversation_id
+            t.conversation_id,
+            MIN(t.created_at) as created_at,
+            MAX(t.created_at) as updated_at,
+            COUNT(t.id) as message_count,
+            COALESCE(cm.title, '') as custom_title,
+            MIN(t.message) as preview,
+            MAX(t.id) as latest_task_id,
+            MAX(t.execution_engine) as execution_engine
+        FROM tasks t
+        LEFT JOIN conversation_metadata cm ON cm.conversation_id = t.conversation_id
+        WHERE t.workspace = ? AND t.conversation_id != '' {owner_clause}
+        GROUP BY t.conversation_id
         ORDER BY updated_at DESC
         LIMIT 50
     """
     params = (workspace_id, identity["user_id"]) if owner_clause else (workspace_id,)
     rows = db.query_all(query, params)
+    for r in rows:
+        r["title"] = r.get("custom_title") or r.get("preview") or "未命名会话"
     return {"workspace_id": workspace_id, "conversations": rows}
 
 
+@app.put("/api/conversations/{conversation_id}/title")
+def update_conversation_title(conversation_id: str, payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    new_title = str(payload.get("title", "")).strip()
+    if not new_title:
+        raise HTTPException(status_code=400, detail="会话标题不能为空")
+    now = db.utc_now()
+    task = db.query_one("SELECT workspace FROM tasks WHERE conversation_id = ? LIMIT 1", (conversation_id,))
+    workspace_id = task["workspace"] if task else "default"
+    _require_workspace_access(workspace_id)
+    db.execute(
+        """
+        INSERT INTO conversation_metadata(conversation_id, workspace_id, title, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(conversation_id) DO UPDATE SET title = excluded.title, updated_at = excluded.updated_at
+        """,
+        (conversation_id, workspace_id, new_title, now, now),
+    )
+    return {"conversation_id": conversation_id, "title": new_title, "updated_at": now}
+
+
 @app.post("/api/uploads")
-async def upload_file(file: UploadFile = File(...)) -> dict[str, Any]:
+async def upload_file(file: UploadFile = File(...), workspace_id: str | None = None) -> dict[str, Any]:
     max_bytes = int(os.getenv("APP_MAX_UPLOAD_MB", "20")) * 1024 * 1024
     raw = await file.read(max_bytes + 1)
     if len(raw) > max_bytes:
@@ -5395,6 +5721,17 @@ async def upload_file(file: UploadFile = File(...)) -> dict[str, Any]:
     identity = auth_service.current_identity.get()
     if identity:
         db.execute("INSERT INTO upload_owners(upload_id,user_id) VALUES(?,?)", (upload_id, identity["user_id"]))
+    if workspace_id:
+        try:
+            _require_workspace_access(workspace_id)
+            owner = db.query_one("SELECT owner_user_id, organization_id FROM workspaces WHERE id=?", (workspace_id,))
+            effective_user = owner["owner_user_id"] if owner and owner.get("owner_user_id") else (identity.get("user_id") if identity else "local-user")
+            org_id = owner["organization_id"] if owner and owner.get("organization_id") else "local-org"
+            paths = default_path_manager.get_paths(org_id, effective_user, workspace_id)
+            paths.code_dir.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(path, paths.code_dir / safe_name)
+        except Exception as e:
+            logger.warning("复制上传文件到工作区失败: %s", e)
     return _public_attachment(record)
 
 

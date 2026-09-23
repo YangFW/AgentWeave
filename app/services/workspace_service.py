@@ -40,6 +40,10 @@ class WorkspaceNotFoundError(WorkspaceError):
     pass
 
 
+class WorkspaceConflictError(WorkspaceError):
+    pass
+
+
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -221,6 +225,12 @@ class WorkspaceService:
             raise TypeError("enabled must be a boolean")
         now = self._clock()
         with self._connection(write=True) as conn:
+            dup = conn.execute(
+                "SELECT id FROM workspaces WHERE organization_id = ? AND LOWER(TRIM(name)) = LOWER(TRIM(?)) AND enabled = 1",
+                (scope.organization_id, name),
+            ).fetchone()
+            if dup:
+                raise WorkspaceConflictError(f"项目名称“{name}”已存在，请使用其他名称")
             conn.execute(
                 """
                 INSERT INTO workspaces(
@@ -270,6 +280,13 @@ class WorkspaceService:
         now = self._clock()
         with self._connection(write=True) as conn:
             self._require_workspace(conn, workspace_id, scope)
+            if enabled:
+                dup = conn.execute(
+                    "SELECT id FROM workspaces WHERE organization_id = ? AND LOWER(TRIM(name)) = LOWER(TRIM(?)) AND id != ? AND enabled = 1",
+                    (scope.organization_id, name, workspace_id),
+                ).fetchone()
+                if dup:
+                    raise WorkspaceConflictError(f"项目名称“{name}”已存在，请使用其他名称")
             conn.execute(
                 """
                 UPDATE workspaces

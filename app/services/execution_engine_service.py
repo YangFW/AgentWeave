@@ -19,6 +19,8 @@ ENGINE_CREDENTIAL_ENV_KEYS = (
     "CLAUDE_CODE_OAUTH_TOKEN",
 )
 
+REASONING_EFFORTS = {"low", "medium", "high", "xhigh"}
+
 BUILTIN_EXECUTION_ENGINES: dict[str, dict[str, Any]] = {
     "codex": {
         "name": "Codex",
@@ -262,6 +264,29 @@ def update_engine(engine_id: str, changes: Mapping[str, Any]) -> dict[str, Any]:
         else:
             config.pop("model", None)
 
+    if "model_options" in changes:
+        raw_options = changes.get("model_options") or []
+        if not isinstance(raw_options, (list, tuple)):
+            raise ExecutionEngineError("可选模型必须是列表")
+        options: list[str] = []
+        for value in raw_options:
+            model_name = str(value or "").strip()
+            if model_name and model_name not in options:
+                options.append(model_name)
+        default_model = str(config.get("model") or "").strip()
+        if default_model and default_model not in options:
+            options.insert(0, default_model)
+        config["model_options"] = options
+
+    if "reasoning_effort" in changes:
+        effort = str(changes.get("reasoning_effort") or "").strip().lower()
+        if effort and effort not in REASONING_EFFORTS:
+            raise ExecutionEngineError("推理强度必须是 low、medium、high 或 xhigh")
+        if effort:
+            config["reasoning_effort"] = effort
+        else:
+            config.pop("reasoning_effort", None)
+
     db.execute(
         """
         UPDATE execution_engines
@@ -290,6 +315,16 @@ def configured_model_name(row: Mapping[str, Any] | None) -> str:
     config = db.json_loads(row.get("config_json"), {})
     if isinstance(config, dict):
         return str(config.get("model") or "").strip()
+    return ""
+
+
+def configured_reasoning_effort(row: Mapping[str, Any] | None) -> str:
+    if not row:
+        return ""
+    config = db.json_loads(row.get("config_json"), {})
+    if isinstance(config, dict):
+        value = str(config.get("reasoning_effort") or "").strip().lower()
+        return value if value in REASONING_EFFORTS else ""
     return ""
 
 

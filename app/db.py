@@ -134,6 +134,14 @@ def _shared_scope_schema(conn: sqlite3.Connection) -> None:
             updated_at TEXT NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS conversation_metadata (
+            conversation_id TEXT PRIMARY KEY,
+            workspace_id TEXT NOT NULL DEFAULT 'default',
+            title TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS expert_templates (
             id TEXT PRIMARY KEY,
             name TEXT NOT NULL,
@@ -944,6 +952,8 @@ def init_db() -> None:
                     conversation_id TEXT NOT NULL DEFAULT '',
                     workspace TEXT NOT NULL DEFAULT 'default',
                     execution_engine TEXT NOT NULL DEFAULT 'builtin',
+                    execution_model TEXT NOT NULL DEFAULT '',
+                    execution_reasoning_effort TEXT NOT NULL DEFAULT '',
                     status TEXT NOT NULL DEFAULT 'queued',
                     result_json TEXT NOT NULL DEFAULT '{}',
                     artifacts_json TEXT NOT NULL DEFAULT '[]',
@@ -1050,6 +1060,10 @@ def init_db() -> None:
                 conn.execute("ALTER TABLE tasks ADD COLUMN conversation_id TEXT NOT NULL DEFAULT ''")
             if "execution_engine" not in task_columns:
                 conn.execute("ALTER TABLE tasks ADD COLUMN execution_engine TEXT NOT NULL DEFAULT 'builtin'")
+            if "execution_reasoning_effort" not in task_columns:
+                conn.execute("ALTER TABLE tasks ADD COLUMN execution_reasoning_effort TEXT NOT NULL DEFAULT ''")
+            if "execution_model" not in task_columns:
+                conn.execute("ALTER TABLE tasks ADD COLUMN execution_model TEXT NOT NULL DEFAULT ''")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_conversation_created ON tasks(conversation_id, created_at)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_skill_files_skill ON skill_files(skill_id, path)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_loops_due ON loops(status, next_run_at)")

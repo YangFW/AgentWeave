@@ -12,12 +12,21 @@ ResourceId = Annotated[
         strip_whitespace=True,
         min_length=2,
         max_length=80,
-        pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]+$",
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:-]+$",
     ),
 ]
 ResourceName = Annotated[
     str,
     StringConstraints(strip_whitespace=True, min_length=1, max_length=120),
+]
+Username = Annotated[
+    str,
+    StringConstraints(
+        strip_whitespace=True,
+        min_length=2,
+        max_length=80,
+        pattern=r"^[\w\-.@\u4e00-\u9fa5]+$",
+    ),
 ]
 McpKind = Literal["builtin", "http", "mcp_stdio", "stdio", "mcp_http", "streamable_http"]
 ModelProvider = Literal["openai", "openai_compatible"]
@@ -25,13 +34,13 @@ ApiKeyMode = Literal["env", "direct"]
 
 
 class UserCreate(BaseModel):
-    username: ResourceId
-    password: str = Field(min_length=12, max_length=256, repr=False)
+    username: Username
+    password: str = Field(min_length=6, max_length=256, repr=False)
     role: Literal["admin", "user"] = "user"
 
 
 class UserUpdate(BaseModel):
-    password: str | None = Field(default=None, min_length=12, max_length=256, repr=False)
+    password: str | None = Field(default=None, min_length=6, max_length=256, repr=False)
     role: Literal["admin", "user"] | None = None
     enabled: bool | None = None
 
@@ -303,6 +312,8 @@ class ExecutionEngineUpdate(BaseModel):
     api_key: str | None = None
     api_key_mode: ApiKeyMode | None = None
     model: str | None = Field(default=None, max_length=200)
+    model_options: list[str] | None = None
+    reasoning_effort: str | None = Field(default=None, max_length=20)
     config: dict[str, Any] | None = None
 
     @field_validator("base_url")
@@ -324,6 +335,8 @@ class TaskCreate(BaseModel):
     executor_id: str | None = None
     attachment_ids: list[str] = Field(default_factory=list, max_length=10)
     execution_engine: str = Field(default="builtin", pattern="^(builtin|codex|claude|container)$")
+    execution_model: str | None = Field(default=None, max_length=200)
+    execution_reasoning_effort: str | None = Field(default=None, max_length=20)
 
     @field_validator('attachment_ids')
     @classmethod
@@ -331,6 +344,16 @@ class TaskCreate(BaseModel):
         if len(value) != len(set(value)):
             raise ValueError('同一附件不能重复添加')
         return value
+
+    @field_validator("execution_reasoning_effort")
+    @classmethod
+    def validate_execution_reasoning_effort(cls, value: str | None) -> str | None:
+        if value is None or not value.strip():
+            return None
+        normalized = value.strip().lower()
+        if normalized not in {"low", "medium", "high", "xhigh"}:
+            raise ValueError("推理强度必须是 low、medium、high 或 xhigh")
+        return normalized
 
 
 class ToolInvokeRequest(BaseModel):

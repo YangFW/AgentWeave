@@ -52,7 +52,15 @@ class WorkspacePathManager:
         if base_dir is None:
             base_env = os.getenv("APP_WORKSPACES_ROOT")
             if base_env:
-                self._base_dir = Path(base_env).resolve()
+                configured = Path(base_env).expanduser()
+                # Environment files are often loaded while the process cwd is
+                # a launcher directory (for example /home/vpn), not the
+                # application directory.  Resolve relative workspace roots
+                # against the project root so the API and worker see the same
+                # files regardless of how Uvicorn was launched.
+                if not configured.is_absolute():
+                    configured = Path(__file__).resolve().parents[2] / configured
+                self._base_dir = configured.resolve()
             else:
                 self._base_dir = Path(__file__).resolve().parents[2] / "data" / "workspaces"
         else:

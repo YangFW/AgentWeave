@@ -100,7 +100,9 @@ class ExecutionEngineApiTests(unittest.TestCase):
         secret_store.key_file = Path(self.temp_dir.name) / ".secret_key"
         db.init_db()
         auth_service.init_schema()
+        auth_service.create_user("admin", "admin123456", "admin")
         self.client = TestClient(__import__("app.main", fromlist=["app"]).app)
+        self.client.post("/api/auth/login", json={"username": "admin", "password": "admin123456"})
 
     def tearDown(self) -> None:
         self.client.close()

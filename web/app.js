@@ -69,6 +69,9 @@ const state = {
   selectedKnowledgeBase: null,
   selectedConversationSummary: null,
   selectedArtifact: null,
+  projectFiles: [],
+  projectFilesSubpath: '',
+  selectedProjectFile: null,
   selectedExpertTemplate: null,
   selectedExpertTeam: null,
   selectedExpertRun: null,
@@ -139,9 +142,15 @@ async function api(path, options = {}) {
     let message = text || res.statusText;
     try {
       const parsed = JSON.parse(text);
-      message = parsed.detail || parsed.message || message;
+      if (Array.isArray(parsed.detail)) {
+        message = parsed.detail.map((item) => item.msg || JSON.stringify(item)).join('；');
+      } else if (parsed.detail && typeof parsed.detail === 'object') {
+        message = parsed.detail.message || JSON.stringify(parsed.detail);
+      } else {
+        message = parsed.detail || parsed.message || message;
+      }
     } catch (_) {}
-    const error = new Error(message);
+    const error = new Error(typeof message === 'string' ? message : JSON.stringify(message));
     error.status = res.status;
     error.path = path;
     throw error;
@@ -286,13 +295,22 @@ function finishTaskUi(taskId, status = 'completed') {
     if ($('taskOverviewStatus')) $('taskOverviewStatus').textContent = '已完成 · 点击查看';
     if ($('runtimeInspectorStatus')) $('runtimeInspectorStatus').textContent = '已完成 · 点击追踪';
     if ($('timelineStatus')) $('timelineStatus').textContent = '执行完成 · 点击追踪';
+    loadArtifactsOnly({ preserveSelection: true }).catch(() => {});
   }
 }
 
 function finishSubmissionFailure(message, { notifyUser = true } = {}) {
-  const detail = String(message || '模型配置不可用，请检查模型设置后重试。').trim();
+  let text = message;
+  if (typeof text === 'object' && text !== null) {
+    text = text.message || text.detail || (text.error && (text.error.message || text.error)) || (text instanceof Error ? text.toString() : JSON.stringify(text));
+  }
+  const detail = String(text || '模型配置不可用，请检查模型设置后重试。').trim();
   const statusNodePresent = Boolean(state.taskUiStatusNode?.isConnected);
   const taskId = state.taskUiTaskId || '__pending__';
+  const item = agentThinkingCard(taskId);
+  if (item) {
+    item.current = { type: 'error', kind: 'error', label: '发送失败', detail };
+  }
   finishTaskUi(taskId, 'submission_failed');
   // A stale page can have lost the temporary status node while the POST is
   // still in flight.  Always create a terminal status in that case so the UI
@@ -771,7 +789,7 @@ function finishAgentThinkingCard(taskId, status = 'completed') {
   if (!item) return;
   item.status = status === 'succeeded' ? 'completed' : status === 'submission_failed' ? 'failed' : status;
   if (status === 'submission_failed') {
-    item.current = { type: 'error', kind: 'error', label: '发送失败', detail: '所选模型不可用，任务尚未开始执行' };
+    item.current = { type: 'error', kind: 'error', label: '发送失败', detail: item.current?.detail || '所选模型不可用或服务异常，任务尚未开始执行' };
   }
   item.finishedAt = item.finishedAt || Date.now();
   // Historical cards stay open when the user explicitly expanded them; live
@@ -855,7 +873,13 @@ function setBusy(button, busy, label = '保存中…') {
   button.textContent = busy ? label : button.dataset.label;
 }
 
-function switchTab(tab) {
+function switchTab(tab, { skipLoad = false } = {}) {
+  const adminOnlyTabs = ['users', 'engines', 'models', 'mcp', 'diagnostics'];
+  if (state.authEnabled && state.currentUser?.role !== 'admin' && adminOnlyTabs.includes(tab)) {
+    notify('当前为普通成员账号，该功能仅限平台管理员访问', 'error');
+    switchTab('chat');
+    return;
+  }
   document.querySelectorAll('.nav').forEach((btn) => btn.classList.toggle('active', btn.dataset.tab === tab));
   document.querySelectorAll('.tab').forEach((el) => el.classList.remove('active'));
   $(`tab-${tab}`).classList.add('active');
@@ -863,6 +887,7 @@ function switchTab(tab) {
     clearTimeout(state.loopPollTimer);
     state.loopPollTimer = null;
   }
+  if (skipLoad) return;
   if (tab === 'workspaces') {
     loadWorkspacesOnly({ preserveSelection: true }).catch((err) => notify(`项目刷新失败：${err.message || err}`, 'error'));
   } else if (tab === 'skills') {
@@ -880,7 +905,11 @@ function switchTab(tab) {
   } else if (tab === 'diagnostics') {
     loadDiagnosticsOnly().catch((err) => notify(`自检失败：${err.message || err}`, 'error'));
   } else if (tab === 'artifacts') {
-    loadArtifactsOnly({ preserveSelection: true }).catch((err) => notify(`产物刷新失败：${err.message || err}`, 'error'));
+    if (state.artifactViewMode === 'project_files') {
+      loadProjectFilesOnly({ preserveSelection: true }).catch((err) => notify(`项目文件刷新失败：${err.message || err}`, 'error'));
+    } else {
+      loadArtifactsOnly({ preserveSelection: true }).catch((err) => notify(`产物刷新失败：${err.message || err}`, 'error'));
+    }
   } else if (tab === 'loops') {
     loadLoopsOnly().catch((err) => notify(`自动化刷新失败：${err.message || err}`, 'error'));
   } else if (tab === 'users') {
@@ -1017,6 +1046,10 @@ async function loadAll() {
     resetExpertRunLive('暂时无法读取团队运行。');
   }
   await refreshExecutionMode();
+  if ($('serviceStatus')) {
+    $('serviceStatus').classList.remove('offline');
+    $('serviceStatus').querySelector('b').textContent = '服务已连接';
+  }
 }
 
 async function refreshExecutionMode() {
@@ -1057,21 +1090,31 @@ function renderWorkbenchTeamOptions() {
 
 function renderWorkbenchMode() {
   const expert = state.workbenchMode === 'expert';
+  const engineValue = $('executionEngineSelect')?.value || 'builtin';
+  const externalEngine = engineValue === 'codex' || engineValue === 'claude';
   document.querySelectorAll('[data-workbench-mode]').forEach((button) => {
     const active = button.dataset.workbenchMode === state.workbenchMode;
+    const disabled = externalEngine && button.dataset.workbenchMode === 'expert';
     button.classList.toggle('active', active);
+    button.classList.toggle('disabled', disabled);
     button.setAttribute('aria-pressed', active ? 'true' : 'false');
+    button.disabled = disabled;
+    button.title = disabled ? 'Codex / Claude Code 为直接执行模式，暂不使用专家团编排' : '';
   });
   $('agentSelect')?.classList.toggle('hidden', expert);
   $('expertTeamControl')?.classList.toggle('hidden', !expert);
   const selectedTeam = enabledWorkbenchTeams().find((team) => team.id === $('expertTeamSelect')?.value);
   if ($('workbenchModeDescription')) {
-    $('workbenchModeDescription').textContent = expert
+    $('workbenchModeDescription').textContent = externalEngine
+      ? '当前使用外部执行引擎直接处理任务；模型与推理强度请在“引擎参数”中选择。'
+      : expert
       ? '自动匹配已配置的专家团；团队内成员独立并行分析，再由主管统一汇总和验收。'
       : '描述目标或上传资料，任务助手会自动选择合适的技能和工具。';
   }
   if ($('composerModeHint')) {
-    $('composerModeHint').textContent = expert
+    $('composerModeHint').textContent = externalEngine
+      ? '外部引擎直跑 · 专家模式仅内置智能体可用'
+      : expert
       ? '专家协作 · 根据目标匹配已启用团队'
       : '单智能体处理 · 自动匹配技能和工具';
   }
@@ -1119,9 +1162,9 @@ function buildGroupedModelOptionsHtml(models, { includeStatus = true } = {}) {
     for (const m of groupModels) {
       const readyState = m.readiness?.state || 'ready';
       const statusSuffix = includeStatus ? ` · ${m.readiness?.label || (m.enabled ? '可用' : '停用')}` : '';
-      let cleanName = m.name;
+      let cleanName = String(m.name || m.id || '');
       if (cleanName.startsWith('[') && cleanName.includes(']')) {
-        cleanName = cleanName.split(']', 1)[1].trim();
+        cleanName = cleanName.slice(cleanName.indexOf(']') + 1).trim();
       }
       const labelText = `[${sourceName}] ${cleanName}${statusSuffix}`;
       html += `<option value="${escapeHtml(m.id)}" ${readyState !== 'ready' ? 'disabled' : ''}>${escapeHtml(labelText)}</option>`;
@@ -1131,7 +1174,7 @@ function buildGroupedModelOptionsHtml(models, { includeStatus = true } = {}) {
   return html;
 }
 
-function renderTaskModelSelect() {
+function renderTaskModelSelect({ syncEngine = true } = {}) {
   const select = $('taskModelSelect');
   if (!select) return;
   const enabled = state.models.filter((m) => m.enabled);
@@ -1139,17 +1182,23 @@ function renderTaskModelSelect() {
   const explicit = readPreference('model-explicit') === '1';
   const workspacePreferred = state.selectedWorkspace?.default_model_id;
   const remembered = select.value || readPreference('model');
+
+  const matchModel = (targetId) => {
+    if (!targetId) return null;
+    return ready.find((m) => m.id === targetId || m.id.endsWith('::' + targetId) || m.model === targetId);
+  };
+
+  const matchedWorkspace = matchModel(workspacePreferred)?.id;
+  const matchedRemembered = matchModel(remembered)?.id;
   const preferred = explicit
-    ? remembered || workspacePreferred || ready.find((m) => m.id !== 'deterministic')?.id || 'deterministic'
-    : workspacePreferred && ready.some((m) => m.id === workspacePreferred)
-      ? workspacePreferred
-      : ready.find((m) => m.id !== 'deterministic')?.id || workspacePreferred || remembered || 'deterministic';
+    ? matchedRemembered || matchedWorkspace || ready.find((m) => m.id !== 'deterministic')?.id || 'deterministic'
+    : matchedWorkspace || ready.find((m) => m.id !== 'deterministic')?.id || matchedRemembered || 'deterministic';
 
   select.innerHTML = buildGroupedModelOptionsHtml(enabled, { includeStatus: true });
   if (ready.some((m) => m.id === preferred)) select.value = preferred;
   else if (ready.length) select.value = ready[0].id;
   renderWorkbenchModelStatus();
-  renderExecutionEngineSelect();
+  if (syncEngine) renderExecutionEngineSelect();
 }
 
 function currentWorkbenchModel() {
@@ -1248,6 +1297,47 @@ function renderAssistantContent(content) {
   return `<div class="assistant-response">${introMarkup}${resultMarkup}${detailMarkup}</div>`;
 }
 
+function resolveArtifactReference(ref) {
+  if (!ref) return null;
+  const clean = String(ref).trim()
+    .replace(/^\/workspace\//, '')
+    .replace(/^code\//, '')
+    .replace(/:\d+(?::\d+)?$/, '')
+    .trim();
+  if (!clean) return null;
+  const artifacts = state.artifacts || [];
+  const filename = clean.split('/').pop();
+  const hasPath = clean.includes('/');
+  if (hasPath) {
+    const exact = artifacts.find((a) => a.relative_path === clean || a.id === clean || (a.download_url && a.download_url.includes(clean)));
+    if (exact) return exact;
+    const suffix = artifacts.find((a) => a.relative_path && (a.relative_path.endsWith('/' + clean) || a.relative_path.endsWith(clean)));
+    if (suffix) return suffix;
+    return null;
+  }
+  return artifacts.find((a) =>
+    a.relative_path === clean ||
+    a.name === clean ||
+    a.id === clean ||
+    (a.download_url && a.download_url.includes(clean))
+  ) || null;
+}
+
+async function openWorkspaceFileFallback(cleanName) {
+  try { await loadArtifactsOnly(); } catch (_) {}
+  const art = resolveArtifactReference(cleanName);
+  if (art) {
+    await openArtifactPreview(art.id);
+  } else if (cleanName) {
+    const wsId = currentWorkspaceId();
+    const directUrl = `/api/workspaces/${encodeURIComponent(wsId)}/files/${cleanName}?inline=true`;
+    window.open(directUrl, '_blank');
+  } else {
+    switchTab('artifacts');
+    notify(`正在产物列表中查找 ${cleanName}…`);
+  }
+}
+
 function renderMarkdown(content) {
   const lines = escapeHtml(String(content ?? '').replace(/\r\n?/g, '\n')).split('\n');
   const output = [];
@@ -1281,11 +1371,152 @@ function renderMarkdown(content) {
     return `<div class="code-block" data-code-language="${escapeHtml(block.language || '')}"><div class="code-block-toolbar"><span>${escapeHtml(label)}</span><button type="button" class="code-copy-button" data-copy-code aria-label="复制${escapeHtml(label)}代码">复制</button></div><pre><code${languageClass}>${block.lines.join('\n')}</code></pre></div>`;
   };
 
-  const inline = (value) => value
-    .replace(/`([^`]+)`/g, '<code>$1</code>')
-    .replace(/\[([^\]]+)\]\((\/api\/artifacts\/[^)\s]+|https?:\/\/[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>')
-    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
-    .replace(/(?<!\*)\*([^*]+)\*(?!\*)/g, '<em>$1</em>');
+  const inline = (value) => {
+    let processed = value.replace(/!\[([^\]]*)\]\(([^)\s]+)\)/g, (_match, alt, url) => {
+      const art = resolveArtifactReference(url);
+      if (art) {
+        const inlineUrl = safeArtifactDownloadUrl(art.download_url, { inline: true }) || `/api/artifacts/${encodeURIComponent(art.id)}/download?inline=true`;
+        const downloadUrl = safeArtifactDownloadUrl(art.download_url) || `/api/artifacts/${encodeURIComponent(art.id)}/download`;
+        return `<div class="chat-artifact-image-card">
+          <div class="chat-artifact-image-header">
+            <span class="chat-artifact-icon">🖼️</span>
+            <span class="chat-artifact-name">${escapeHtml(alt || art.name)}</span>
+            <span class="chat-artifact-actions">
+              <button type="button" class="chat-artifact-btn" onclick="openArtifactPreview('${escapeHtml(art.id)}')">全屏预览</button>
+              <a href="${escapeHtml(inlineUrl)}" target="_blank" rel="noopener" class="chat-artifact-btn">新窗口打开</a>
+              <a href="${escapeHtml(downloadUrl)}" download="${escapeHtml(art.name)}" target="_blank" rel="noopener" class="chat-artifact-btn">下载</a>
+            </span>
+          </div>
+          <div class="chat-artifact-image-body" onclick="openArtifactPreview('${escapeHtml(art.id)}')">
+            <img src="${escapeHtml(inlineUrl)}" alt="${escapeHtml(alt || art.name)}" loading="lazy" />
+          </div>
+        </div>`;
+      }
+      if (url.startsWith('/workspace/')) {
+        const cleanName = url.replace(/^\/workspace\//, '').replace(/:\d+(?::\d+)?$/, '');
+        const wsId = currentWorkspaceId();
+        const directFileUrl = `/api/workspaces/${encodeURIComponent(wsId)}/files/${cleanName}?inline=true`;
+        return `<div class="chat-artifact-image-card">
+          <div class="chat-artifact-image-header">
+            <span class="chat-artifact-icon">🖼️</span>
+            <span class="chat-artifact-name">${escapeHtml(alt || cleanName)}</span>
+            <span class="chat-artifact-actions">
+              <a href="${escapeHtml(directFileUrl)}" target="_blank" rel="noopener" class="chat-artifact-btn">新窗口打开</a>
+            </span>
+          </div>
+          <div class="chat-artifact-image-body">
+            <img src="${escapeHtml(directFileUrl)}" alt="${escapeHtml(alt || cleanName)}" loading="lazy" />
+          </div>
+        </div>`;
+      }
+      if (url.startsWith('http://') || url.startsWith('https://') || url.startsWith('/api/')) {
+        return `<div class="chat-artifact-image-card"><div class="chat-artifact-image-body"><img src="${url}" alt="${alt}" loading="lazy" /></div></div>`;
+      }
+      return _match;
+    });
+
+    processed = processed.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (_match, text, url) => {
+      if (url.startsWith('http://') || url.startsWith('https://') || url.startsWith('/api/artifacts/')) {
+        return `<a href="${url}" target="_blank" rel="noopener noreferrer">${text}</a>`;
+      }
+      const art = resolveArtifactReference(url);
+      if (art) {
+        const downloadUrl = safeArtifactDownloadUrl(art.download_url) || `/api/artifacts/${encodeURIComponent(art.id)}/download`;
+        const inlineUrl = safeArtifactDownloadUrl(art.download_url, { inline: true }) || `/api/artifacts/${encodeURIComponent(art.id)}/download?inline=true`;
+        const isImage = ['png', 'jpg', 'jpeg', 'gif', 'svg', 'webp'].includes(String(art.kind || '').toLowerCase());
+        if (isImage) {
+          return `<div class="chat-artifact-image-card">
+            <div class="chat-artifact-image-header">
+              <span class="chat-artifact-icon">🖼️</span>
+              <span class="chat-artifact-name">${escapeHtml(text || art.name)}</span>
+              <span class="chat-artifact-actions">
+                <button type="button" class="chat-artifact-btn" onclick="openArtifactPreview('${escapeHtml(art.id)}')">全屏预览</button>
+                <a href="${escapeHtml(inlineUrl)}" target="_blank" rel="noopener" class="chat-artifact-btn">新窗口打开</a>
+                <a href="${escapeHtml(downloadUrl)}" download="${escapeHtml(art.name)}" target="_blank" rel="noopener" class="chat-artifact-btn">下载</a>
+              </span>
+            </div>
+            <div class="chat-artifact-image-body" onclick="openArtifactPreview('${escapeHtml(art.id)}')">
+              <img src="${escapeHtml(inlineUrl)}" alt="${escapeHtml(text || art.name)}" loading="lazy" />
+            </div>
+          </div>`;
+        }
+        if (art.kind === 'html') {
+          return `<div class="chat-artifact-file-card html-card">
+            <div class="chat-artifact-file-info">
+              <span class="chat-artifact-file-icon">🌐</span>
+              <div>
+                <strong class="chat-artifact-file-name">${escapeHtml(text || art.name)}</strong>
+                <div class="chat-artifact-file-meta">HTML 网页 · ${formatBytes(art.size)}</div>
+              </div>
+            </div>
+            <div class="chat-artifact-file-actions">
+              <button type="button" class="chat-artifact-preview-btn" onclick="openArtifactPreview('${escapeHtml(art.id)}')">在工作台预览</button>
+              <a href="${escapeHtml(inlineUrl)}" class="chat-artifact-preview-btn primary" target="_blank" rel="noopener">在浏览器中打开</a>
+              <a href="${escapeHtml(downloadUrl)}" download="${escapeHtml(art.name)}" class="chat-artifact-download-btn" target="_blank" rel="noopener">下载</a>
+            </div>
+          </div>`;
+        }
+        return `<div class="chat-artifact-file-card">
+          <div class="chat-artifact-file-info">
+            <span class="chat-artifact-file-icon">📄</span>
+            <div>
+              <strong class="chat-artifact-file-name">${escapeHtml(text || art.name)}</strong>
+              <div class="chat-artifact-file-meta">${escapeHtml(String(art.kind || 'file').toUpperCase())} · ${formatBytes(art.size)}</div>
+            </div>
+          </div>
+          <div class="chat-artifact-file-actions">
+            <button type="button" class="chat-artifact-preview-btn" onclick="openArtifactPreview('${escapeHtml(art.id)}')">预览</button>
+            <a href="${escapeHtml(downloadUrl)}" download="${escapeHtml(art.name)}" class="chat-artifact-download-btn" target="_blank" rel="noopener">下载</a>
+          </div>
+        </div>`;
+      }
+      if (url.startsWith('/workspace/')) {
+        const cleanName = url.replace(/^\/workspace\//, '').replace(/:\d+(?::\d+)?$/, '');
+        const ext = cleanName.split('.').pop().toLowerCase();
+        const wsId = currentWorkspaceId();
+        const directFileUrl = `/api/workspaces/${encodeURIComponent(wsId)}/files/${cleanName}?inline=true`;
+        const directDownloadUrl = `/api/workspaces/${encodeURIComponent(wsId)}/files/${cleanName}`;
+        if (['png', 'jpg', 'jpeg', 'gif', 'svg', 'webp'].includes(ext)) {
+          return `<div class="chat-artifact-image-card">
+            <div class="chat-artifact-image-header">
+              <span class="chat-artifact-icon">🖼️</span>
+              <span class="chat-artifact-name">${escapeHtml(text || cleanName)}</span>
+              <span class="chat-artifact-actions">
+                <a href="${escapeHtml(directFileUrl)}" target="_blank" rel="noopener" class="chat-artifact-btn">新窗口打开</a>
+                <a href="${escapeHtml(directDownloadUrl)}" download="${escapeHtml(cleanName)}" target="_blank" rel="noopener" class="chat-artifact-btn">下载</a>
+              </span>
+            </div>
+            <div class="chat-artifact-image-body">
+              <img src="${escapeHtml(directFileUrl)}" alt="${escapeHtml(text || cleanName)}" loading="lazy" />
+            </div>
+          </div>`;
+        }
+        if (ext === 'html') {
+          return `<div class="chat-artifact-file-card html-card">
+            <div class="chat-artifact-file-info">
+              <span class="chat-artifact-file-icon">🌐</span>
+              <div>
+                <strong class="chat-artifact-file-name">${escapeHtml(text || cleanName)}</strong>
+                <div class="chat-artifact-file-meta">HTML 网页 · 工作区文件</div>
+              </div>
+            </div>
+            <div class="chat-artifact-file-actions">
+              <a href="${escapeHtml(directFileUrl)}" class="chat-artifact-preview-btn primary" target="_blank" rel="noopener">在浏览器中打开</a>
+              <a href="${escapeHtml(directDownloadUrl)}" download="${escapeHtml(cleanName)}" class="chat-artifact-download-btn" target="_blank" rel="noopener">下载</a>
+            </div>
+          </div>`;
+        }
+        const icon = '📄';
+        return `<button type="button" class="chat-artifact-tag" onclick="openWorkspaceFileFallback('${escapeHtml(cleanName)}')">${icon} ${escapeHtml(text || cleanName)} (点击查看/下载)</button>`;
+      }
+      return _match;
+    });
+
+    return processed
+      .replace(/`([^`]+)`/g, '<code>$1</code>')
+      .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+      .replace(/(?<!\*)\*([^*]+)\*(?!\*)/g, '<em>$1</em>');
+  };
   const closeParagraph = () => {
     if (paragraph.length) output.push(`<p>${paragraph.map(inline).join('<br>')}</p>`);
     paragraph = [];
@@ -1389,7 +1620,11 @@ async function sendTask() {
   state.currentExpertSelection = null;
   $('artifacts').innerHTML = '暂无产物';
   $('artifacts').classList.add('empty');
-  const selectedModel = state.models.find((m) => m.id === $('taskModelSelect').value);
+  const selectedEngine = $('executionEngineSelect')?.value || 'builtin';
+  const selectedModelId = ['codex', 'claude'].includes(selectedEngine)
+    ? ($('engineQuickModelSelect')?.value || '')
+    : $('taskModelSelect').value;
+  const selectedModel = state.models.find((m) => m.id === selectedModelId || m.model === selectedModelId);
   if (selectedModel && (selectedModel.readiness?.state || 'ready') !== 'ready') {
     // Keep the message in the composer so the user can correct the model and
     // retry without retyping it.  The conversation still records the failed
@@ -1406,7 +1641,7 @@ async function sendTask() {
     const submissionBody = JSON.stringify({
         message,
         agent_id: $('agentSelect').value,
-        model_id: $('taskModelSelect').value,
+        model_id: selectedModelId,
         conversation_id: state.conversationId,
         workspace: currentWorkspaceId(),
         organization_id: 'local-org',
@@ -1415,6 +1650,12 @@ async function sendTask() {
         executor_id: expertMode ? ($('expertTeamSelect').value || null) : $('agentSelect').value,
         attachment_ids: state.uploads.map((x) => x.id),
         execution_engine: $('executionEngineSelect')?.value || 'builtin',
+        execution_model: ['codex', 'claude'].includes($('executionEngineSelect')?.value || '')
+          ? ($('engineQuickModelSelect')?.value || '')
+          : '',
+        execution_reasoning_effort: ['codex', 'claude'].includes($('executionEngineSelect')?.value || '')
+          ? ($('engineQuickReasoningSelect')?.value || '')
+          : '',
       });
     if (state.pendingSubmission?.body !== submissionBody) {
       state.pendingSubmission = {body: submissionBody, key: createConversationId()};
@@ -1537,6 +1778,18 @@ function runtimeTime(value) {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return String(value);
   return date.toLocaleString('zh-CN', { hour12: false });
+}
+
+function formatIsoDate(value) {
+  if (!value) return '';
+  try {
+    const d = new Date(value);
+    if (Number.isNaN(d.getTime())) return String(value);
+    const pad = (n) => String(n).padStart(2, '0');
+    return `${d.getFullYear()}/${pad(d.getMonth() + 1)}/${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  } catch {
+    return String(value);
+  }
 }
 
 function runtimeActiveRun(runtime = state.taskRuntime) {
@@ -2777,6 +3030,14 @@ async function refreshCurrentTask(taskId) {
       finishTaskUi(taskId, task.status);
     }
     renderTaskMeta(task);
+    if (task.artifacts && task.artifacts.length) {
+      const existingIds = new Set((state.artifacts || []).map((a) => a.id));
+      const newItems = task.artifacts.filter((a) => !existingIds.has(a.id));
+      if (newItems.length) {
+        state.artifacts = [...newItems, ...(state.artifacts || [])];
+        renderArtifactWorkspace();
+      }
+    }
     renderArtifacts(task.artifacts || []);
     const clarification = [...(task.events || [])].reverse().find((event) => event.type === 'clarification');
     if (clarification) publishClarification(taskId, clarification);
@@ -2795,18 +3056,25 @@ async function refreshCurrentTask(taskId) {
 
 function renderArtifacts(artifacts) {
   const box = $('artifacts');
-  if (!artifacts.length) {
+  const items = Array.isArray(artifacts) ? artifacts : (state.artifacts || []);
+  if (!items.length) {
     box.innerHTML = '暂无产物';
     box.classList.add('empty');
     return;
   }
   box.classList.remove('empty');
-  box.innerHTML = artifacts.map((a) => {
+  box.innerHTML = items.map((a) => {
     const downloadUrl = safeArtifactDownloadUrl(a.download_url);
+    const isWeb = ['html', 'png', 'jpg', 'jpeg', 'webp', 'gif', 'svg', 'pdf'].includes(String(a.kind || '').toLowerCase());
+    const inlineUrl = isWeb ? safeArtifactDownloadUrl(a.download_url, { inline: true }) : '';
     return `
       <div class="artifact">
         <span>${escapeHtml(a.name)} <span class="small">${escapeHtml(a.kind)}</span></span>
-        <span class="artifact-actions"><button type="button" class="text-button" data-preview-artifact="${escapeHtml(a.id || '')}" ${a.id ? '' : 'disabled'}>预览</button>${downloadUrl ? `<a href="${escapeHtml(downloadUrl)}" target="_blank" rel="noopener noreferrer">下载</a>` : ''}</span>
+        <span class="artifact-actions">
+          <button type="button" class="text-button" data-preview-artifact="${escapeHtml(a.id || '')}" ${a.id ? '' : 'disabled'}>预览</button>
+          ${inlineUrl ? `<a href="${escapeHtml(inlineUrl)}" target="_blank" rel="noopener noreferrer" title="新窗口打开">打开</a>` : ''}
+          ${downloadUrl ? `<a href="${escapeHtml(downloadUrl)}" download="${escapeHtml(a.name)}" target="_blank" rel="noopener noreferrer">下载</a>` : ''}
+        </span>
       </div>
     `;
   }).join('');
@@ -3212,7 +3480,18 @@ function newWorkspace() {
   $('workspaceEditorMeta').textContent = '保存后可在左侧切换当前项目';
   $('workspaceId').disabled = false;
   $('workspaceId').value = 'project-' + Date.now().toString(36).slice(-6);
-  $('workspaceName').value = '新项目';
+  let defaultName = '新项目';
+  let counter = 2;
+  const existingNames = new Set(
+    (state.workspaces || []).filter((item) => item.enabled).map((item) => (item.name || '').trim().toLowerCase())
+  );
+  if (existingNames.has(defaultName.toLowerCase())) {
+    while (existingNames.has(`新项目 ${counter}`.toLowerCase())) {
+      counter++;
+    }
+    defaultName = `新项目 ${counter}`;
+  }
+  $('workspaceName').value = defaultName;
   $('workspaceDescription').value = '';
   $('workspaceDefaultAgent').value = $('agentSelect')?.value || 'general-agent';
   $('workspaceDefaultModel').value = $('taskModelSelect')?.value || 'deterministic';
@@ -3313,6 +3592,12 @@ async function saveWorkspace() {
     enabled: $('workspaceEnabled').checked,
   };
   if (!payload.id || !payload.name) return notify('请填写项目 ID 和名称', 'error');
+  const duplicate = (state.workspaces || []).find(
+    (item) => item.enabled && item.id !== id && (item.name || '').trim().toLowerCase() === payload.name.toLowerCase()
+  );
+  if (duplicate) {
+    return notify(`项目名称“${payload.name}”已存在，请更换项目名称`, 'error');
+  }
   const button = $('saveWorkspaceBtn'); setBusy(button, true);
   try {
     const saved = state.workspaces.some((item) => item.id === id)
@@ -5327,7 +5612,8 @@ function safeArtifactDownloadUrl(value, { inline = false } = {}) {
   try {
     const url = new URL(String(value || ''), window.location.href);
     if (url.origin !== window.location.origin || !/^\/api\/artifacts\/[^/]+\/download$/.test(url.pathname)) return '';
-    return inline && url.searchParams.get('inline') === 'true' ? `${url.pathname}?inline=true` : url.pathname;
+    const shouldInline = Boolean(inline || url.searchParams.get('inline') === 'true');
+    return shouldInline ? `${url.pathname}?inline=true` : url.pathname;
   } catch (_) {
     return '';
   }
@@ -5349,37 +5635,67 @@ function resetArtifactPreview(message = '从左侧选择一个文件。') {
   const download = $('artifactPreviewDownload');
   download.removeAttribute('href');
   download.classList.add('hidden');
+  const openBtn = $('artifactPreviewOpen');
+  if (openBtn) {
+    openBtn.removeAttribute('href');
+    openBtn.classList.add('hidden');
+  }
   $('artifactPreview').className = 'artifact-preview-empty';
   $('artifactPreview').textContent = message;
 }
 
-async function loadArtifactsOnly({ preserveSelection = false } = {}) {
-  const selectedId = preserveSelection ? state.selectedArtifact?.id : '';
+async function loadArtifactsOnly({ preserveSelection = false, targetId = '' } = {}) {
+  const selectedId = targetId || (preserveSelection ? state.selectedArtifact?.id : '');
   const kind = $('artifactKindFilter')?.value || '';
   const query = new URLSearchParams({ workspace_id: currentWorkspaceId(), limit: '300' });
   if (kind) query.set('kind', kind);
   state.artifacts = runtimeArray(await api(`/api/artifacts?${query.toString()}`));
-  state.selectedArtifact = selectedId ? state.artifacts.find((item) => item.id === selectedId) || null : null;
+  let target = selectedId ? state.artifacts.find((item) => item.id === selectedId) || null : null;
+  if (selectedId && !target) {
+    try {
+      target = await api(`/api/artifacts/${encodeURIComponent(selectedId)}`);
+    } catch (_) {}
+  }
+  state.selectedArtifact = target;
   renderArtifactWorkspace();
   if (state.selectedArtifact) await selectArtifact(state.selectedArtifact.id, { reload: false });
   else resetArtifactPreview();
 }
 
 function renderArtifactWorkspace() {
-  $('artifactCount').textContent = String(state.artifacts.length);
-  $('artifactWorkspaceList').innerHTML = state.artifacts.map((item) => {
-    const kind = String(item.kind || 'file');
-    const version = item.version ? `v${String(item.version)} · ` : '';
-    const metadata = `${String(item.task_id || '手动生成')} · ${version}${formatBytes(item.size)}`;
-    const hash = item.sha256 ? `SHA-256 ${String(item.sha256).slice(0, 12)}…` : '暂无校验值';
-    return `
-      <button class="artifact-workspace-item ${state.selectedArtifact?.id === item.id ? 'active' : ''}" data-workspace-artifact="${escapeHtml(item.id)}" type="button">
-        <span class="artifact-file-icon">${escapeHtml(kind.slice(0, 4).toUpperCase())}</span>
-        <span class="artifact-file-copy"><strong>${escapeHtml(item.name || '未命名文件')}</strong><small>${escapeHtml(metadata)}</small><small class="artifact-file-hash">${escapeHtml(hash)}</small></span>
-        <span class="artifact-file-time">${escapeHtml(runtimeTime(item.created_at))}</span>
-      </button>
-    `;
-  }).join('') || '<div class="meta empty">当前工作区还没有生成文件。</div>';
+  const artifacts = state.artifacts || [];
+  $('artifactCount').textContent = String(artifacts.length);
+  const taskById = new Map((state.tasks || []).map((task) => [String(task.id), task]));
+  const groups = new Map();
+  artifacts.forEach((item) => {
+    const taskId = String(item.task_id || 'manual');
+    if (!groups.has(taskId)) groups.set(taskId, []);
+    groups.get(taskId).push(item);
+  });
+  const groupMarkup = [...groups.entries()].map(([taskId, items]) => {
+    const task = taskById.get(taskId);
+    const taskTitle = task?.title || (taskId === 'manual' ? '手动生成' : `任务 ${taskId}`);
+    const latest = items.map((item) => item.created_at).filter(Boolean).sort().at(-1);
+    const headerMeta = `${items.length} 个文件${latest ? ` · ${runtimeTime(latest)}` : ''}`;
+    const fileMarkup = items.map((item) => {
+      const kind = String(item.kind || 'file');
+      const version = item.version ? `v${String(item.version)} · ` : '';
+      const metadata = `${version}${formatBytes(item.size)} · ${String(item.relative_path || item.name || '')}`;
+      const hash = item.sha256 ? `SHA-256 ${String(item.sha256).slice(0, 12)}…` : '暂无校验值';
+      return `
+        <button class="artifact-workspace-item ${state.selectedArtifact?.id === item.id ? 'active' : ''}" data-workspace-artifact="${escapeHtml(item.id)}" type="button">
+          <span class="artifact-file-icon">${escapeHtml(kind.slice(0, 4).toUpperCase())}</span>
+          <span class="artifact-file-copy"><strong>${escapeHtml(item.name || '未命名文件')}</strong><small>${escapeHtml(metadata)}</small><small class="artifact-file-hash">${escapeHtml(hash)}</small></span>
+          <span class="artifact-file-time">${escapeHtml(runtimeTime(item.created_at))}</span>
+        </button>
+      `;
+    }).join('');
+    return `<section class="artifact-task-group">
+      <div class="artifact-task-group-header"><span class="artifact-task-group-icon">📁</span><span><strong>${escapeHtml(taskTitle)}</strong><small>${escapeHtml(taskId)} · ${escapeHtml(headerMeta)}</small></span></div>
+      <div class="artifact-task-group-files">${fileMarkup}</div>
+    </section>`;
+  }).join('');
+  $('artifactWorkspaceList').innerHTML = groupMarkup || '<div class="meta empty">当前工作区还没有生成文件。</div>';
   $('artifactWorkspaceList').querySelectorAll('[data-workspace-artifact]').forEach((element) => {
     element.onclick = () => selectArtifact(element.dataset.workspaceArtifact).catch((err) => notify(`产物预览失败：${err.message || err}`, 'error'));
   });
@@ -5393,13 +5709,13 @@ function scrollArtifactCardIntoView(id) {
 
 async function openArtifactPreview(id) {
   if (!id) return;
-  switchTab('artifacts');
-  if (!state.artifacts.some((item) => item.id === id)) await loadArtifactsOnly();
-  await selectArtifact(id, { reload: false });
+  switchTab('artifacts', { skipLoad: true });
+  await loadArtifactsOnly({ targetId: id });
+  scrollArtifactCardIntoView(id);
 }
 
 async function selectArtifact(id, { reload = true } = {}) {
-  if (reload && !state.artifacts.some((item) => item.id === id)) await loadArtifactsOnly();
+  if (reload && !state.artifacts.some((item) => item.id === id)) await loadArtifactsOnly({ targetId: id });
   const item = state.artifacts.find((artifact) => artifact.id === id) || await api(`/api/artifacts/${encodeURIComponent(id)}`);
   state.selectedArtifact = item;
   renderArtifactWorkspace();
@@ -5413,6 +5729,17 @@ async function selectArtifact(id, { reload = true } = {}) {
   } else {
     download.removeAttribute('href');
     download.classList.add('hidden');
+  }
+  const openBtn = $('artifactPreviewOpen');
+  if (openBtn) {
+    const inlineUrl = safeArtifactDownloadUrl(item.download_url, { inline: true });
+    if (inlineUrl && ['html', 'png', 'jpg', 'jpeg', 'webp', 'gif', 'svg', 'pdf'].includes(String(item.kind || '').toLowerCase())) {
+      openBtn.href = inlineUrl;
+      openBtn.classList.remove('hidden');
+    } else {
+      openBtn.removeAttribute('href');
+      openBtn.classList.add('hidden');
+    }
   }
   $('artifactPreview').className = 'artifact-preview-loading';
   $('artifactPreview').textContent = '正在生成受控预览…';
@@ -5430,6 +5757,251 @@ async function selectArtifact(id, { reload = true } = {}) {
 function previewTable(rows) {
   if (!rows?.length) return '<div class="meta empty">空表格</div>';
   return `<div class="artifact-table-wrap"><table>${rows.map((row, index) => `<tr>${(row || []).map((cell) => `<${index === 0 ? 'th' : 'td'}>${escapeHtml(cell)}</${index === 0 ? 'th' : 'td'}>`).join('')}</tr>`).join('')}</table></div>`;
+}
+
+function renderProjectFilesBreadcrumb() {
+  const node = $('projectFilesBreadcrumb');
+  if (!node) return;
+  const parts = String(state.projectFilesSubpath || '').split('/').filter(Boolean);
+  const crumbs = [`<button type="button" data-project-dir="">项目根目录</button>`];
+  let path = '';
+  parts.forEach((part) => {
+    path = path ? `${path}/${part}` : part;
+    crumbs.push(`<span>/</span><button type="button" data-project-dir="${escapeHtml(path)}">${escapeHtml(part)}</button>`);
+  });
+  node.innerHTML = crumbs.join('');
+  node.querySelectorAll('[data-project-dir]').forEach((button) => {
+    button.onclick = () => loadProjectFilesOnly({ targetSubpath: button.dataset.projectDir || '' });
+  });
+}
+
+async function loadProjectFilesOnly({ preserveSelection = false, targetPath = '', targetSubpath = null } = {}) {
+  // The project-file view is workspace-scoped.  Refresh the workspace list
+  // first when the page was opened from a stale session or a deep link, so we
+  // do not silently query the fallback `default` workspace.
+  if (!state.selectedWorkspace || !state.workspaces?.length) {
+    try { await loadWorkspacesOnly({ preserveSelection: true }); } catch (err) {
+      console.warn('加载工作区列表失败', err);
+    }
+  }
+  const selectedPath = targetPath || (preserveSelection ? state.selectedProjectFile?.path : '');
+  const workspaceId = currentWorkspaceId();
+  if (targetSubpath !== null) {
+    state.projectFilesSubpath = String(targetSubpath || '').replace(/^\/+|\/+$/g, '');
+    state.selectedProjectFile = null;
+  }
+  const subpath = state.projectFilesSubpath;
+  let loadError = null;
+  try {
+    const query = subpath ? `?subpath=${encodeURIComponent(subpath)}` : '';
+    const res = await api(`/api/workspaces/${encodeURIComponent(workspaceId)}/files${query}`);
+    state.projectFiles = res.items || [];
+  } catch (err) {
+    console.warn('获取项目文件失败', err);
+    loadError = err;
+    state.projectFiles = [];
+  }
+  let target = selectedPath ? state.projectFiles.find((f) => f.path === selectedPath) || null : null;
+  state.selectedProjectFile = target;
+  renderProjectFilesBreadcrumb();
+  renderProjectFilesList();
+  if (state.selectedProjectFile) {
+    await selectProjectFile(state.selectedProjectFile.path);
+  } else if (!state.projectFiles.length) {
+    resetArtifactPreview(loadError
+      ? `项目文件读取失败：${loadError.message || loadError}（当前工作区：${workspaceId}）`
+      : `当前项目目录下暂无文件。（当前工作区：${workspaceId}）`);
+  }
+}
+
+function sortProjectFilesHierarchically(files) {
+  return [...files].sort((a, b) => {
+    const aParts = (a.path || '').split('/');
+    const bParts = (b.path || '').split('/');
+    const minLen = Math.min(aParts.length, bParts.length);
+    for (let i = 0; i < minLen; i++) {
+      if (aParts[i] !== bParts[i]) {
+        const isLastA = (i === aParts.length - 1);
+        const isLastB = (i === bParts.length - 1);
+        const isDirA = !isLastA || a.is_dir;
+        const isDirB = !isLastB || b.is_dir;
+        if (isDirA !== isDirB) return isDirA ? -1 : 1;
+        return aParts[i].localeCompare(bParts[i], 'zh-CN', { numeric: true });
+      }
+    }
+    return aParts.length - bParts.length;
+  });
+}
+
+function renderProjectFilesList() {
+  const listEl = $('artifactWorkspaceList');
+  if (!listEl) return;
+  renderProjectFilesBreadcrumb();
+  const searchInput = $('projectFilesSearchInput');
+  const query = (searchInput?.value || '').toLowerCase().trim();
+  let files = state.projectFiles || [];
+  if (query) {
+    files = files.filter((f) => (f.path || '').toLowerCase().includes(query) || (f.name || '').toLowerCase().includes(query));
+  }
+  const countEl = $('artifactCount');
+  if (countEl) countEl.textContent = String(files.length);
+  const headingEl = $('filesListHeading');
+  if (headingEl) headingEl.textContent = '项目目录文件';
+
+  if (!files.length) {
+    listEl.innerHTML = `<div class="meta empty">${query ? '未找到匹配的文件或目录。' : '当前项目目录下暂无文件。<br>可点击上方“上传文档到当前项目”添加，或在工作台生成文件。'}</div>`;
+    return;
+  }
+
+  const sortedFiles = sortProjectFilesHierarchically(files);
+
+  listEl.innerHTML = sortedFiles.map((item) => {
+    const isDir = Boolean(item.is_dir);
+    const kind = String(item.kind || (isDir ? 'dir' : 'file')).toUpperCase();
+    const isSelected = state.selectedProjectFile?.path === item.path;
+    const sizeLabel = isDir ? '目录' : formatBytes(item.size);
+    const icon = isDir ? '📁' : ['PNG', 'JPG', 'JPEG', 'WEBP', 'GIF', 'SVG'].includes(kind) ? '🖼️' : ['HTML', 'HTM'].includes(kind) ? '🌐' : ['DOCX', 'DOC'].includes(kind) ? '📄' : ['PDF'].includes(kind) ? '📑' : ['XLSX', 'XLS', 'CSV'].includes(kind) ? '📊' : ['PPTX', 'PPT'].includes(kind) ? '📽️' : ['PY', 'JS', 'TS', 'SH', 'JSON', 'YAML', 'YML', 'SQL'].includes(kind) ? '💻' : '📝';
+
+    const parts = (item.path || '').split('/');
+    const depth = Math.max(0, parts.length - 1);
+    const indentPx = depth * 16 + 8;
+
+    return `
+      <div class="project-file-item ${isSelected ? 'active' : ''} ${isDir ? 'is-dir' : ''}" data-project-file-path="${escapeHtml(item.path)}" style="padding-left: ${indentPx}px; display: flex; align-items: center; justify-content: space-between; gap: 8px; padding-top: 7px; padding-bottom: 7px; padding-right: 10px; margin-bottom: 4px; background: ${isSelected ? '#eef2ff' : (isDir ? '#f8fafc' : '#ffffff')}; border: 1px solid ${isSelected ? '#6366f1' : '#e2e8f0'}; border-radius: 8px; cursor: pointer; transition: all 0.15s ease;">
+        <div class="project-file-info" style="display: flex; align-items: center; gap: 6px; min-width: 0; flex: 1;">
+          ${depth > 0 ? '<span class="project-tree-guide" style="color: #94a3b8; font-family: ui-monospace, monospace; font-size: 11px; flex-shrink: 0;">└─</span>' : ''}
+          <span class="project-file-icon">${icon}</span>
+          <span class="project-file-name" title="${escapeHtml(item.path)}" style="font-size: 12px; font-weight: ${isDir ? '600' : '500'}; color: ${isDir ? '#1e293b' : '#334155'}; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 0;">${escapeHtml(item.name || item.path)}</span>
+          <span class="project-file-badge" style="font-size: 10px; padding: 1px 5px; border-radius: 4px; background: #f1f5f9; color: #64748b; font-weight: 500; flex-shrink: 0;">${escapeHtml(sizeLabel)}</span>
+        </div>
+        <div class="project-file-actions" style="display: flex; align-items: center; gap: 6px; flex-shrink: 0;">
+          ${!isDir ? `<a href="${escapeHtml(item.download_url)}" download="${escapeHtml(item.name)}" class="project-file-dl-btn" title="下载原文件" onclick="event.stopPropagation()" style="display: inline-flex; align-items: center; gap: 2px; padding: 3px 8px; border: 1px solid #cbd5e1; border-radius: 5px; background: #ffffff; color: #475569; font-size: 11px; font-weight: 500; text-decoration: none; cursor: pointer;">⬇️ 下载</a>` : ''}
+        </div>
+      </div>
+    `;
+  }).join('');
+
+  listEl.querySelectorAll('[data-project-file-path]').forEach((element) => {
+    element.onclick = () => {
+      const path = element.dataset.projectFilePath;
+      const item = (state.projectFiles || []).find((file) => file.path === path);
+      if (item?.is_dir) {
+        const next = state.projectFilesSubpath ? `${state.projectFilesSubpath}/${path}` : path;
+        loadProjectFilesOnly({ targetSubpath: next }).catch((err) => notify(`进入目录失败：${err.message || err}`, 'error'));
+      } else {
+        selectProjectFile(path).catch((err) => notify(`预览失败：${err.message || err}`, 'error'));
+      }
+    };
+  });
+}
+
+async function selectProjectFile(filePath) {
+  const item = (state.projectFiles || []).find((f) => f.path === filePath);
+  if (!item) return;
+  state.selectedProjectFile = item;
+  renderProjectFilesList();
+
+  const titleEl = $('artifactPreviewTitle');
+  const metaEl = $('artifactPreviewMeta');
+  const download = $('artifactPreviewDownload');
+  const openBtn = $('artifactPreviewOpen');
+  const previewBox = $('artifactPreview');
+
+  titleEl.textContent = item.name;
+  const isDir = Boolean(item.is_dir);
+  metaEl.textContent = isDir ? '目录' : `${String(item.kind || '').toUpperCase()} · ${formatBytes(item.size)} · ${item.modified_at ? runtimeTime(item.modified_at) : ''}`;
+
+  if (!isDir && item.download_url) {
+    download.href = item.download_url;
+    download.download = item.name;
+    download.classList.remove('hidden');
+  } else {
+    download.removeAttribute('href');
+    download.classList.add('hidden');
+  }
+
+  const kind = String(item.kind || '').toLowerCase();
+  const canInlineOpen = ['html', 'htm', 'png', 'jpg', 'jpeg', 'webp', 'gif', 'svg', 'pdf'].includes(kind);
+  if (!isDir && openBtn) {
+    if (canInlineOpen && item.preview_url) {
+      openBtn.href = item.preview_url;
+      openBtn.classList.remove('hidden');
+    } else {
+      openBtn.removeAttribute('href');
+      openBtn.classList.add('hidden');
+    }
+  }
+
+  if (isDir) {
+    previewBox.className = 'artifact-preview-empty';
+    const children = (state.projectFiles || []).filter((f) => f.path !== item.path && f.path.startsWith(item.path + '/'));
+    previewBox.innerHTML = `<div style="text-align:center;padding:40px;"><div style="font-size:40px;margin-bottom:10px;">📁</div><strong style="font-size:16px;color:#1e293b;">${escapeHtml(item.name)}</strong><p style="color:var(--muted);margin-top:6px;font-size:13px;">包含 ${children.length} 个子文件或子目录</p></div>`;
+    return;
+  }
+
+  previewBox.className = 'artifact-preview-loading';
+  previewBox.textContent = '正在加载文件预览…';
+
+  try {
+    if (['png', 'jpg', 'jpeg', 'webp', 'gif', 'svg'].includes(kind)) {
+      previewBox.className = 'artifact-preview';
+      previewBox.innerHTML = `
+        <div style="display:flex;justify-content:center;align-items:center;padding:24px;background:#fff;min-height:360px;">
+          <img src="${escapeHtml(item.preview_url)}" alt="${escapeHtml(item.name)}" style="max-width:100%;max-height:520px;border-radius:8px;box-shadow:0 4px 16px rgba(0,0,0,.08);object-fit:contain;" />
+        </div>
+      `;
+    } else if (kind === 'pdf') {
+      previewBox.className = 'artifact-preview';
+      previewBox.innerHTML = `
+        <div style="width:100%;height:100%;min-height:600px;display:flex;flex-direction:column;">
+          <iframe src="${escapeHtml(item.preview_url)}" style="width:100%;flex:1;min-height:600px;border:none;border-radius:8px;background:#fff;" title="${escapeHtml(item.name)}"></iframe>
+        </div>
+      `;
+    } else if (['html', 'htm'].includes(kind)) {
+      previewBox.className = 'artifact-preview';
+      previewBox.innerHTML = `
+        <div style="width:100%;height:100%;min-height:560px;display:flex;flex-direction:column;">
+          <iframe src="${escapeHtml(item.preview_url)}" style="width:100%;flex:1;min-height:560px;border:none;border-radius:8px;background:#fff;" sandbox="allow-scripts allow-same-origin"></iframe>
+        </div>
+      `;
+    } else if (['md', 'txt', 'py', 'json', 'csv', 'yaml', 'yml', 'js', 'ts', 'css', 'sh', 'sql', 'xml', 'log'].includes(kind)) {
+      const resp = await fetch(item.preview_url);
+      const text = await resp.text();
+      previewBox.className = 'artifact-preview';
+      previewBox.innerHTML = `<pre class="code-block" style="padding:16px;margin:0;overflow:auto;max-height:560px;font-size:12px;font-family:ui-monospace,monospace;line-height:1.5;"><code>${escapeHtml(text)}</code></pre>`;
+    } else {
+      previewBox.className = 'artifact-preview';
+      previewBox.innerHTML = `
+        <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;padding:50px 20px;text-align:center;">
+          <div style="font-size:48px;margin-bottom:12px;">📄</div>
+          <strong style="font-size:16px;color:#1e293b;">${escapeHtml(item.name)}</strong>
+          <p style="color:#64748b;font-size:13px;margin:8px 0 16px;">${escapeHtml(kind.toUpperCase())} 文档 · ${formatBytes(item.size)}</p>
+          <a href="${escapeHtml(item.download_url)}" download="${escapeHtml(item.name)}" class="button-link" style="display:inline-flex;align-items:center;gap:6px;padding:9px 18px;font-size:13px;">⬇️ 立即下载原文件</a>
+        </div>
+      `;
+    }
+  } catch (err) {
+    previewBox.className = 'artifact-preview-error';
+    previewBox.textContent = `加载预览失败：${err.message || err}`;
+  }
+}
+
+async function uploadProjectFiles(files) {
+  const workspaceId = currentWorkspaceId();
+  for (const file of files) {
+    try {
+      const form = new FormData();
+      form.append('file', file);
+      if (state.projectFilesSubpath) {
+        form.append('subpath', state.projectFilesSubpath);
+      }
+      await api(`/api/workspaces/${encodeURIComponent(workspaceId)}/files/upload`, { method: 'POST', body: form });
+      notify(`文件“${file.name}”已成功上传至项目！`);
+    } catch (err) {
+      notify(`文件“${file.name}”上传失败：${err.message || err}`, 'error');
+    }
+  }
+  await loadProjectFilesOnly({ preserveSelection: true });
 }
 
 function renderArtifactPreview(preview) {
@@ -5459,7 +6031,6 @@ function renderArtifactPreview(preview) {
     const frame = document.createElement('iframe');
     frame.className = 'artifact-frame pdf';
     frame.title = 'PDF 文件预览';
-    frame.setAttribute('sandbox', '');
     frame.referrerPolicy = 'no-referrer';
     frame.src = source;
     box.replaceChildren(frame);
@@ -5493,6 +6064,8 @@ function renderArtifactPreview(preview) {
 }
 
 function renderCapabilities() {
+  const box = $('capabilities');
+  if (!box) return;
   const capability = state.capabilities || {};
   const status = (enabled, configured = true) => {
     if (!configured) return { label: '待配置', className: 'pending' };
@@ -5558,7 +6131,7 @@ function renderCapabilities() {
       state: status(!!automation.supported),
     },
   ];
-  $('capabilities').innerHTML = `
+  box.innerHTML = `
     <div class="capability-heading"><div><h2>能力状态</h2><p>平台默认边界与当前可用能力</p></div><span>${cards.filter((item) => item.state.className === 'ready').length}/${cards.length} 可使用</span></div>
     <div class="capability-grid">${cards.map((item) => `
       <article class="capability-card">
@@ -5567,7 +6140,7 @@ function renderCapabilities() {
         ${item.title === '文档交付' && !pptxReady ? '<button class="text-button capability-action" data-open-pptx-config type="button">打开 PPTX 配置向导</button>' : ''}
       </article>`).join('')}
     </div>`;
-  $('capabilities').querySelectorAll('[data-open-pptx-config]').forEach((button) => {
+  box.querySelectorAll('[data-open-pptx-config]').forEach((button) => {
     button.onclick = () => openPptxConfigDialog().catch((err) => notify(`读取 PPTX 配置失败：${err.message || err}`, 'error'));
   });
 }
@@ -6029,25 +6602,82 @@ function syncExecutionEngineModelUi() {
   const pill = $('modelStatusPill');
   if (!engineSelect || !taskModelSelect) return;
   const val = engineSelect.value;
+  const quick = $('engineQuickConfig');
+  const quickPanel = $('engineQuickConfigPanel');
+  const quickModel = $('engineQuickModelSelect');
+  const quickReasoning = $('engineQuickReasoningSelect');
+  const selectedEngine = (state.executionEngines || []).find((item) => item.id === val);
+  const isExternal = val === 'codex' || val === 'claude';
+  const taskModelLabel = $('taskModelLabel');
+  if (taskModelLabel) {
+    taskModelLabel.textContent = '底座大模型';
+  }
+  if (isExternal && state.workbenchMode === 'expert') {
+    setWorkbenchMode('agent', { persist: false });
+  }
+  quick?.classList.toggle('hidden', !isExternal);
+  if (!isExternal) {
+    quickPanel?.classList.add('hidden');
+    $('engineQuickConfigBtn')?.setAttribute('aria-expanded', 'false');
+  } else if (quickModel) {
+    const options = [];
+    const seen = new Set();
+    const addOption = (value, label) => {
+      const normalized = String(value || '').trim();
+      if (!normalized || seen.has(normalized)) return;
+      seen.add(normalized);
+      options.push({ value: normalized, label: label || normalized });
+    };
+    const configuredModel = String(selectedEngine?.config?.model || '').trim();
+    const configuredOptions = Array.isArray(selectedEngine?.config?.model_options)
+      ? selectedEngine.config.model_options
+      : [];
+    const allowedModels = [...new Set([...configuredOptions, configuredModel].map((item) => String(item || '').trim()).filter(Boolean))];
+    allowedModels.forEach((modelName) => addOption(modelName, modelName === configuredModel
+      ? `${modelName}（默认）`
+      : modelName));
+    const remembered = readPreference(`engine-model-${val}`) || configuredModel;
+    quickModel.innerHTML = '<option value="">跟随引擎默认模型</option>'
+      + options.map((item) => `<option value="${escapeHtml(item.value)}">${escapeHtml(item.label)}</option>`).join('');
+    quickModel.value = options.some((item) => item.value === remembered) ? remembered : '';
+    if (quickReasoning) {
+      quickReasoning.value = readPreference(`engine-reasoning-${val}`) || '';
+      const xhigh = quickReasoning.querySelector('option[value="xhigh"]');
+      if (xhigh) xhigh.disabled = val === 'claude';
+    }
+  }
+  if (taskModelSelect.disabled || taskModelSelect.options.length <= 1) {
+    renderTaskModelSelect({ syncEngine: false });
+  }
   taskModelSelect.disabled = false;
   if (val === 'codex') {
-    taskModelSelect.title = '为 Codex 容器沙箱指定底座大模型（如不指定则使用默认模型）';
+    taskModelSelect.title = '外部执行引擎不使用这里的底座模型；请通过“引擎参数”选择 Codex 模型';
     if (pill) {
       pill.textContent = 'Codex 沙箱';
       pill.className = 'model-status-pill ready';
-      pill.title = '当前任务将在 Codex 容器沙箱中运行，可自选底座大模型';
+      pill.title = '打开 Codex 执行引擎配置';
     }
   } else if (val === 'claude') {
-    taskModelSelect.title = '为 Claude Code 容器沙箱指定底座大模型';
+    taskModelSelect.title = '外部执行引擎不使用这里的底座模型；请通过“引擎参数”选择 Claude Code 模型';
     if (pill) {
       pill.textContent = 'Claude 沙箱';
       pill.className = 'model-status-pill ready';
-      pill.title = '当前任务将在 Claude Code 容器沙箱中运行';
+      pill.title = '打开 Claude Code 执行引擎配置';
     }
   } else {
     taskModelSelect.title = '选择内置智能体底座模型';
     renderWorkbenchModelStatus();
   }
+  renderWorkbenchMode();
+}
+
+function toggleEngineQuickConfig() {
+  const panel = $('engineQuickConfigPanel');
+  const button = $('engineQuickConfigBtn');
+  if (!panel || !button) return;
+  const opening = panel.classList.contains('hidden');
+  panel.classList.toggle('hidden', !opening);
+  button.setAttribute('aria-expanded', opening ? 'true' : 'false');
 }
 
 function renderExecutionEngineSelect() {
@@ -6092,7 +6722,7 @@ function renderExecutionEngines() {
     el.onclick = () => selectExecutionEngine(el.dataset.engine);
   });
   const canManage = canManageExecutionEngines();
-  ['engineBaseUrl', 'engineModel', 'engineKeyMode', 'engineApiKeyEnv', 'engineApiKey', 'engineAllowedRoles', 'engineEnabled', 'saveEngineBtn'].forEach((id) => {
+  ['engineBaseUrl', 'engineModel', 'engineModelOptions', 'engineReasoningEffort', 'engineKeyMode', 'engineApiKeyEnv', 'engineApiKey', 'engineAllowedRoles', 'engineEnabled', 'saveEngineBtn'].forEach((id) => {
     const node = $(id);
     if (node) node.disabled = !canManage || !state.selectedExecutionEngine;
   });
@@ -6122,6 +6752,8 @@ function selectExecutionEngine(id) {
   $('engineName').value = engine.name;
   $('engineBaseUrl').value = engine.base_url || '';
   $('engineModel').value = engine.config?.model || '';
+  renderEngineModelOptions(engine.config?.model_options || []);
+  $('engineReasoningEffort').value = engine.config?.reasoning_effort || '';
   $('engineKeyMode').value = engine.api_key_mode || (engine.has_api_key ? 'direct' : 'env');
   $('engineApiKeyEnv').value = engine.api_key_env || engine.default_api_key_env || '';
   $('engineApiKey').value = '';
@@ -6129,7 +6761,7 @@ function selectExecutionEngine(id) {
   if ($('engineAllowedRoles')) $('engineAllowedRoles').value = engine.allowed_roles || 'admin,user';
   $('engineSaveResult').textContent = engine.readiness?.detail || '保存后，新的任务会使用这里的配置。';
   const canManage = canManageExecutionEngines();
-  ['engineBaseUrl', 'engineModel', 'engineKeyMode', 'engineApiKeyEnv', 'engineApiKey', 'engineAllowedRoles', 'engineEnabled', 'saveEngineBtn'].forEach((fieldId) => {
+  ['engineBaseUrl', 'engineModel', 'engineModelOptions', 'engineReasoningEffort', 'engineKeyMode', 'engineApiKeyEnv', 'engineApiKey', 'engineAllowedRoles', 'engineEnabled', 'saveEngineBtn'].forEach((fieldId) => {
     const node = $(fieldId);
     if (node) node.disabled = !canManage;
   });
@@ -6142,12 +6774,15 @@ async function saveExecutionEngine() {
   if (!canManageExecutionEngines()) { notify('只有管理员可以修改执行引擎', 'error'); return; }
   const button = $('saveEngineBtn'); setBusy(button, true);
   try {
+    const selectedEngineModels = Array.from($('engineModelOptions')?.selectedOptions || []).map((option) => option.value);
     const payload = {
       enabled: $('engineEnabled').checked,
       base_url: $('engineBaseUrl').value.trim(),
       api_key_mode: $('engineKeyMode').value,
       api_key_env: $('engineApiKeyEnv').value.trim(),
-      model: $('engineModel').value.trim(),
+      model: $('engineModel').value.trim() || selectedEngineModels[0] || '',
+      model_options: selectedEngineModels,
+      reasoning_effort: $('engineReasoningEffort').value,
       allowed_roles: $('engineAllowedRoles')?.value || 'admin,user',
     };
     if (payload.api_key_mode === 'direct' && $('engineApiKey').value) payload.api_key = $('engineApiKey').value;
@@ -6162,6 +6797,14 @@ async function saveExecutionEngine() {
     $('engineSaveResult').textContent = `保存失败：${err.message || err}`;
     notify(`执行引擎保存失败：${err.message || err}`, 'error');
   } finally { setBusy(button, false); }
+}
+
+function renderEngineModelOptions(options = [], selectedValues = options) {
+  const select = $('engineModelOptions');
+  if (!select) return;
+  const values = [...new Set((options || []).map((item) => String(item || '').trim()).filter(Boolean))];
+  const selected = new Set((selectedValues || []).map((item) => String(item || '').trim()));
+  select.innerHTML = values.map((value) => `<option value="${escapeHtml(value)}" ${selected.has(value) ? 'selected' : ''}>${escapeHtml(value)}</option>`).join('');
 }
 
 
@@ -6363,6 +7006,8 @@ async function discoverModelsForExecutionEngine() {
       body: JSON.stringify(payload),
     });
     const models = result.models || [];
+    const currentOptions = Array.from($('engineModelOptions')?.selectedOptions || []).map((option) => option.value);
+    renderEngineModelOptions([...currentOptions, ...models], currentOptions);
     const datalist = $('discoveredEngineModelsList');
     if (datalist) {
       datalist.innerHTML = models.map((m) => `<option value="${escapeHtml(m)}"></option>`).join('');
@@ -6375,6 +7020,9 @@ async function discoverModelsForExecutionEngine() {
       picker.onchange = () => {
         if (picker.value) {
           $('engineModel').value = picker.value;
+          const selected = new Set(Array.from($('engineModelOptions')?.selectedOptions || []).map((option) => option.value));
+          selected.add(picker.value);
+          renderEngineModelOptions([...selected]);
         }
       };
     }
@@ -6481,11 +7129,13 @@ function uploadSizeLabel(size) {
 }
 
 async function uploadFiles(files) {
+  const wsId = currentWorkspaceId();
   for (const file of files) {
     try {
       const form = new FormData();
       form.append('file', file);
-      const uploaded = await api('/api/uploads', { method: 'POST', body: form });
+      const query = wsId ? `?workspace_id=${encodeURIComponent(wsId)}` : '';
+      const uploaded = await api(`/api/uploads${query}`, { method: 'POST', body: form });
       state.uploads.push(uploaded);
     } catch (err) {
       notify(`附件“${file.name}”上传失败：${err.message || err}`, 'error');
@@ -6968,6 +7618,8 @@ async function openTask(id) {
 async function renderConversation(conversationId) {
   setTimeout(updateWorkbenchContextBadges, 50);
   const data = await api(`/api/conversations/${encodeURIComponent(conversationId)}/messages`);
+  state.conversationTitle = data.title || '';
+  state.currentConversationArtifacts = data.artifacts || [];
   $('conversation').innerHTML = '';
   for (const message of data.messages || []) {
     if (message.message_type === 'error') {
@@ -6987,6 +7639,37 @@ async function renderConversation(conversationId) {
       createAgentThinkingCard(message.task_id, { historical: true, open: false });
     }
   }
+
+  const latestTaskId = data.latest_task_id || (() => {
+    const taskIds = (data.messages || []).map((m) => m.task_id).filter(Boolean);
+    return taskIds.length ? taskIds[taskIds.length - 1] : null;
+  })();
+
+  if (latestTaskId) {
+    try {
+      await refreshCurrentTask(latestTaskId);
+    } catch (err) {
+      console.warn('恢复当前任务状态失败:', err);
+    }
+  } else {
+    state.currentTask = null;
+    resetTaskRuntime();
+    renderArtifacts([]);
+  }
+
+  if (data.artifacts && data.artifacts.length) {
+    const existingIds = new Set((state.artifacts || []).map((a) => a.id));
+    const newItems = data.artifacts.filter((a) => !existingIds.has(a.id));
+    if (newItems.length) {
+      state.artifacts = [...newItems, ...(state.artifacts || [])];
+      renderArtifactWorkspace();
+    }
+    renderArtifacts(data.artifacts);
+  } else if (!latestTaskId) {
+    renderArtifacts([]);
+  }
+
+  updateWorkbenchContextBadges();
   return (data.messages || []).length > 0;
 }
 
@@ -6998,6 +7681,8 @@ function newConversation() {
   setSendButtonState('idle');
   state.currentTask = null;
   state.currentExpertSelection = null;
+  state.conversationTitle = '';
+  state.currentConversationArtifacts = [];
   state.conversationId = createConversationId();
   writePreference('conversation', state.conversationId);
   $('conversation').innerHTML = '';
@@ -7012,6 +7697,7 @@ function newConversation() {
   renderArtifacts([]);
   addMessage('agent', '新对话已开始。你可以继续描述要完成的事情。');
   loadMemoriesOnly({ preserveSelection: false }).catch((err) => notify(`记忆刷新失败：${err.message || err}`, 'error'));
+  updateWorkbenchContextBadges();
 }
 
 function setSidebarCollapsed(collapsed) {
@@ -7121,9 +7807,20 @@ function bindEvents() {
   $('taskModelSelect').onchange = (e) => {
     writePreference('model', e.target.value);
     writePreference('model-explicit', '1');
-    renderWorkbenchModelStatus();
+    const engine = $('executionEngineSelect')?.value || 'builtin';
+    if (engine === 'codex' || engine === 'claude') syncExecutionEngineModelUi();
+    else renderWorkbenchModelStatus();
   };
-  $('modelStatusPill').onclick = () => {
+  $('modelStatusPill').onclick = async () => {
+    const engine = $('executionEngineSelect')?.value || 'builtin';
+    if (engine === 'codex' || engine === 'claude') {
+      switchTab('engines');
+      if (!state.executionEngines?.length) {
+        await loadExecutionEnginesOnly({ preserveSelection: true }).catch((err) => notify(`执行引擎刷新失败：${err.message || err}`, 'error'));
+      }
+      selectExecutionEngine(engine);
+      return;
+    }
     const model = currentWorkbenchModel();
     switchTab('models');
     if (model) selectModel(model.id);
@@ -7204,6 +7901,52 @@ function bindEvents() {
   $('memoryStatusFilter').onchange = renderMemories;
   $('reloadArtifactsBtn').onclick = () => loadArtifactsOnly({ preserveSelection: true }).catch((err) => notify(`产物刷新失败：${err.message || err}`, 'error'));
   $('artifactKindFilter').onchange = () => loadArtifactsOnly({ preserveSelection: true }).catch((err) => notify(`产物筛选失败：${err.message || err}`, 'error'));
+  if ($('showArtifactsModeBtn')) {
+    $('showArtifactsModeBtn').onclick = () => {
+      state.artifactViewMode = 'artifacts';
+      $('showArtifactsModeBtn').classList.add('active');
+      $('showProjectFilesModeBtn')?.classList.remove('active');
+      $('filesListHeading').textContent = '产物文件（按任务分组）';
+      $('projectFilesUploadBar')?.classList.add('hidden');
+      loadArtifactsOnly();
+    };
+  }
+  if ($('showProjectFilesModeBtn')) {
+    $('showProjectFilesModeBtn').onclick = () => {
+      state.artifactViewMode = 'project_files';
+      state.projectFilesSubpath = '';
+      $('showProjectFilesModeBtn').classList.add('active');
+      $('showArtifactsModeBtn')?.classList.remove('active');
+      $('filesListHeading').textContent = '项目文件（代码与上传）';
+      $('projectFilesUploadBar')?.classList.remove('hidden');
+      loadProjectFilesOnly();
+    };
+  }
+  if ($('viewProjectFilesBtn')) {
+    $('viewProjectFilesBtn').onclick = () => {
+      switchTab('artifacts');
+      state.artifactViewMode = 'project_files';
+      state.projectFilesSubpath = '';
+      $('showProjectFilesModeBtn')?.classList.add('active');
+      $('showArtifactsModeBtn')?.classList.remove('active');
+      $('filesListHeading').textContent = '项目文件（代码与上传）';
+      $('projectFilesUploadBar')?.classList.remove('hidden');
+      loadProjectFilesOnly();
+    };
+  }
+  if ($('uploadToProjectBtn')) {
+    $('uploadToProjectBtn').onclick = () => $('projectFileInput')?.click();
+  }
+  if ($('projectFileInput')) {
+    $('projectFileInput').onchange = (e) => {
+      uploadProjectFiles(Array.from(e.target.files || []));
+      e.target.value = '';
+    };
+  }
+  if ($('projectFilesSearchInput')) {
+    $('projectFilesSearchInput').oninput = () => renderProjectFilesList();
+  }
+  if ($('backToChatBtn')) $('backToChatBtn').onclick = () => switchTab('chat');
   if ($('newModelBtn')) $('newModelBtn').onclick = newModel;
   if ($('saveModelBtn')) $('saveModelBtn').onclick = saveModel;
   if ($('testModelBtn')) $('testModelBtn').onclick = testModel;
@@ -7215,6 +7958,22 @@ function bindEvents() {
   if ($('executionEngineSelect')) $('executionEngineSelect').onchange = (event) => {
     writePreference('execution-engine', event.target.value);
     syncExecutionEngineModelUi();
+  };
+  if ($('engineQuickConfigBtn')) $('engineQuickConfigBtn').onclick = toggleEngineQuickConfig;
+  if ($('engineQuickModelSelect')) $('engineQuickModelSelect').onchange = (event) => {
+    const value = event.target.value;
+    const engine = $('executionEngineSelect')?.value || 'builtin';
+    if (!value) return;
+    writePreference(`engine-model-${engine}`, value);
+    const matched = (state.models || []).find((model) => model.id === value || model.model === value);
+    if (matched && $('taskModelSelect')) {
+      $('taskModelSelect').value = matched.id;
+      renderWorkbenchModelStatus();
+    }
+  };
+  if ($('engineQuickReasoningSelect')) $('engineQuickReasoningSelect').onchange = (event) => {
+    const engine = $('executionEngineSelect')?.value || 'builtin';
+    writePreference(`engine-reasoning-${engine}`, event.target.value);
   };
   if ($('testEngineBtn')) $('testEngineBtn').onclick = () => testExecutionEngine().catch((err) => notify(`测试失败：${err.message || err}`, 'error'));
   if ($('discoverModelsBtn')) $('discoverModelsBtn').onclick = discoverModelsForModelConfig;
@@ -7262,16 +8021,24 @@ function selectAdminUser(user) {
     $('adminUserPassword').value = '';
     $('adminUserPassword').required = !user;
   }
-  if ($('adminPasswordHint')) $('adminPasswordHint').textContent = user ? '留空保留现有密码；输入新密码将重置并撤销已有会话。' : '新用户需设置至少 12 位安全密码。';
+  if ($('adminPasswordHint')) $('adminPasswordHint').textContent = user ? '留空保留现有密码；输入新密码将重置并撤销已有会话（至少 6 位）。' : '新用户需设置至少 6 位登录密码。';
   if ($('adminUserEnabled')) {
     $('adminUserEnabled').checked = user ? Boolean(user.enabled) : true;
     $('adminUserEnabled').disabled = !user;
   }
+  if ($('saveUserBtn')) {
+    $('saveUserBtn').textContent = user ? '保存用户修改' : '确认创建成员';
+  }
+  if ($('newUserBtn')) {
+    $('newUserBtn').textContent = user ? '+ 新建其他用户' : '+ 新建用户';
+  }
   if ($('adminUserError')) $('adminUserError').textContent = '';
 
-  document.querySelectorAll('.user-card-item').forEach((item) => {
-    item.classList.toggle('active', item.dataset.userId === user?.id);
-  });
+  if (typeof document?.querySelectorAll === 'function') {
+    document.querySelectorAll('.user-card-item').forEach((item) => {
+      item.classList.toggle('active', item.dataset.userId === user?.id);
+    });
+  }
 }
 
 
@@ -7282,7 +8049,7 @@ function updateWorkbenchContextBadges() {
   if ($('workbenchWorkspaceName')) $('workbenchWorkspaceName').textContent = `项目: ${wsName}`;
   if ($('workbenchConversationPreview')) {
     const conv = (state.workspaceConversations || []).find((c) => c.conversation_id === state.conversationId);
-    let title = conv?.preview || '当前对话';
+    let title = state.conversationTitle || conv?.title || conv?.preview || '当前对话';
     if (title.length > 20) title = title.slice(0, 18) + '…';
     $('workbenchConversationPreview').textContent = title;
   }
@@ -7306,6 +8073,7 @@ function renderAdminUsersMetrics() {
 }
 
 function renderAdminUsersList() {
+  const esc = typeof escapeHtml === 'function' ? escapeHtml : (s) => String(s ?? '');
   const list = $('adminUserList');
   if (!list) return;
   list.replaceChildren();
@@ -7325,6 +8093,7 @@ function renderAdminUsersList() {
     const isSelected = state.adminSelectedUser?.id === user.id;
     const card = document.createElement('div');
     card.className = `user-card-item ${isSelected ? 'active' : ''}`;
+    if (!card.dataset) card.dataset = {};
     card.dataset.userId = user.id;
 
     const initials = (user.username || 'U').slice(0, 2).toUpperCase();
@@ -7332,18 +8101,18 @@ function renderAdminUsersList() {
     const isEnabled = Boolean(user.enabled);
 
     card.innerHTML = `
-      <div class="user-avatar ${isAdmin ? 'admin-avatar' : ''}">${escapeHtml(initials)}</div>
+      <div class="user-avatar ${isAdmin ? 'admin-avatar' : ''}">${esc(initials)}</div>
       <div class="user-card-body">
         <div class="user-card-title-row">
-          <strong class="user-card-name">${escapeHtml(user.username)}</strong>
+          <strong class="user-card-name">${esc(user.username)}</strong>
           <div class="user-card-badges">
             <span class="user-role-badge ${user.role}">${isAdmin ? '管理员' : '普通用户'}</span>
             <span class="user-status-badge ${isEnabled ? 'enabled' : 'disabled'}">${isEnabled ? '● 已启用' : '● 已停用'}</span>
           </div>
         </div>
         <div class="user-card-sub">
-          <span class="small user-id-mono">ID: ${escapeHtml((user.id || '').slice(0, 14))}</span>
-          ${user.created_at ? `<span class="small user-date">${escapeHtml(user.created_at.slice(0, 10))}</span>` : ''}
+          <span class="small user-id-mono">ID: ${esc((user.id || '').slice(0, 14))}</span>
+          ${user.created_at ? `<span class="small user-date">${esc(user.created_at.slice(0, 10))}</span>` : ''}
         </div>
       </div>
     `;
@@ -7367,6 +8136,10 @@ async function saveAdminUser(event) {
     $('adminUserError').textContent = '新用户必须设置密码。';
     return;
   }
+  if (password && password.length < 6) {
+    $('adminUserError').textContent = '密码长度至少需为 6 位。';
+    return;
+  }
   $('saveUserBtn').disabled = true;
   $('adminUserError').textContent = '';
   try {
@@ -7375,7 +8148,7 @@ async function saveAdminUser(event) {
     });
     state.adminSelectedUser = user;
     await loadAdminUsers();
-    notify('用户已保存');
+    notify(selected ? '用户信息已更新' : '新用户创建成功');
   } catch (error) {
     $('adminUserError').textContent = error.message;
   } finally {
@@ -7414,9 +8187,19 @@ async function initializeAuthentication() {
     if (session.user.role === 'admin') {
       $('usersNav').classList.remove('hidden');
       $('enginesNav')?.classList.remove('hidden');
+      $('modelsNav')?.classList.remove('hidden');
+      $('mcpNav')?.classList.remove('hidden');
+      $('diagnosticsNav')?.classList.remove('hidden');
+    } else {
+      $('skillsMemberNotice')?.classList.remove('hidden');
     }
     $('accountPanel').classList.remove('hidden');
     $('accountName').textContent = session.user.username;
+    $('logoutButton').title = `退出登录 (${session.user.username})`;
+    if (typeof $('accountPanel').querySelector === 'function') {
+      const userBlock = $('accountPanel').querySelector('.account-user');
+      if (userBlock) userBlock.title = `当前账号：${session.user.username}（${session.user.role === 'admin' ? '管理员' : '成员'}）`;
+    }
     $('logoutButton').onclick = async () => {
       try {
         await api('/api/auth/logout', { method: 'POST' });
@@ -7432,6 +8215,9 @@ async function initializeAuthentication() {
     }
   } else {
     $('enginesNav')?.classList.remove('hidden');
+    $('modelsNav')?.classList.remove('hidden');
+    $('mcpNav')?.classList.remove('hidden');
+    $('diagnosticsNav')?.classList.remove('hidden');
   }
   document.body.classList.remove('auth-pending');
   return true;
@@ -7467,7 +8253,7 @@ function renderConversationsList(conversations) {
   const list = $('conversationsList');
   if (!list) return;
   const search = ($('conversationSearchInput')?.value || '').toLowerCase().trim();
-  const filtered = (conversations || []).filter((c) => !search || (c.preview || '').toLowerCase().includes(search) || (c.conversation_id || '').toLowerCase().includes(search));
+  const filtered = (conversations || []).filter((c) => !search || (c.title || c.preview || '').toLowerCase().includes(search) || (c.conversation_id || '').toLowerCase().includes(search));
   if (!filtered.length) {
     list.innerHTML = `<div class="meta empty">${search ? '未找到匹配的对话' : '当前项目暂无历史对话。发送任务后会自动记录。'}</div>`;
     return;
@@ -7477,10 +8263,11 @@ function renderConversationsList(conversations) {
     const engine = c.execution_engine || 'builtin';
     const engineLabel = engine === 'codex' ? 'Codex' : engine === 'claude' ? 'Claude' : '内置引擎';
     const time = c.updated_at ? c.updated_at.slice(0, 16).replace('T', ' ') : '';
+    const titleText = c.title || c.preview || '无标题对话';
     return `
       <div class="conversation-item-card ${isActive ? 'active' : ''}" data-conv-id="${escapeHtml(c.conversation_id)}">
         <div class="conversation-item-main">
-          <div class="conversation-item-preview">${escapeHtml(c.preview || '无标题对话')}</div>
+          <div class="conversation-item-preview">${escapeHtml(titleText)}</div>
           <div class="conversation-item-meta">
             <span class="engine-tag ${engine}">${escapeHtml(engineLabel)}</span>
             <span>${c.message_count || 1} 条消息</span>
@@ -7488,18 +8275,56 @@ function renderConversationsList(conversations) {
             ${isActive ? '<span style="color: var(--primary); font-weight: 700;">● 当前会话</span>' : ''}
           </div>
         </div>
+        <div class="conversation-item-actions" style="display:flex;gap:6px;align-items:center;">
+          <button type="button" class="small-btn secondary rename-conv-btn" data-rename-conv="${escapeHtml(c.conversation_id)}" title="重命名此会话">重命名</button>
+        </div>
       </div>
     `;
   }).join('');
 
   list.querySelectorAll('[data-conv-id]').forEach((item) => {
-    item.onclick = async () => {
+    item.onclick = async (e) => {
+      if (e.target.closest('[data-rename-conv]')) return;
       const convId = item.dataset.convId;
       state.conversationId = convId;
       writePreference('conversation', convId);
       await renderConversation(convId);
       $('conversationsDialog').classList.add('hidden');
       notify(`已切换至历史对话`);
+    };
+  });
+
+  list.querySelectorAll('[data-rename-conv]').forEach((btn) => {
+    btn.onclick = async (e) => {
+      e.stopPropagation();
+      const convId = btn.dataset.renameConv;
+      const currentConv = (state.workspaceConversations || []).find((x) => x.conversation_id === convId);
+      const currentTitle = currentConv?.title || currentConv?.preview || '';
+      const newTitle = prompt('请输入新的会话名称：', currentTitle);
+      if (newTitle === null) return;
+      const trimmed = newTitle.trim();
+      if (!trimmed) {
+        notify('会话名称不能为空', 'error');
+        return;
+      }
+      try {
+        await api(`/api/conversations/${encodeURIComponent(convId)}/title`, {
+          method: 'PUT',
+          body: JSON.stringify({ title: trimmed }),
+        });
+        if (currentConv) {
+          currentConv.title = trimmed;
+          currentConv.custom_title = trimmed;
+        }
+        if (convId === state.conversationId) {
+          state.conversationTitle = trimmed;
+          updateWorkbenchContextBadges();
+        }
+        renderConversationsList(state.workspaceConversations);
+        notify('会话重命名成功');
+      } catch (err) {
+        notify(`重命名失败：${err.message || err}`, 'error');
+      }
     };
   });
 }
@@ -7609,24 +8434,29 @@ function renderCurrentSourceModels() {
   if (!container) return;
   const search = ($('sourceModelSearch')?.value || '').toLowerCase().trim();
   const models = state.currentSourceModels || [];
-  const filtered = models.filter((m) => !search || m.id.toLowerCase().includes(search) || m.name.toLowerCase().includes(search));
+  const filtered = models.filter((m) => !search || (m.id && m.id.toLowerCase().includes(search)) || (m.name && m.name.toLowerCase().includes(search)));
   if (!filtered.length) {
     container.innerHTML = `<div class="meta empty">${search ? '没有匹配搜索条件的模型' : '暂无模型。点击“拉取源可用模型”或下方输入手动添加。'}</div>`;
     return;
   }
   container.innerHTML = filtered.map((m) => {
+    const displayName = m.name || m.id;
+    const showIdBadge = m.id && m.name && m.id !== m.name;
     return `
-      <div class="source-model-item ${m.enabled ? '' : 'disabled'}" data-model-id="${escapeHtml(m.id)}">
-        <div class="source-model-left">
-          <input type="checkbox" class="model-enable-cb" data-model-id="${escapeHtml(m.id)}" ${m.enabled ? 'checked' : ''} />
-          <span class="source-model-name" title="${escapeHtml(m.id)}">${escapeHtml(m.name || m.id)}</span>
+      <div class="source-model-item ${m.enabled ? '' : 'disabled'}" data-model-id="${escapeHtml(m.id)}" style="display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 8px 12px; background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px;">
+        <div class="source-model-left" style="display: flex; align-items: center; gap: 10px; flex: 1; min-width: 0;">
+          <input type="checkbox" class="model-enable-cb" data-model-id="${escapeHtml(m.id)}" ${m.enabled ? 'checked' : ''} title="${m.enabled ? '已启用' : '已停用'}" style="width: 16px !important; min-width: 16px !important; max-width: 16px !important; height: 16px !important; margin: 0 !important; cursor: pointer; flex-shrink: 0 !important;" />
+          <div class="source-model-name" title="${escapeHtml(m.id)}" style="flex: 1 1 auto; min-width: 0; font-size: 13px; font-weight: 600; color: #1e293b; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: flex; align-items: center; gap: 6px;">
+            <span style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #1e293b;">${escapeHtml(displayName)}</span>
+            ${showIdBadge ? `<span class="source-model-id-badge" style="font-size: 11px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-weight: 400; color: #64748b; background: #edf2f7; padding: 1px 6px; border-radius: 4px; flex-shrink: 0;">${escapeHtml(m.id)}</span>` : ''}
+          </div>
         </div>
-        <div class="source-model-right">
-          <label class="default-radio-label" title="设为此模型源的默认模型">
-            <input type="radio" name="defaultModelRadio" class="model-default-radio" data-model-id="${escapeHtml(m.id)}" ${m.is_default ? 'checked' : ''} />
-            <span>默认</span>
+        <div class="source-model-right" style="display: flex; align-items: center; gap: 12px; flex-shrink: 0;">
+          <label class="default-radio-label" title="设为此模型源的默认模型" style="display: inline-flex; align-items: center; gap: 5px; font-size: 12px; color: #475569; cursor: pointer; margin: 0 !important; user-select: none; flex-shrink: 0 !important;">
+            <input type="radio" name="defaultModelRadio" class="model-default-radio" data-model-id="${escapeHtml(m.id)}" ${m.is_default ? 'checked' : ''} style="width: 16px !important; min-width: 16px !important; max-width: 16px !important; height: 16px !important; margin: 0 !important; cursor: pointer; flex-shrink: 0 !important;" />
+            <span style="font-size: 12px; font-weight: 500; color: #475569; white-space: nowrap;">默认</span>
           </label>
-          <button type="button" class="icon-button secondary remove-model-btn" data-model-id="${escapeHtml(m.id)}" style="padding: 2px 6px; font-size: 11px; height: 24px; min-width: 24px;">×</button>
+          <button type="button" class="icon-button secondary remove-model-btn" data-model-id="${escapeHtml(m.id)}" title="移除模型" style="padding: 2px 6px; font-size: 11px; height: 24px; min-width: 24px; line-height: 1;">×</button>
         </div>
       </div>
     `;
@@ -7850,7 +8680,20 @@ async function testModelSourceConnection() {
     if (!await initializeAuthentication()) return;
   } catch (error) {
     $('loginPanel').classList.remove('hidden');
-    $('loginError').textContent = `无法检查登录状态：${error.message}`;
+    const isNetworkError = /load failed|failed to fetch|networkerror/i.test(error.message || '');
+    if (isNetworkError) {
+      $('loginError').innerHTML = `
+        <div style="line-height: 1.5; margin-bottom: 8px;">
+          无法连接后端服务（网络请求失败）。<br>
+          <span style="font-size: 13px; color: #64748b;">
+            请检查远程端口转发（8000 端口）是否已开启，并确认浏览器访问的地址和端口是否正确。
+          </span>
+        </div>
+        <button type="button" class="action-btn secondary" style="width: 100%; padding: 6px 12px; margin-top: 4px;" onclick="location.reload()">重新连接</button>
+      `;
+    } else {
+      $('loginError').textContent = `无法检查登录状态：${error.message}`;
+    }
     $('loginSubmit').disabled = true;
     return;
   }
@@ -7866,8 +8709,13 @@ async function testModelSourceConnection() {
       $('serviceStatus').querySelector('b').textContent = '服务已连接';
     }
     writePreference('conversation', state.conversationId);
-    const restored = await renderConversation(state.conversationId);
-    if (!restored) addMessage('agent', '你好，我可以帮你分析资料、调用工具并生成文档。直接告诉我你想完成什么。');
+    try {
+      const restored = await renderConversation(state.conversationId);
+      if (!restored) addMessage('agent', '你好，我可以帮你分析资料、调用工具并生成文档。直接告诉我你想完成什么。');
+    } catch (convErr) {
+      console.warn('恢复历史对话失败', convErr);
+      addMessage('agent', '你好，我可以帮你分析资料、调用工具并生成文档。直接告诉我你想完成什么。');
+    }
   } catch (err) {
     if ($('serviceStatus')) {
       $('serviceStatus').classList.add('offline');

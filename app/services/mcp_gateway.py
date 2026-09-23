@@ -565,6 +565,16 @@ class McpGateway:
         server = self._get_server_runtime(server_id)
         return self.to_api(server) if server else None
 
+    def is_server_available(self, server: str | dict[str, Any] | None) -> bool:
+        if not server:
+            return False
+        runtime = self._get_server_runtime(server) if isinstance(server, str) else server
+        if not runtime or not runtime.get("enabled", True):
+            return False
+        if runtime.get("kind") in {"mcp_stdio", "stdio"} and not env_flag("APP_ALLOW_STDIO_MCP"):
+            return False
+        return True
+
     def server_exists(self, server_id: str) -> bool:
         return self._get_server_runtime(server_id) is not None
 
@@ -670,7 +680,7 @@ class McpGateway:
         )
         tools: list[dict[str, Any]] = []
         for server in servers:
-            if not server:
+            if not self.is_server_available(server):
                 continue
             for tool in server.get("tools", []):
                 tools.append({**tool, "server_id": server["id"], "server_name": server["name"]})
@@ -686,7 +696,7 @@ class McpGateway:
         """
 
         server = self._get_server_runtime(server_id)
-        if not server:
+        if not self.is_server_available(server):
             return None
         tool = next(
             (item for item in server.get("tools", []) if str(item.get("name") or "") == tool_name),
@@ -716,6 +726,8 @@ class McpGateway:
             raise ToolError(f"MCP server not found: {server_id}")
         if not server["enabled"]:
             raise ToolError(f"MCP server disabled: {server_id}")
+        if server.get("kind") in {"mcp_stdio", "stdio"} and not env_flag("APP_ALLOW_STDIO_MCP"):
+            raise ToolError("本地 stdio MCP 默认关闭，请设置 APP_ALLOW_STDIO_MCP=true")
         if server["kind"] == "builtin":
             return await self._invoke_builtin(
                 server_id,

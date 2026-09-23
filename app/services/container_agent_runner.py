@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime
 import hashlib
 import json
 import logging
@@ -20,6 +21,7 @@ from app.services.mcp_gateway import ARTIFACT_DIR
 from app.services.execution_engine_service import (
     ExecutionEngineError,
     configured_model_name,
+    configured_reasoning_effort,
     get_engine_row,
     normalize_engine_id,
     require_engine_ready,
@@ -125,6 +127,7 @@ class ContainerAgentRunner:
         resume_session_id: str | None = None,
         model_override: str | None = None,
         base_url_override: str | None = None,
+        reasoning_effort: str | None = None,
     ) -> list[str]:
         if command_override:
             if isinstance(command_override, list):
@@ -167,6 +170,8 @@ class ContainerAgentRunner:
                 ])
             if model_name:
                 command.extend(["-m", model_name])
+            if reasoning_effort:
+                command.extend(["-c", f'model_reasoning_effort="{reasoning_effort}"'])
             command.append(prompt)
             return command
         if engine_id == "claude":
@@ -175,6 +180,8 @@ class ContainerAgentRunner:
                 command.extend(["--resume", resume_session_id])
             if model_name:
                 command.extend(["--model", model_name])
+            if reasoning_effort and reasoning_effort != "xhigh":
+                command.extend(["--effort", reasoning_effort])
             return command
         return ["/bin/bash", "-c", prompt]
 
@@ -290,28 +297,22 @@ class ContainerAgentRunner:
             raise RuntimeError(f"启动常驻沙箱容器失败: {err.decode('utf-8', errors='replace')}")
 
     def _start_reaper_if_needed(self) -> None:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
         if not self._reaper_task or self._reaper_task.done():
-            self._reaper_task = asyncio.create_task(self._reaper_loop())
+            self._reaper_task = loop.create_task(self._reaper_loop())
 
     async def _reaper_loop(self) -> None:
         while True:
-            await asyncio.sleep(15)
-            now = time.time()
-            for c_name, last_act in list(self._warm_containers.items()):
-                if self._active_tasks_count.get(c_name, 0) == 0:
-                    idle_sec = get_runner_idle_seconds()
-                    if now - last_act > idle_sec:
-                        self._warm_containers.pop(c_name, None)
-                        try:
-                            rm = await asyncio.create_subprocess_exec(
-                                "docker", "rm", "-f", c_name,
-                                stdout=asyncio.subprocess.DEVNULL,
-                                stderr=asyncio.subprocess.DEVNULL,
-                            )
-                            await rm.wait()
-                            logger.info("已自动回收空闲超过 %s 秒的容器: %s", self.config.idle_timeout, c_name)
-                        except Exception as e:
-                            logger.warning("回收空闲容器 %s 失败: %s", c_name, e)
+            try:
+                await asyncio.sleep(15)
+                await self.cleanup_stale_containers(prefix="nexus-")
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.warning("容器自动回收循环异常: %s", e)
 
     async def cancel_container(self, container_name: str) -> None:
         try:
@@ -330,28 +331,76 @@ class ContainerAgentRunner:
         except Exception as err:
             logger.warning("停止并销毁容器失败 %s: %s", container_name, err)
 
-    async def cleanup_stale_containers(self, *, prefix: str = "nexus-run-") -> int:
+    async def cleanup_stale_containers(
+        self,
+        *,
+        prefix: str = "nexus-",
+        force_all_idle_warm: bool = False,
+    ) -> int:
         cleaned = 0
+        idle_sec = get_runner_idle_seconds()
+        now = time.time()
         try:
             proc = await asyncio.create_subprocess_exec(
-                "docker", "ps", "-a", "--filter", f"name={prefix}", "--format", "{{.ID}} {{.Names}}",
+                "docker", "ps", "-a", "--filter", f"name={prefix}", "--format", "{{.ID}}\t{{.Names}}\t{{.State}}",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL,
             )
             stdout, _ = await proc.communicate()
             if proc.returncode == 0 and stdout:
                 for line in stdout.decode("utf-8").strip().split("\n"):
-                    parts = line.strip().split()
-                    if len(parts) >= 2:
-                        cid, name = parts[0], parts[1]
+                    line = line.strip()
+                    if not line:
+                        continue
+                    parts = line.split("\t")
+                    if len(parts) < 3:
+                        continue
+                    cid, name, state = parts[0].strip(), parts[1].strip(), parts[2].strip().lower()
+
+                    should_remove = False
+                    if name.startswith("nexus-run-"):
                         if name not in self._running_containers:
-                            rm_proc = await asyncio.create_subprocess_exec(
-                                "docker", "rm", "-f", cid,
-                                stdout=asyncio.subprocess.DEVNULL,
-                                stderr=asyncio.subprocess.DEVNULL,
-                            )
-                            await rm_proc.wait()
-                            cleaned += 1
+                            should_remove = True
+                    elif name.startswith("nexus-warm-"):
+                        if state != "running":
+                            should_remove = True
+                        elif self._active_tasks_count.get(name, 0) == 0:
+                            if force_all_idle_warm or idle_sec <= 0:
+                                should_remove = True
+                            else:
+                                last_act = self._warm_containers.get(name)
+                                if last_act is None:
+                                    try:
+                                        insp_proc = await asyncio.create_subprocess_exec(
+                                            "docker", "inspect", "-f", "{{.State.StartedAt}}", cid,
+                                            stdout=asyncio.subprocess.PIPE,
+                                            stderr=asyncio.subprocess.DEVNULL,
+                                        )
+                                        insp_out, _ = await insp_proc.communicate()
+                                        started_str = insp_out.decode("utf-8").strip()
+                                        clean_ts = started_str[:26] + "Z" if "." in started_str else started_str
+                                        dt = datetime.fromisoformat(clean_ts.replace("Z", "+00:00"))
+                                        last_act = dt.timestamp()
+                                    except Exception:
+                                        last_act = 0.0
+
+                                if now - last_act > idle_sec:
+                                    should_remove = True
+                                else:
+                                    self._warm_containers[name] = last_act
+                    elif name not in self._running_containers and state != "running":
+                        should_remove = True
+
+                    if should_remove:
+                        rm_proc = await asyncio.create_subprocess_exec(
+                            "docker", "rm", "-f", cid,
+                            stdout=asyncio.subprocess.DEVNULL,
+                            stderr=asyncio.subprocess.DEVNULL,
+                        )
+                        await rm_proc.wait()
+                        self._warm_containers.pop(name, None)
+                        cleaned += 1
+                        logger.info("已自动回收沙箱容器: %s (%s)", name, cid)
         except Exception as err:
             logger.warning("清理残留容器失败: %s", err)
         return cleaned
@@ -363,14 +412,40 @@ class ContainerAgentRunner:
         workspace_id: str,
         paths: WorkspacePaths,
         start_time: float,
+        *,
+        referenced_files: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         discovered_files = self.path_manager.collect_new_artifacts(paths, since_timestamp=start_time)
+        if referenced_files:
+            existing_set = set(discovered_files)
+            for ref in referenced_files:
+                target = (paths.code_dir / ref).resolve()
+                if target.is_file() and str(target).startswith(str(paths.code_dir.resolve())):
+                    if target not in existing_set:
+                        discovered_files.append(target)
+                        existing_set.add(target)
+
         registered_artifacts: list[dict[str, Any]] = []
 
         ARTIFACT_DIR.mkdir(parents=True, exist_ok=True, mode=0o750)
 
         for file_path in discovered_files:
             try:
+                relative_path = str(file_path.relative_to(paths.code_dir)) if paths.code_dir in file_path.parents else file_path.name
+                existing_art = db.query_one(
+                    "SELECT id, name, size, kind, relative_path FROM artifacts WHERE task_id = ? AND relative_path = ?",
+                    (task_id, relative_path),
+                )
+                if existing_art:
+                    registered_artifacts.append({
+                        "id": existing_art["id"],
+                        "name": existing_art["name"],
+                        "size": existing_art["size"],
+                        "kind": existing_art["kind"],
+                        "relative_path": existing_art["relative_path"],
+                    })
+                    continue
+
                 stat = file_path.stat()
                 size = stat.st_size
                 name = file_path.name
@@ -438,6 +513,7 @@ class ContainerAgentRunner:
         *,
         engine: str = "codex",
         model_id: str | None = None,
+        execution_model: str | None = None,
         organization_id: str = "local-org",
         user_id: str = "local-user",
         workspace_id: str = "default",
@@ -446,6 +522,7 @@ class ContainerAgentRunner:
         timeout_seconds: int | None = None,
         is_cancel_requested: Callable[[], bool] | None = None,
         resume_session_id: str | None = None,
+        reasoning_effort: str | None = None,
     ) -> ContainerExecutionResult:
         start_time = time.time()
         timeout = timeout_seconds or self.config.default_timeout
@@ -469,9 +546,17 @@ class ContainerAgentRunner:
         engine_id_norm = normalize_engine_id(engine)
         c_model = None
         c_base_url = None
+        c_reasoning_effort = None
         c_api_key = None
+        configured_engine_row = get_engine_row(engine_id_norm) if engine_id_norm in {"codex", "claude"} else None
+        if configured_engine_row:
+            c_reasoning_effort = reasoning_effort or configured_reasoning_effort(configured_engine_row)
 
-        if model_id and model_id != "deterministic":
+        if engine_id_norm in {"codex", "claude"}:
+            c_model = str(execution_model or "").strip() or (
+                configured_model_name(configured_engine_row) if configured_engine_row else ""
+            )
+        elif model_id and model_id != "deterministic":
             m_row = db.query_one("SELECT * FROM model_configs WHERE id = ?", (model_id,))
             if not m_row and ("::" in model_id or ":" in model_id):
                 sep = "::" if "::" in model_id else ":"
@@ -489,7 +574,7 @@ class ContainerAgentRunner:
                     c_api_key = os.getenv(m_row["api_key_env"], "")
 
         if engine_id_norm == "codex":
-            engine_row = get_engine_row("codex")
+            engine_row = configured_engine_row
             if not c_base_url and engine_row:
                 c_base_url = str(engine_row.get("base_url") or "").strip()
             if not c_model:
@@ -521,6 +606,7 @@ class ContainerAgentRunner:
             resume_session_id=resume_session_id,
             model_override=c_model,
             base_url_override=c_base_url,
+            reasoning_effort=c_reasoning_effort,
         )
 
         active_envs = resolve_runtime_env(engine, env_vars)
@@ -762,7 +848,10 @@ class ContainerAgentRunner:
         self._running_containers.pop(container_name, None)
         if use_warm:
             self._active_tasks_count[container_name] = max(0, self._active_tasks_count.get(container_name, 1) - 1)
-            self._warm_containers[container_name] = time.time()
+            if not cancelled and not timed_out:
+                self._warm_containers[container_name] = time.time()
+            else:
+                self._warm_containers.pop(container_name, None)
 
         exit_code = proc.returncode if proc.returncode is not None else -1
         duration = time.time() - start_time
@@ -808,12 +897,21 @@ class ContainerAgentRunner:
             if match:
                 session_id = match.group(1)
 
+        referenced_files = []
+        if summary:
+            for m in re.finditer(r"/workspace/([A-Za-z0-9_\-./]+)", summary):
+                rel = m.group(1).rstrip(").,;:!?\"'")
+                rel = re.sub(r":\d+(?::\d+)?$", "", rel)
+                if rel and rel not in referenced_files:
+                    referenced_files.append(rel)
+
         artifacts = self._register_artifacts(
             task_id=task_id,
             run_id=run_id,
             workspace_id=workspace_id,
             paths=paths,
             start_time=start_time,
+            referenced_files=referenced_files,
         )
 
         if status == "completed":

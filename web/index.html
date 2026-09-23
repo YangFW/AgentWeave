@@ -4,8 +4,8 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>AgentWeave · 工作台</title>
-  <link rel="icon" href="./favicon.svg?v=20260817-1" type="image/svg+xml" />
-  <link rel="stylesheet" href="./styles.css?v=20260916-execution-engines-6" />
+ <link rel="icon" href="./favicon.svg?v=20260817-1" type="image/svg+xml" />
+  <link rel="stylesheet" href="./styles.css?v=20260921-sidebar-fix-1" />
 </head>
 <body class="auth-pending">
   <section id="loginPanel" class="login-panel hidden" aria-labelledby="loginTitle">
@@ -78,8 +78,6 @@
   </div>
   <div id="app">
     <aside id="sidebar" class="sidebar">
-      <div id="accountPanel" class="account-panel hidden"><span id="accountName"></span><button id="logoutButton" type="button" class="secondary" aria-label="退出登录" title="退出登录">退出</button></div>
-      <button id="usersNav" class="nav hidden" data-tab="users" title="用户管理" aria-label="用户管理"><span class="nav-icon"><svg viewBox="0 0 24 24"><circle cx="12" cy="8" r="3"/><path d="M5 20v-2a7 7 0 0 1 14 0v2"/></svg></span><span class="nav-label">用户管理</span></button>
       <div class="brand">
         <div class="logo" aria-hidden="true">
           <svg viewBox="0 0 36 36"><path class="logo-shell" d="M18 7.5 27 12.7v10.6L18 28.5 9 23.3V12.7Z"/><path class="logo-link" d="M18 14.4V9.8M14.7 20l-4 2.3M21.3 20l4 2.3"/><circle class="logo-core" cx="18" cy="18" r="4"/><circle class="logo-node" cx="18" cy="9.2" r="1.35"/><circle class="logo-node" cx="10.2" cy="22.7" r="1.35"/><circle class="logo-node" cx="25.8" cy="22.7" r="1.35"/></svg>
@@ -102,22 +100,35 @@
         <button class="nav" data-tab="workspaces" title="项目"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M4 6.5A2.5 2.5 0 0 1 6.5 4H10l2 2h5.5A2.5 2.5 0 0 1 20 8.5v8A2.5 2.5 0 0 1 17.5 19h-11A2.5 2.5 0 0 1 4 16.5v-10Z"/><path d="M8 11h8M8 14h5"/></svg></span><span class="nav-label">项目</span></button>
         <button class="nav" data-tab="skills" title="技能中心"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="m12 3 2.1 4.9L19 10l-4.9 2.1L12 17l-2.1-4.9L5 10l4.9-2.1L12 3Z"/><path d="m19 16 .8 1.8L22 19l-2.2 1.2L19 22l-.8-1.8L16 19l2.2-1.2L19 16Z"/></svg></span><span class="nav-label">技能中心</span></button>
         <button class="nav" data-tab="marketplace" title="市场"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M4.5 10.5h15l-1 8.5h-13l-1-8.5Z"/><path d="M7 10.5a5 5 0 1 1 10 0"/><path d="M8.5 14h7"/></svg></span><span class="nav-label">市场</span></button>
-        <button class="nav" data-tab="mcp" title="工具接入"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M14.7 6.3a4 4 0 0 0-5.6 5.6l-5.3 5.3a1.4 1.4 0 0 0 2 2l5.3-5.3a4 4 0 0 0 5.6-5.6l-2.5 2.5-1.8-.5-.5-1.8 2.8-2.2Z"/></svg></span><span class="nav-label">工具接入</span></button>
+        <button id="mcpNav" class="nav hidden" data-tab="mcp" title="工具接入"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M14.7 6.3a4 4 0 0 0-5.6 5.6l-5.3 5.3a1.4 1.4 0 0 0 2 2l5.3-5.3a4 4 0 0 0 5.6-5.6l-2.5 2.5-1.8-.5-.5-1.8 2.8-2.2Z"/></svg></span><span class="nav-label">工具接入</span></button>
         <button class="nav" data-tab="agents" title="智能体"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="m12 3.5 7.2 4.2v8.6L12 20.5l-7.2-4.2V7.7Z"/><circle cx="12" cy="12" r="2.7"/><path d="M12 9.3V6.5M9.7 13.4l-2.5 1.5M14.3 13.4l2.5 1.5"/></svg></span><span class="nav-label">智能体</span></button>
         <button class="nav" data-tab="experts" title="专家团"><span class="nav-icon"><svg viewBox="0 0 24 24"><circle cx="8" cy="8" r="3"/><circle cx="17" cy="9" r="2.5"/><path d="M3.5 19c.5-3.2 2-5 4.5-5s4 1.8 4.5 5M13 18.5c.4-2.5 1.7-4 4-4 2.2 0 3.5 1.5 3.8 4"/></svg></span><span class="nav-label">专家团</span></button>
         <button class="nav" data-tab="knowledge" title="知识库"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M5 5.5c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2v13l-2.8-1.7-2.8 1.7-2.8-1.7L7.8 18.5 5 16.8V5.5Z"/><path d="M8.5 8h7M8.5 11h7M8.5 14h4.5"/></svg></span><span class="nav-label">知识库</span></button>
-        <button class="nav" data-tab="diagnostics" title="自检"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M12 3.5 19 6v5.2c0 4.4-2.7 7.9-7 9.3-4.3-1.4-7-4.9-7-9.3V6l7-2.5Z"/><path d="m8.8 12.2 2.1 2.1 4.5-5"/></svg></span><span class="nav-label">自检</span></button>
+        <button id="diagnosticsNav" class="nav hidden" data-tab="diagnostics" title="自检"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M12 3.5 19 6v5.2c0 4.4-2.7 7.9-7 9.3-4.3-1.4-7-4.9-7-9.3V6l7-2.5Z"/><path d="m8.8 12.2 2.1 2.1 4.5-5"/></svg></span><span class="nav-label">自检</span></button>
         <button class="nav" data-tab="memory" title="记忆"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M7.5 5.5A3.5 3.5 0 0 1 14 3.8a3.6 3.6 0 0 1 4.2 4.9A3.6 3.6 0 0 1 18 15a3.7 3.7 0 0 1-6 3.6A3.7 3.7 0 0 1 6 15a3.6 3.6 0 0 1-.2-6.3A3.5 3.5 0 0 1 7.5 5.5Z"/><path d="M9 8.5c1.5.2 2.5 1.2 3 2.5m3-4c-1.5.4-2.5 1.5-3 3m-3 5c1.4-.2 2.5-1 3-2.2m3 2.2c-1.4-.2-2.5-1-3-2.2M12 5v14"/></svg></span><span class="nav-label">记忆</span></button>
-        <button class="nav" data-tab="models" title="模型设置"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M12 3 4.5 7 12 11l7.5-4L12 3Z"/><path d="m4.5 12 7.5 4 7.5-4M4.5 17l7.5 4 7.5-4"/></svg></span><span class="nav-label">模型设置</span></button>
+        <button id="modelsNav" class="nav hidden" data-tab="models" title="模型设置"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M12 3 4.5 7 12 11l7.5-4L12 3Z"/><path d="m4.5 12 7.5 4 7.5-4M4.5 17l7.5 4 7.5-4"/></svg></span><span class="nav-label">模型设置</span></button>
         <button id="enginesNav" class="nav hidden" data-tab="engines" title="执行引擎" aria-label="执行引擎"><span class="nav-icon"><svg viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2.5"/><path d="M8 9h8M8 12.5h5M8 16h3"/></svg></span><span class="nav-label">执行引擎</span></button>
+        <button id="usersNav" class="nav hidden" data-tab="users" title="用户管理" aria-label="用户管理"><span class="nav-icon"><svg viewBox="0 0 24 24"><circle cx="12" cy="8" r="3"/><path d="M5 20v-2a7 7 0 0 1 14 0v2"/></svg></span><span class="nav-label">用户管理</span></button>
         <button class="nav" data-tab="loops" title="自动化"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M19 7.5A8 8 0 0 0 5.4 6L3 8.5"/><path d="M3 4v4.5h4.5M5 16.5A8 8 0 0 0 18.6 18l2.4-2.5"/><path d="M21 20v-4.5h-4.5"/></svg></span><span class="nav-label">自动化</span></button>
         <button class="nav" data-tab="artifacts" title="产物"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M5 3.5h9l5 5V20H5V3.5Z"/><path d="M14 3.5V9h5M8 13h8M8 16.5h6"/></svg></span><span class="nav-label">产物</span></button>
         <button class="nav" data-tab="tasks" title="运行记录"><span class="nav-icon"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2M6 4.5 4 7"/></svg></span><span class="nav-label">运行记录</span></button>
       </nav>
       </div>
+      <div id="accountPanel" class="account-panel hidden">
+        <div class="account-user" title="当前登录账号">
+          <span class="account-avatar" aria-hidden="true">
+            <svg viewBox="0 0 24 24"><circle cx="12" cy="8" r="3.2"/><path d="M5 19a7 7 0 0 1 14 0"/></svg>
+          </span>
+          <span id="accountName"></span>
+        </div>
+        <button id="logoutButton" type="button" class="secondary logout-btn" aria-label="退出登录" title="退出登录">
+          <svg class="logout-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
+          <span class="logout-text">退出</span>
+        </button>
+      </div>
       <div class="sidebar-footer">
-        <div id="serviceStatus" class="service-status"><span></span><b>正在连接</b></div>
-        <div class="small">当前为本机实例，配置与运行数据统一保存在服务端</div>
+        <div id="serviceStatus" class="service-status"><span></span><b>服务已连接</b></div>
+        <div class="small">本机实例运行正常 · 数据已同步至服务端</div>
       </div>
     </aside>
 
@@ -143,6 +154,7 @@
               <button id="newConversationBtn" class="primary-action small-btn" type="button" title="新建对话">+ 新对话</button>
               <button id="viewConversationsBtn" class="secondary small-btn" type="button" title="查看当前项目的历史对话列表">📋 项目历史对话</button>
               <button id="viewCodexSessionsBtn" class="secondary small-btn" type="button" title="查看当前项目的 Codex 容器历史会话记录">🐳 Codex 历史</button>
+              <button id="viewProjectFilesBtn" class="secondary small-btn" type="button" title="查看与管理当前项目目录中的全部文件及上传文档">📁 项目文件</button>
               <button id="refreshBtn" class="icon-button secondary" type="button" aria-label="刷新平台数据" title="刷新"><svg viewBox="0 0 24 24"><path d="M20 6v5h-5"/><path d="M18.2 15.5a7.5 7.5 0 1 1 .8-7L20 11"/></svg></button>
             </div>
           </div>
@@ -163,7 +175,7 @@
                 <span id="expertTeamHint">根据目标与已启用团队的匹配规则选择</span>
               </div>
               <div class="selector-field">
-                <span class="field-label">底座大模型</span>
+                <span id="taskModelLabel" class="field-label">底座大模型</span>
                 <select id="taskModelSelect" aria-label="选择模型" title="选择底座大模型"></select>
               </div>
               <div class="selector-field">
@@ -174,6 +186,20 @@
                   <option value="claude">Claude Code 容器</option>
                   <option value="container">自定义容器沙箱</option>
                 </select>
+              </div>
+              <div id="engineQuickConfig" class="engine-quick-config hidden">
+                <button id="engineQuickConfigBtn" class="engine-quick-config-btn" type="button" aria-expanded="false" title="设置当前执行引擎的模型和推理强度">
+                  <span class="engine-quick-config-icon">⚙</span>
+                  <span>引擎参数</span>
+                  <span class="engine-quick-config-chevron">⌄</span>
+                </button>
+                <div id="engineQuickConfigPanel" class="engine-quick-config-panel hidden">
+                  <label><span>引擎模型</span><select id="engineQuickModelSelect" aria-label="选择执行引擎模型"></select></label>
+                  <label><span>推理强度</span><select id="engineQuickReasoningSelect" aria-label="选择推理强度">
+                    <option value="">默认</option><option value="low">低</option><option value="medium">中</option><option value="high">高</option><option value="xhigh">极高</option>
+                  </select></label>
+                  <p>只影响本次任务，不会修改管理员默认配置。</p>
+                </div>
               </div>
               <div class="status-field">
                 <button id="modelStatusPill" class="model-status-pill" type="button" title="打开模型设置">未检查</button>
@@ -309,6 +335,9 @@
       </section>
 
       <section id="tab-skills" class="tab">
+        <div id="skillsMemberNotice" class="connection-banner hidden" style="margin-bottom: 14px; background: #f0fdf4; border-color: #bbf7d0; color: #166534;">
+          <strong>平台公共技能库</strong><span>当前为浏览模式。技能由管理员统一发布与维护，团队成员可查看并在会话中直接调用。</span>
+        </div>
         <div class="topbar">
           <div>
             <div class="eyebrow">可复用流程</div><h1>技能中心</h1>
@@ -709,6 +738,7 @@
         </div>
         <div class="split">
           <div>
+            <div id="capabilities" class="editor-card" style="margin-bottom: 16px;"></div>
             <div class="section-heading"><h2>已配置模型源</h2><span id="sourceCount">0</span></div>
             <div id="sourceList" class="card-list"></div>
           </div>
@@ -841,6 +871,20 @@
               <datalist id="discoveredEngineModelsList"></datalist>
               <div id="discoveredEngineModelsHint" class="field-hint"></div>
             </label>
+            <label>工作台可选模型（可多选）
+              <select id="engineModelOptions" class="engine-model-options" multiple size="5" aria-label="选择工作台可用模型"></select>
+              <span class="field-hint">先点击“获取可用模型”，按住 Ctrl/⌘ 可多选；其中“模型名称”是默认模型。</span>
+            </label>
+            <label>推理强度
+              <select id="engineReasoningEffort">
+                <option value="">跟随模型默认</option>
+                <option value="low">低</option>
+                <option value="medium">中</option>
+                <option value="high">高</option>
+                <option value="xhigh">极高（仅 Codex 支持）</option>
+              </select>
+              <span class="field-hint">Codex 使用 reasoning effort；Claude Code 使用对应的 effort 参数。</span>
+            </label>
             <label>密钥方式<select id="engineKeyMode"><option value="env">环境变量</option><option value="direct">直接填写密钥</option></select></label>
             <label id="engineKeyEnvField">密钥环境变量名<input id="engineApiKeyEnv" placeholder="OPENAI_API_KEY" /></label>
             <label id="engineKeyDirectField" class="hidden">API Key<input id="engineApiKey" type="password" autocomplete="new-password" placeholder="密钥在本机加密保存，页面不会回显" /></label>
@@ -955,13 +999,26 @@
 
       <section id="tab-artifacts" class="tab">
         <div class="topbar">
-          <div><div class="eyebrow">生成文件</div><h1>产物工作区</h1><p>集中查看每次运行生成的文件、版本、校验值，并在平台内受控预览或下载。</p></div>
-          <div class="toolbar"><select id="artifactKindFilter" aria-label="按文件格式筛选"><option value="">全部格式</option><option value="docx">Word</option><option value="pdf">PDF</option><option value="pptx">PowerPoint</option><option value="xlsx">Excel</option><option value="csv">CSV</option><option value="markdown">Markdown</option><option value="html">HTML</option></select><button id="reloadArtifactsBtn" class="secondary">刷新</button></div>
+          <div><div class="eyebrow">文件中心</div><h1>项目文件与产物</h1><p>项目文件展示代码和上传内容；产物按来源任务分组，便于区分同名文件、版本和生成时间。</p></div>
+          <div class="toolbar"><button id="backToChatBtn" class="secondary" type="button">← 返回工作台</button><select id="artifactKindFilter" aria-label="按文件格式筛选"><option value="">全部格式</option><option value="html">HTML 网页</option><option value="png">图片 (PNG/JPG)</option><option value="docx">Word</option><option value="pdf">PDF</option><option value="pptx">PowerPoint</option><option value="xlsx">Excel</option><option value="csv">CSV</option><option value="markdown">Markdown</option><option value="py">代码脚本</option></select><button id="reloadArtifactsBtn" class="secondary">刷新</button></div>
         </div>
         <div class="artifact-workspace">
-          <div class="artifact-list-panel"><div class="section-heading"><h2>文件</h2><span id="artifactCount">0</span></div><div id="artifactWorkspaceList" class="artifact-workspace-list" aria-live="polite"></div></div>
+          <div class="artifact-list-panel">
+            <div class="project-files-toggle-bar">
+              <button id="showArtifactsModeBtn" class="project-files-toggle-btn active" type="button">产物（按任务）</button>
+              <button id="showProjectFilesModeBtn" class="project-files-toggle-btn" type="button">项目文件（代码与上传）</button>
+            </div>
+            <div class="section-heading"><h2 id="filesListHeading">产物文件</h2><span id="artifactCount">0</span></div>
+            <div id="projectFilesUploadBar" class="hidden" style="margin-bottom: 8px;">
+              <button id="uploadToProjectBtn" class="secondary small-btn" type="button" style="width: 100%;">➕ 上传文档到当前项目</button>
+              <input id="projectFileInput" type="file" style="display: none;" multiple />
+              <div id="projectFilesBreadcrumb" class="project-files-breadcrumb" aria-label="项目目录路径"></div>
+              <input id="projectFilesSearchInput" class="project-files-search" placeholder="🔍 搜索文件名或路径..." style="margin-top: 6px;" />
+            </div>
+            <div id="artifactWorkspaceList" class="artifact-workspace-list" aria-live="polite"></div>
+          </div>
           <div class="editor-card artifact-preview-panel">
-            <div class="editor-header"><div><h2 id="artifactPreviewTitle">选择文件预览</h2><div id="artifactPreviewMeta" class="small">支持 Word、PDF、PPT、Excel、Markdown 和 HTML</div></div><a id="artifactPreviewDownload" class="button-link hidden" target="_blank" rel="noopener">下载原文件</a></div>
+            <div class="editor-header"><div><h2 id="artifactPreviewTitle">选择文件预览</h2><div id="artifactPreviewMeta" class="small">支持 Word、PDF、PPT、Excel、Markdown 和 HTML</div></div><div class="editor-header-actions" style="display:flex;gap:8px;"><a id="artifactPreviewOpen" class="button-link secondary hidden" target="_blank" rel="noopener">在新窗口打开</a><a id="artifactPreviewDownload" class="button-link hidden" target="_blank" rel="noopener">下载原文件</a></div></div>
             <div id="artifactPreview" class="artifact-preview-empty" aria-live="polite">从左侧选择一个文件。</div>
           </div>
         </div>
@@ -1022,10 +1079,10 @@
                 <h2 id="adminUserTitle">新建用户</h2>
                 <p id="adminUserSubtitle" class="small" style="color: var(--muted-2); margin-top: 2px;">设置账号基本信息、分配角色与访问权限</p>
               </div>
-              <button id="newUserBtn" type="button" class="secondary small-btn">+ 重置表单</button>
+              <button id="newUserBtn" type="button" class="secondary small-btn">+ 新建用户</button>
             </div>
             <label>用户名
-              <input id="adminUsername" autocomplete="off" minlength="2" maxlength="80" placeholder="例如 dev_team_1" required />
+              <input id="adminUsername" autocomplete="off" minlength="2" maxlength="80" placeholder="支持中文、英文、数字、邮箱格式" required />
             </label>
             <label>角色分配
               <select id="adminUserRole">
@@ -1034,15 +1091,15 @@
               </select>
             </label>
             <label>登录密码
-              <input id="adminUserPassword" type="password" autocomplete="new-password" minlength="12" maxlength="256" placeholder="设置或更新登录密码" />
+              <input id="adminUserPassword" type="password" autocomplete="new-password" minlength="6" maxlength="256" placeholder="设置或更新登录密码 (至少 6 位)" />
             </label>
-            <p id="adminPasswordHint" class="field-hint">新用户需设置至少 12 位密码。</p>
+            <p id="adminPasswordHint" class="field-hint">新用户需设置至少 6 位登录密码。</p>
             <label class="checkbox" style="margin-top: 6px;">
               <input id="adminUserEnabled" type="checkbox" checked /> 允许此账号登录平台
             </label>
             <p id="adminUserError" class="error-text" role="alert"></p>
             <div class="toolbar" style="margin-top: 14px;">
-              <button id="saveUserBtn" type="submit" class="primary-action">保存用户设置</button>
+              <button id="saveUserBtn" type="submit" class="primary-action">确认创建成员</button>
             </div>
             <div class="info-callout" style="margin-top: 16px;">
               <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
@@ -1054,7 +1111,7 @@
     </main>
   </div>
 
-  <script src="./diagnostics-routing.js?v=20260916-v8"></script>
-  <script src="./app.js?v=20260916-v8"></script>
+  <script src="./diagnostics-routing.js?v=20260923-v9"></script>
+  <script src="./app.js?v=20260923-v9"></script>
 </body>
 </html>
