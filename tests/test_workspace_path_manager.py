@@ -23,6 +23,7 @@ class WorkspacePathManagerTests(unittest.TestCase):
     def test_sanitize_path_segment(self) -> None:
         self.assertEqual(_sanitize_path_segment("valid-org", "org"), "valid-org")
         self.assertEqual(_sanitize_path_segment("user.123_abc", "user"), "user.123_abc")
+        self.assertEqual(_sanitize_path_segment("loop:automation-1", "workspace"), "loop:automation-1")
 
         with self.assertRaises(WorkspacePathError):
             _sanitize_path_segment("../escaped", "org")

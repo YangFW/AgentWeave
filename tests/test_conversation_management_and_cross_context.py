@@ -5,9 +5,16 @@ from fastapi.testclient import TestClient
 from app.main import app, runtime
 from app import db
 from app.services import auth_service
+from app.services.task_state import TaskStateService
+from app.services.workspace_service import WorkspaceService
 
 class ConversationManagementAndCrossContextTests(unittest.TestCase):
     def setUp(self):
+        # Keep the suite runnable against a fresh APP_DB_PATH as documented;
+        # this class writes workspace and event rows directly.
+        db.init_db()
+        WorkspaceService().init_schema()
+        TaskStateService().init_schema()
         self.client = TestClient(app)
         self.client.post("/api/auth/login", json={"username": "admin", "password": "admin123456"})
         self.suffix = uuid.uuid4().hex[:8]

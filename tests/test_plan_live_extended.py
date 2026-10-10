@@ -13,6 +13,7 @@ import hmac
 import io
 import json
 import mimetypes
+import os
 import time
 import unittest
 import uuid
@@ -30,7 +31,7 @@ SCENARIOS = SAMPLES / "scenarios"
 
 
 class ExtendedLivePlanTests(unittest.TestCase):
-    base_url = "http://127.0.0.1:8000"
+    base_url = os.getenv("AGENTNEXUS_BASE_URL", "http://127.0.0.1:8000").rstrip("/")
     timeout = 180.0
 
     @classmethod
@@ -117,7 +118,7 @@ class ExtendedLivePlanTests(unittest.TestCase):
     def test_01_preflight_public_catalog_and_redaction(self) -> None:
         root = self.client.get(f"{self.base_url}/")
         self.assertEqual(root.status_code, 200)
-        self.assertIn("AgentNexus", root.text)
+        self.assertIn("AgentWeave", root.text)
         self.assertNotIn("file://", root.url.__str__())
         health = self._request("GET", "/api/health")
         self.assertTrue(health["ok"])

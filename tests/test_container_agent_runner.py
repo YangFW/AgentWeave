@@ -14,10 +14,16 @@ from app.services.container_agent_runner import (
     default_container_runner,
 )
 from app.services.workspace_path_manager import WorkspacePathManager
+from app.services.task_state import TaskStateService
 
 
 class ContainerAgentRunnerTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
+        # These tests emit task events directly through the runner.  Initialize
+        # the isolated database so the documented APP_DB_PATH test command is
+        # independent of a developer's existing platform database.
+        db.init_db()
+        TaskStateService().init_schema()
         self.temp_dir = tempfile.TemporaryDirectory()
         self.base_dir = Path(self.temp_dir.name)
         self.path_manager = WorkspacePathManager(base_dir=self.base_dir)

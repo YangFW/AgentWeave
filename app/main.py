@@ -3,6 +3,7 @@ from __future__ import annotations
 from app.services.workspace_path_manager import default_path_manager
 
 import asyncio
+import logging
 import mimetypes
 import csv
 import hashlib
@@ -112,6 +113,7 @@ from app.services.task_state import (
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 WEB_DIR = BASE_DIR / "web"
+logger = logging.getLogger(__name__)
 
 
 def _load_local_env_file() -> None:
@@ -1762,9 +1764,14 @@ def list_workspace_files(
     clean_sub = ""
     if subpath:
         clean_sub = Path(subpath).as_posix().lstrip("/")
+        if clean_sub == ".":
+            clean_sub = ""
+        if clean_sub and (clean_sub == ".." or clean_sub.startswith("../")):
+            raise HTTPException(status_code=400, detail="目录路径不合法")
         cand = (code_dir / clean_sub).resolve()
-        if cand.exists() and str(cand).startswith(str(code_dir)):
-            base_dir = cand
+        if not cand.exists() or not cand.is_dir() or not str(cand).startswith(str(code_dir)):
+            raise HTTPException(status_code=404, detail="目录不存在")
+        base_dir = cand
 
     if not base_dir.exists():
         base_dir.mkdir(parents=True, exist_ok=True)
@@ -2998,9 +3005,21 @@ def get_mcp_server(server_id: str) -> dict[str, Any]:
 
 @app.get("/api/mcp/{server_id}/tools")
 def list_mcp_tools(server_id: str) -> list[dict[str, Any]]:
-    if not mcp_gateway.get_server(server_id):
+    server = mcp_gateway.get_server(server_id)
+    if not server:
         raise HTTPException(status_code=404, detail="MCP server not found")
-    return mcp_gateway.list_tools(server_id)
+    # Keep a disabled server's discovered tool catalogue visible in the
+    # configuration UI.  Runtime planning still uses ``McpGateway.list_tools``
+    # and therefore excludes disabled capabilities.
+    return [
+        {
+            **tool,
+            "server_id": server_id,
+            "server_name": server.get("name", server_id),
+        }
+        for tool in (server.get("tools") or [])
+        if isinstance(tool, dict)
+    ]
 
 
 @app.post("/api/mcp/{server_id}/discover")
@@ -3447,6 +3466,11 @@ async def test_execution_engine(engine_id: str) -> dict[str, Any]:
 
 @app.post("/api/mcp/{server_id}/tools/{tool_name}/invoke")
 async def invoke_mcp_tool(server_id: str, tool_name: str, payload: ToolInvokeRequest) -> dict[str, Any]:
+    server = mcp_gateway.get_server(server_id)
+    if not server:
+        raise HTTPException(status_code=404, detail="MCP server not found")
+    if not server.get("enabled", True):
+        raise HTTPException(status_code=400, detail="MCP 服务未启用")
     definition = mcp_gateway.get_tool_definition(server_id, tool_name)
     if not definition:
         raise HTTPException(status_code=404, detail="MCP 工具不存在，请先同步工具清单")
@@ -3700,7 +3724,7 @@ def _public_artifact(value: dict[str, Any]) -> dict[str, Any]:
     allowed = {
         "id", "task_id", "run_id", "workspace_id", "name", "kind",
         "mime_type", "size", "sha256", "version", "created_at",
-        "delivery_status", "relative_path",
+        "delivery_status",
     }
     result = {key: value.get(key) for key in allowed if value.get(key) not in (None, "")}
     result["delivery_status"] = delivery_status
@@ -4171,7 +4195,7 @@ _PUBLIC_TASK_EVENT_TYPES = frozenset(
         "interrupted", "memory", "memory_deleted", "memory_saved", "model", "notice",
         "output_check", "permissions", "plan", "plan_check", "plan_progress", "progress",
         "recovery", "recovery_scheduled", "resume", "resume_scheduled", "retry_scheduled",
-        "skill", "start", "steering", "team_acceptance_failed", "team_aggregating",
+        "skill", "start", "stage_started", "stage_completed", "stage_failed", "task_completed", "task_failed", "task_cancelled", "steering", "team_acceptance_failed", "team_aggregating",
         "team_completed", "team_member_retry", "team_parallel_start", "team_partial_failed",
         "team_queued", "tool_blocked", "tool_call", "tool_error", "tool_result",
         "tool_reused", "verification_result", "verification_started",
@@ -5458,6 +5482,10 @@ async def create_task(payload: TaskCreate, request: Request = None) -> dict[str,
             recommendation=recommendation,
         )
     selected_agent = db.query_one("SELECT * FROM agents WHERE id = ?", (selected_agent_id,))
+    # Resolve the agent fallback before any role/model checks.  The previous
+    # ordering referenced this local below before assigning it, which turned
+    # authenticated task submissions into an unhandled 500.
+    fallback_model_id = str((selected_agent or {}).get("model") or "")
     if identity and not auth_service.agent_access(selected_agent_id, identity, payload.workspace):
         raise HTTPException(status_code=403, detail='无权使用所选智能体')
     if identity and identity.get("role") != "admin":
@@ -5473,7 +5501,6 @@ async def create_task(payload: TaskCreate, request: Request = None) -> dict[str,
             if identity.get("role") not in allowed:
                 raise HTTPException(status_code=403, detail="管理员未授权当前角色使用该第三方执行引擎")
 
-    fallback_model_id = str((selected_agent or {}).get("model") or "")
     if payload.execution_engine not in ("codex", "claude"):
         _ensure_model_ready(payload.model_id or fallback_model_id or "deterministic", label="所选模型")
     if payload.executor_type == "team":

@@ -8,7 +8,10 @@ from pathlib import Path
 from typing import Any, Mapping
 
 
-SAFE_ID_PATTERN = re.compile(r"^[a-zA-Z0-9_\-\.]+$")
+# ``:`` is used by the internal automation namespace (``loop:<id>``).  It is
+# safe as a single POSIX path segment; traversal characters and separators
+# remain rejected below.
+SAFE_ID_PATTERN = re.compile(r"^[a-zA-Z0-9_\-\.:]+$")
 
 
 class WorkspacePathError(RuntimeError):

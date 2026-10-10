@@ -85,6 +85,7 @@ const state = {
   runtimeTaskId: null,
   runtimeTimer: null,
   eventSource: null,
+  streamPollTimer: null,
   streamTaskId: null,
   streamCursor: 0,
   streamGeneration: 0,
@@ -2271,8 +2272,10 @@ function stopTaskStream({ clearCursor = true } = {}) {
   state.streamGeneration += 1;
   if (state.eventSource) state.eventSource.close();
   if (state.streamRetryTimer) clearTimeout(state.streamRetryTimer);
+  if (state.streamPollTimer) clearTimeout(state.streamPollTimer);
   state.eventSource = null;
   state.streamRetryTimer = null;
+  state.streamPollTimer = null;
   state.streamRetryCount = 0;
   state.streamTaskId = null;
   if (clearCursor) {
@@ -2398,6 +2401,33 @@ function connectTaskStream(taskId, generation) {
   };
 }
 
+async function pollTaskEvents(taskId, generation) {
+  if (generation !== state.streamGeneration || state.streamTaskId !== taskId || state.currentTask?.id !== taskId) return;
+  try {
+    const events = await api(`/api/tasks/${encodeURIComponent(taskId)}/events?after_id=${encodeURIComponent(state.streamCursor || 0)}`);
+    for (const payload of (Array.isArray(events) ? events : [])) {
+      handleTaskStreamEvent(taskId, {
+        data: JSON.stringify(payload),
+        lastEventId: String(payload.id || ''),
+      });
+    }
+  } catch (_) {
+    // SSE remains the primary path; polling is only a resilient local
+    // fallback and will retry while the task is active.
+  }
+  if (
+    generation === state.streamGeneration
+    && state.streamTaskId === taskId
+    && state.currentTask?.id === taskId
+    && !taskTerminalStatuses.has(state.currentTask?.status)
+  ) {
+    state.streamPollTimer = setTimeout(() => {
+      state.streamPollTimer = null;
+      pollTaskEvents(taskId, generation);
+    }, 500);
+  }
+}
+
 function startTaskStream(taskId, { seenEventIds = null } = {}) {
   const sameTask = state.streamTaskId === taskId;
   const previousCursor = sameTask ? state.streamCursor : 0;
@@ -2410,6 +2440,10 @@ function startTaskStream(taskId, { seenEventIds = null } = {}) {
   state.seenEventIds = previousSeen;
   const generation = state.streamGeneration;
   connectTaskStream(taskId, generation);
+  // Some local reverse proxies buffer or drop long-lived EventSource
+  // responses.  Keep a lightweight database-backed fallback so progress and
+  // answer_delta events still reach the conversation in real time.
+  pollTaskEvents(taskId, generation);
 }
 
 window.addEventListener('beforeunload', () => stopTaskStream());

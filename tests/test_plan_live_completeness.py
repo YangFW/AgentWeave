@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import time
 import uuid
 import unittest
@@ -25,7 +26,7 @@ SCENARIOS = SAMPLES / "scenarios"
 
 
 class PlanCompletenessLiveTests(unittest.TestCase):
-    base_url = "http://127.0.0.1:8000"
+    base_url = os.getenv("AGENTNEXUS_BASE_URL", "http://127.0.0.1:8000").rstrip("/")
     timeout = 30.0
 
     @classmethod

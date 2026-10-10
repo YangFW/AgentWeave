@@ -125,7 +125,11 @@ class WorkspaceCreate(BaseModel):
     organization_id: str = Field(default="local-org", min_length=1, max_length=128)
     user_id: str = Field(default="local-user", min_length=1, max_length=128)
     default_agent_id: ResourceId = "general-agent"
-    default_model_id: ResourceId = "deterministic"
+    # Keep this as a string at the request boundary.  Model IDs may contain
+    # a source separator (for example ``source-01::gpt-5.5``), and older
+    # clients could submit the human-readable ``[Source] model`` label.
+    # WorkspaceService performs the canonicalisation and strict validation.
+    default_model_id: str = Field(default="deterministic", min_length=1, max_length=200)
     settings: dict[str, Any] = Field(default_factory=dict)
     enabled: bool = True
 
@@ -134,7 +138,7 @@ class WorkspaceUpdate(BaseModel):
     name: ResourceName
     description: str = Field(default="", max_length=2_000)
     default_agent_id: ResourceId = "general-agent"
-    default_model_id: ResourceId = "deterministic"
+    default_model_id: str = Field(default="deterministic", min_length=1, max_length=200)
     settings: dict[str, Any] = Field(default_factory=dict)
     enabled: bool = True
 

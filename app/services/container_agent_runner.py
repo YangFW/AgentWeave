@@ -359,7 +359,21 @@ class ContainerAgentRunner:
 
                     should_remove = False
                     if name.startswith("nexus-run-"):
-                        if name not in self._running_containers:
+                        # Never kill a running task owned by another runner
+                        # instance (for example during a rolling restart or
+                        # an isolated smoke test).  A name-only ownership
+                        # check caused the reaper to terminate active Codex
+                        # processes and surface exit code 137.
+                        # A caller may pass a specific prefix when it has
+                        # identified a stale container.  In that case the
+                        # scope itself is the ownership boundary, so remove
+                        # matching running containers that this runner does
+                        # not currently track.  The normal broad `nexus-`
+                        # sweep continues to preserve every running task.
+                        scoped_stale_sweep = prefix != "nexus-" and name.startswith(prefix)
+                        if state != "running" or (
+                            scoped_stale_sweep and name not in self._running_containers
+                        ):
                             should_remove = True
                     elif name.startswith("nexus-warm-"):
                         if state != "running":
@@ -626,6 +640,9 @@ class ContainerAgentRunner:
             self._active_tasks_count[container_name] = self._active_tasks_count.get(container_name, 0) + 1
 
             exec_args = [
+                # Attach stdin so Docker forwards an explicit EOF from
+                # DEVNULL.  Codex's warm-container exec path otherwise keeps
+                # waiting for another turn even after response.completed.
                 "docker", "exec", "-i",
                 f"--user={os.getuid()}:{os.getgid()}",
                 f"--workdir={self.config.container_workspace}",
@@ -663,6 +680,11 @@ class ContainerAgentRunner:
                 *run_cmd_args,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                # Codex/Claude one-shot invocations must never inherit the
+                # API server's stdin.  An open stdin makes Codex wait for a
+                # follow-up turn ("Reading additional input from stdin...")
+                # instead of exiting and allowing artifact collection.
+                stdin=asyncio.subprocess.DEVNULL,
             )
             self._running_containers[container_name] = proc
         except Exception as err:
@@ -684,6 +706,39 @@ class ContainerAgentRunner:
 
         detected_session_id = resume_session_id or ""
         accumulated_agent_message: list[str] = []
+        referenced_files: list[str] = []
+        streamed_item_ids: set[str] = set()
+
+        def extract_item_text(item: Mapping[str, Any]) -> str:
+            """Extract text from the several Codex JSONL payload shapes."""
+            values: list[str] = []
+            for key in ("text", "content", "message", "delta"):
+                value = item.get(key)
+                if isinstance(value, str):
+                    values.append(value)
+                elif isinstance(value, list):
+                    for part in value:
+                        if isinstance(part, str):
+                            values.append(part)
+                        elif isinstance(part, Mapping):
+                            text = part.get("text") or part.get("value") or part.get("delta")
+                            if isinstance(text, str):
+                                values.append(text)
+            return "".join(values)
+
+        def remember_file_change(item: Mapping[str, Any]) -> None:
+            changes = item.get("changes") or item.get("files") or []
+            if isinstance(changes, Mapping):
+                changes = [changes]
+            if not isinstance(changes, list):
+                return
+            for change in changes:
+                path = change if isinstance(change, str) else change.get("path") if isinstance(change, Mapping) else ""
+                path = str(path or "").strip()
+                if path.startswith("/workspace/"):
+                    path = path[len("/workspace/"):]
+                if path and path not in referenced_files:
+                    referenced_files.append(path)
 
         async def read_stream(stream: asyncio.StreamReader, accumulator: list[str], stream_name: str) -> None:
             nonlocal detected_session_id
@@ -756,6 +811,7 @@ class ContainerAgentRunner:
                                     {"server_id": "sandbox", "tool_name": "bash", "call_id": item.get("id")},
                                 )
                             elif itype in ("file_change", "FileChange"):
+                                remember_file_change(item)
                                 emit(
                                     task_id,
                                     "tool_call",
@@ -764,12 +820,35 @@ class ContainerAgentRunner:
                                     {"server_id": "sandbox", "tool_name": "apply_patch"},
                                 )
                             continue
+                        if ev_type in (
+                            "item.delta", "response.output_text.delta",
+                            "response.content_part.delta", "content_block_delta",
+                        ):
+                            item = event_data.get("item") or event_data.get("content") or event_data
+                            if not isinstance(item, Mapping):
+                                item = {}
+                            delta = event_data.get("delta")
+                            if not isinstance(delta, str):
+                                delta = extract_item_text(item)
+                            if delta:
+                                item_id = str(event_data.get("item_id") or (item.get("id") if isinstance(item, Mapping) else "") or "")
+                                if item_id:
+                                    streamed_item_ids.add(item_id)
+                                accumulated_agent_message.append(delta)
+                                emit(
+                                    task_id,
+                                    "answer_delta",
+                                    "实时回复",
+                                    delta,
+                                    {"engine": engine},
+                                )
+                            continue
                         if ev_type == "item.completed":
                             item = event_data.get("item", {})
                             itype = item.get("type")
                             if itype in ("agent_message", "AgentMessage"):
-                                text = item.get("text") or item.get("content") or ""
-                                if text:
+                                text = extract_item_text(item)
+                                if text and str(item.get("id") or "") not in streamed_item_ids:
                                     accumulated_agent_message.append(text)
                                     emit(
                                         task_id,
@@ -778,6 +857,18 @@ class ContainerAgentRunner:
                                         text,
                                         {"engine": engine},
                                     )
+                            elif itype in ("file_change", "FileChange"):
+                                remember_file_change(item)
+                                for change in item.get("changes") or []:
+                                    path = change.get("path") if isinstance(change, Mapping) else str(change)
+                                    if path:
+                                        emit(
+                                            task_id,
+                                            "tool_result",
+                                            "文件已更新",
+                                            str(path),
+                                            {"server_id": "sandbox", "tool_name": "apply_patch"},
+                                        )
                             elif itype in ("command_execution", "CommandExecution"):
                                 exit_code = item.get("exit_code", 0)
                                 cmd = item.get("command", "")
@@ -897,7 +988,6 @@ class ContainerAgentRunner:
             if match:
                 session_id = match.group(1)
 
-        referenced_files = []
         if summary:
             for m in re.finditer(r"/workspace/([A-Za-z0-9_\-./]+)", summary):
                 rel = m.group(1).rstrip(").,;:!?\"'")

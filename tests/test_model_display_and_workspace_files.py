@@ -9,6 +9,8 @@ from app.services.workspace_path_manager import default_path_manager
 
 class ModelDisplayAndWorkspaceFilesTests(unittest.TestCase):
     def setUp(self):
+        db.init_db()
+        auth_service.init_schema()
         db.execute("DELETE FROM login_limits")
         self.client = TestClient(app)
         self.client.post("/api/auth/login", json={"username": "admin", "password": "admin123456"})
@@ -134,6 +136,17 @@ class ModelDisplayAndWorkspaceFilesTests(unittest.TestCase):
         list_resp4 = self.client.get(f"/api/workspaces/{ws_id}/files")
         remaining_files = [item["name"] for item in list_resp4.json()["items"] if not item["is_dir"]]
         self.assertNotIn("sales_report.md", remaining_files)
+
+    def test_workspace_files_reject_missing_and_traversal_subpaths(self):
+        """Directory navigation must fail closed instead of falling back to the project root."""
+        ws_id = self.ws_id
+        missing = self.client.get(f"/api/workspaces/{ws_id}/files", params={"subpath": "does-not-exist"})
+        self.assertEqual(missing.status_code, 404)
+        self.assertEqual(missing.json()["detail"], "目录不存在")
+
+        traversal = self.client.get(f"/api/workspaces/{ws_id}/files", params={"subpath": "../"})
+        self.assertEqual(traversal.status_code, 400)
+        self.assertEqual(traversal.json()["detail"], "目录路径不合法")
 
     def test_chat_upload_with_workspace_id(self):
         """Verify /api/uploads with workspace_id copies file to workspace code_dir."""

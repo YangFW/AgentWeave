@@ -63,8 +63,33 @@ def _clean_text(value: Any, *, field: str, allow_empty: bool = True, max_length:
 
 def _clean_id(value: Any, *, field: str) -> str:
     result = _clean_text(value, field=field, allow_empty=False, max_length=80)
-    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]+", result):
-        raise ValueError(f"{field} must start with a letter or digit and contain only letters, digits, '_', '-' or '.'")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]+", result):
+        raise ValueError(f"{field} must start with a letter or digit and contain only letters, digits, '_', '-', '.', ':'")
+    return result
+
+
+def _clean_model_id(value: Any) -> str:
+    """Canonicalise a workspace model selection.
+
+    The current UI submits the model's stable ID.  Older/cached UI bundles
+    submitted labels such as ``[裕江AI] gpt-5.5`` instead, so resolve that
+    form against the configured model table before applying ID validation.
+    """
+    result = _clean_text(value, field="default_model_id", allow_empty=False, max_length=200)
+    if result.startswith("[") and "]" in result:
+        _, display_model = result.split("]", 1)
+        display_model = display_model.strip()
+        if display_model:
+            row = db.query_one(
+                "SELECT id FROM model_configs WHERE id = ? OR model = ? OR name = ? "
+                "ORDER BY CASE WHEN id = ? THEN 0 WHEN model = ? THEN 1 ELSE 2 END, updated_at DESC LIMIT 1",
+                (display_model, display_model, result, display_model, display_model),
+            )
+            result = str((row or {}).get("id") or display_model)
+    if len(result) > 80 or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]+", result):
+        raise ValueError(
+            "default_model_id must start with a letter or digit and contain only letters, digits, '_', '-', '.', ':'"
+        )
     return result
 
 
@@ -219,7 +244,7 @@ class WorkspaceService:
         name = _clean_text(name, field="name", allow_empty=False, max_length=120)
         description = _clean_text(description, field="description", max_length=2000)
         default_agent_id = _clean_id(default_agent_id, field="default_agent_id")
-        default_model_id = _clean_id(default_model_id, field="default_model_id")
+        default_model_id = _clean_model_id(default_model_id)
         settings_json = json.dumps(_settings(settings), ensure_ascii=False)
         if not isinstance(enabled, bool):
             raise TypeError("enabled must be a boolean")
@@ -273,7 +298,7 @@ class WorkspaceService:
         name = _clean_text(name, field="name", allow_empty=False, max_length=120)
         description = _clean_text(description, field="description", max_length=2000)
         default_agent_id = _clean_id(default_agent_id, field="default_agent_id")
-        default_model_id = _clean_id(default_model_id, field="default_model_id")
+        default_model_id = _clean_model_id(default_model_id)
         settings_json = json.dumps(_settings(settings), ensure_ascii=False)
         if not isinstance(enabled, bool):
             raise TypeError("enabled must be a boolean")

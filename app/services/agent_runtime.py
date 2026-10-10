@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import sqlite3
 import contextvars
 import hashlib
@@ -79,6 +80,7 @@ from app.services.tool_effect_journal import (
 from app.services.verification_service import CandidateOutput, EvidenceBundle, VerificationService
 
 FINAL_STATUSES = {"completed", "failed", "waiting_approval", "cancelled"}
+logger = logging.getLogger(__name__)
 
 
 def sanitize_public_answer(value: str) -> str:
@@ -5928,13 +5930,16 @@ class AgentRuntime:
     def _is_mcp_server_available(self, server_id: str | None) -> bool:
         if not server_id:
             return False
-        checker = getattr(self.mcp_gateway, "is_server_available", None)
+        gateway = getattr(self, "mcp_gateway", None)
+        if gateway is None:
+            return False
+        checker = getattr(gateway, "is_server_available", None)
         if callable(checker):
             return bool(checker(server_id))
-        checker_exists = getattr(self.mcp_gateway, "server_exists", None)
+        checker_exists = getattr(gateway, "server_exists", None)
         if callable(checker_exists):
             return bool(checker_exists(server_id))
-        lister = getattr(self.mcp_gateway, "list_tools", None)
+        lister = getattr(gateway, "list_tools", None)
         if callable(lister):
             try:
                 tools = lister()
@@ -8830,7 +8835,7 @@ def create_task_record(
             organization_id, user_id, parent_task_id, executor_type, executor_id,
             execution_engine, execution_model, execution_reasoning_effort, status, result_json, artifacts_json, attachments_json, created_at, updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             task_id, title, message, agent_id, model_id or "",

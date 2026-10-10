@@ -15,7 +15,7 @@ echo
 echo "工作区目录： ${APP_WORKSPACES_ROOT:-$ROOT/data/workspaces}"
 mkdir -p "${APP_WORKSPACES_ROOT:-$ROOT/data/workspaces}"
 
-ENV_FILE="${AGENTNEXUS_ENV_FILE:-$ROOT/.env.local}"
+ENV_FILE="${AGENTWEAVE_ENV_FILE:-${AGENTNEXUS_ENV_FILE:-$ROOT/.env.local}}"
 echo "配置文件： $ENV_FILE"
 if [ ! -f "$ENV_FILE" ]; then
   echo "  不存在。请复制 .env.example 为 .env.local 后填写密钥。"
